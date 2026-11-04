@@ -1,0 +1,143 @@
+/* Control interface: unix socket, plaintext commands, JSON replies (plan §3/§4).
+ * Idempotent, logged, auditable. */
+#define _GNU_SOURCE
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <jansson.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "ha-dhcpc/cluster.h"
+#include "ha-dhcpc/ctl.h"
+#include "ha-dhcpc/lease.h"
+#include "ha-dhcpc/log.h"
+#include "internal.h"
+
+static const char *role_name(hadc_role_t r)
+{
+    return r == HADC_ROLE_MASTER ? "master" : (r == HADC_ROLE_SLAVE ? "slave" : "unknown");
+}
+
+static json_t *status_object(hadc_ctx_t *ctx)
+{
+    json_t *o = json_pack(
+        "{s:s, s:s, s:s, s:I, s:b, s:o}", "role", role_name(ctx->role), "self",
+        ctx->slave.self, "master", ctx->master.designated_master, "lease_version",
+        (json_int_t)ctx->lease.version, "retention", (int)ctx->lease.retention_active, "timers",
+        json_pack("{s:I, s:I}", "heartbeat_ms", (json_int_t)ctx->conf.cluster.heartbeat_ms,
+                  "election_deadline_ms", (json_int_t)ctx->conf.cluster.election_deadline_ms));
+    if (!o)
+        return NULL;
+    json_t *members = json_array();
+    for (size_t i = 0; i < ctx->master.n_members; i++) {
+        char addr[64];
+        snprintf(addr, sizeof(addr), "%s", inet_ntoa(ctx->master.members[i].sync_address));
+        json_array_append_new(
+            members, json_pack("{s:s, s:s, s:b, s:I}", "id", ctx->master.members[i].id,
+                               "sync_address", addr, "alive", ctx->peers[i].alive,
+                               "acked_version", (json_int_t)ctx->peers[i].acked_version));
+    }
+    json_object_set_new(o, "members", members);
+    return o;
+}
+
+char *hadc_ctl_status_json(hadc_ctx_t *ctx)
+{
+    json_t *o = status_object(ctx);
+    char *txt = json_dumps(o, JSON_PRESERVE_ORDER | JSON_COMPACT);
+    json_decref(o);
+    return txt;
+}
+
+static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
+{
+    char cmd[64] = "", arg[128] = "";
+    if (sscanf(line, "%63s %127s", cmd, arg) < 1)
+        return;
+    const char *reply = "{\"ok\":true}";
+    if (!strcmp(cmd, "promote")) {
+        hadc_info("ctl: promote %s", arg[0] ? arg : "(self)");
+        hadc_cluster_promote(ctx, arg[0] ? arg : NULL);
+    } else if (!strcmp(cmd, "demote")) {
+        hadc_info("ctl: demote");
+        hadc_cluster_demote(ctx);
+    } else if (!strcmp(cmd, "status")) {
+        char *txt = hadc_ctl_status_json(ctx);
+        if (txt) {
+            char nl = '\n';
+            (void)!write(reply_fd, txt, strlen(txt));
+            (void)!write(reply_fd, &nl, 1);
+            free(txt);
+            reply = NULL;
+        }
+    } else {
+        hadc_warn("ctl: unknown command '%s'", cmd);
+        reply = "{\"ok\":false}";
+    }
+    if (reply) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s\n", reply);
+        (void)!write(reply_fd, buf, strlen(buf));
+    }
+}
+
+static void ctl_ready(hadc_ctx_t *ctx, int fd)
+{
+    int c = accept(fd, NULL, NULL);
+    if (c < 0)
+        return;
+    char line[256];
+    ssize_t n = read(c, line, sizeof(line) - 1);
+    if (n > 0) {
+        line[n] = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
+        handle_command(ctx, line, c);
+    }
+    close(c);
+}
+
+int hadc_ctl_init(hadc_ctx_t *ctx)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctx->conf.ctl_socket);
+
+    ctx->ctl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (ctx->ctl_fd < 0) {
+        hadc_err("ctl: socket: %s", strerror(errno));
+        return -1;
+    }
+    int tmp_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (tmp_fd >= 0) {
+        if (connect(tmp_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            close(tmp_fd);
+            close(ctx->ctl_fd);
+            ctx->ctl_fd = -1;
+            hadc_err("ctl: %s is held by a live ha-dhcpc; refusing to start",
+                     ctx->conf.ctl_socket);
+            return -1;
+        }
+        close(tmp_fd);
+        unlink(ctx->conf.ctl_socket); /* stale socket from a dead daemon */
+    }
+    if (bind(ctx->ctl_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        hadc_err("ctl: bind %s: %s", ctx->conf.ctl_socket, strerror(errno));
+        return -1;
+    }
+    listen(ctx->ctl_fd, 8);
+    hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, 0);
+    hadc_info("ctl: listening on %s", ctx->conf.ctl_socket);
+    return 0;
+}
+
+int hadc_ctl_step(hadc_ctx_t *ctx)
+{
+    (void)ctx;
+    return 0;
+}
