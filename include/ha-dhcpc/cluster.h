@@ -64,6 +64,12 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx);
 void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
                                            hadc_role_t new_role), void *arg);
 
+/* Default-role bootstrap election (called from the heartbeat tick and at
+ * startup): with default_role=master and no master known, self-promote when
+ * single-node, when all members are alive and none is master, or once
+ * cluster_timeout_ms has elapsed. Election is by priority, ties by id. */
+void hadc_cluster_elect_check(hadc_ctx_t *ctx);
+
 /* Role change entrypoints (idempotent, cooldown-guarded, logged).
  * role_change propagates cluster-wide over the UDP control path. */
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id);

@@ -224,6 +224,8 @@ int hadc_config_load_master(const char *path, hadc_master_conf_t *out, char *err
                 json_decref(root);
                 return -1;
             }
+            json_t *pj = json_object_get(m, "priority");
+            mm->priority = (pj && json_is_integer(pj)) ? (int)json_integer_value(pj) : 0;
         }
     }
     json_decref(root);
@@ -270,6 +272,21 @@ int hadc_config_load_daemon(const char *path, hadc_daemon_conf_t *out, char *err
     if (get_int(c ? c : root, "election_deadline_ms", &v, 6000, false, "cluster")) goto derr;
     out->cluster.election_deadline_ms = (uint32_t)v;
     out->cluster.quorum = HADC_QUORUM_MAJORITY;
+    if (get_int(c ? c : root, "cluster_timeout_ms", &v, 0, false, "cluster")) goto derr;
+    out->cluster.cluster_timeout_ms = (uint32_t)v;
+
+    const char *dr = "slave";
+    json_t *drv = json_object_get(root, "default_role");
+    if (drv && json_is_string(drv))
+        dr = json_string_value(drv);
+    if (!strcmp(dr, "slave"))
+        out->default_role_master = false;
+    else if (!strcmp(dr, "master"))
+        out->default_role_master = true;
+    else {
+        snprintf(err, errlen, "ha-dhcpc.yaml: unknown default_role %s", dr);
+        goto derr;
+    }
 
     json_t *d = json_object_get(root, "dhcp");
     const char *ret = "forever";

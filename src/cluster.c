@@ -26,6 +26,7 @@ static hadc_ctx_t *g_ctx;
 
 static void (*g_role_hook)(void *arg, hadc_role_t old_role, hadc_role_t new_role);
 static void *g_role_hook_arg;
+static uint64_t g_cluster_start_ms;
 
 void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
                                            hadc_role_t new_role), void *arg)
@@ -335,6 +336,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
 int hadc_cluster_init(hadc_ctx_t *ctx)
 {
     g_ctx = ctx;
+    g_cluster_start_ms = (uint64_t)hadc_now_ms();
 
     const hadc_member_t *self = NULL;
     for (size_t i = 0; i < ctx->master.n_members; i++)
@@ -392,6 +394,66 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
                       (unsigned)ctx->conf.cluster.election_deadline_ms);
         }
     }
+
+    hadc_cluster_elect_check(ctx);
+}
+
+/* Default-role bootstrap election: with default_role=master and no master
+ * known, a node self-promotes when it is a single node, when every member is
+ * alive and none is master (all slaves), or once cluster_timeout_ms has
+ * elapsed (partial view: dual-master partitions still alarm). Election is by
+ * priority (mirrored in master.conf), ties by lowest node id; the winner
+ * announces via the normal role_change propagation path. */
+void hadc_cluster_elect_check(hadc_ctx_t *ctx)
+{
+    bool all_alive, timeout_path;
+    const char *winner;
+    int wprio;
+
+    if (!ctx->conf.default_role_master)
+        return;
+    if (ctx->master.designated_master[0] != '\0')
+        return; /* a master is known: configured or elected */
+    if (ctx->role != HADC_ROLE_SLAVE)
+        return;
+
+    all_alive = true;
+    for (size_t i = 0; i < ctx->master.n_members; i++) {
+        hadc_peer_t *p;
+        if (!strcmp(ctx->master.members[i].id, ctx->slave.self))
+            continue;
+        p = peer_entry(ctx, ctx->master.members[i].id);
+        if (!p || !p->alive)
+            all_alive = false;
+    }
+    timeout_path = ctx->conf.cluster.cluster_timeout_ms > 0 &&
+        (uint64_t)hadc_now_ms() - g_cluster_start_ms >=
+            ctx->conf.cluster.cluster_timeout_ms;
+    if (!all_alive && !timeout_path)
+        return;
+
+    winner = ctx->slave.self;
+    wprio = ctx->slave.priority;
+    for (size_t i = 0; i < ctx->master.n_members; i++) {
+        const hadc_member_t *m = &ctx->master.members[i];
+        hadc_peer_t *p;
+        if (!strcmp(m->id, ctx->slave.self))
+            continue;
+        p = peer_entry(ctx, m->id);
+        if (!p || !p->alive)
+            continue; /* not visible: cannot vote in its absence */
+        if (m->priority > wprio ||
+            (m->priority == wprio && strcmp(m->id, winner) < 0)) {
+            wprio = m->priority;
+            winner = m->id;
+        }
+    }
+    if (strcmp(winner, ctx->slave.self) != 0)
+        return;
+
+    hadc_info("cluster: default-role election: promoting self (priority %d, %s)", wprio,
+              all_alive ? "all members alive" : "cluster timeout elapsed");
+    hadc_cluster_promote(ctx, ctx->slave.self);
 }
 
 int hadc_cluster_step(hadc_ctx_t *ctx)

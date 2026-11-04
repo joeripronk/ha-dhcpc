@@ -10,7 +10,10 @@ By default, **keepalived's VRRP handles the failover**: the VRRP master is the
 ha-dhcpc master, and its notify script promotes the node via `ha-dhcpc ctl promote`
 (backup/fault → `demote`). No built-in election is needed for now — selection is
 keepalived's priority; a manual cmdline override (`ha-dhcpc ctl promote <id>`)
-remains. The new master's duty is renew-only — it continues RENEW/REBIND on the
+remains. A `default_role: master` bootstrap election covers deployments without
+a designated master: single-node nodes elect immediately; cluster nodes elect
+(by priority, ties by id) once all members are alive and all slaves, or after
+`cluster_timeout_ms`. The new master's duty is renew-only — it continues RENEW/REBIND on the
 synced lease with the same identity. Every node carries a local **`master.conf`**
 with the designated master's MAC, which all members copy as their DHCP interface
 MAC — so a promoted node is byte-for-byte the same DHCP client identity.
@@ -63,8 +66,11 @@ MAC — so a promoted node is byte-for-byte the same DHCP client identity.
    not dropped — dropping the IP is the failure mode we are designing away.
 5. **Keepalived decides, ha-dhcpc obeys:** failover is handled by keepalived VRRP
    by default — its `priority` selects the new master and its notify scripts drive
-   `ha-dhcpc ctl promote/demote`. No built-in election for now (v2 candidate).
-   Manual override via `ctl promote <id>`. A promoted node's duty is renew-only
+   `ha-dhcpc ctl promote/demote`. No built-in election for now (v2 candidate),
+   except the `default_role` bootstrap election (single-node immediate; cluster
+   elects when all members are alive and all slaves, or after `cluster_timeout_ms`;
+   by priority, ties by id). Manual override via `ctl promote <id>`. A promoted
+   node's duty is renew-only
    (continue RENEW/REBIND on the synced lease); the full DHCP lifecycle belongs to
    the designated master on cold start or after total lease loss.
 6. **Silent standby + built-in ARP/NS responder:** because every member carries
@@ -148,7 +154,8 @@ Components:
   VRRP master is the ha-dhcpc master. `notify_master` → `ha-dhcpc ctl promote`,
   `notify_backup`/`notify_fault` → `ha-dhcpc ctl demote`. Selection is by
   keepalived `priority` (single source of truth; `slave.conf` mirrors it for
-  reference). No built-in election in v1; manual override via
+  reference). No built-in election in v1 (except the `default_role` bootstrap
+  election above); manual override via
   `ha-dhcpc ctl promote <id>`. Dead-master detection and quorum alarm in v1;
   dual-master is settled by a demote issued anywhere and propagated cluster-wide
   over the UDP control path.

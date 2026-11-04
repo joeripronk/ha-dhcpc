@@ -26,7 +26,9 @@ typedef struct {
         uint32_t heartbeat_ms;
         uint32_t election_deadline_ms; /* dead-master detection, alarm-only v1 */
         hadc_quorum_mode_t quorum;     /* alarm-only v1 */
+        uint32_t cluster_timeout_ms;   /* default-role bootstrap deadline, 0=off */
     } cluster;
+    bool default_role_master;          /* adopt when no master is known (plan §4) */
     struct {
         hadc_retention_policy_t retention;
         uint64_t retention_max_duration_s; /* used when retention=max_duration */

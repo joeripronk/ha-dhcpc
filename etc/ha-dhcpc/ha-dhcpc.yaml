@@ -4,6 +4,14 @@ cluster:
   heartbeat_ms: 2000
   election_deadline_ms: 6000  # dead-master detection (alarm-only in v1)
   quorum: majority             # alarm-only in v1 (dual-master guard)
+  cluster_timeout_ms: 0        # default-role bootstrap deadline (0=off); when
+                               # elapsed a default_role:master node elects among
+                               # the members it can currently see
+default_role: slave            # master = bootstrap election when no master is
+                               # known: single-node immediately, all members
+                               # alive and all slaves, or after cluster_timeout;
+                               # election by priority (master.conf mirrors
+                               # slave.conf), ties by node id
 dhcp:
   retention: forever          # forever | max_duration | until_carrier_loss | off
   rediscover_in_retention: true

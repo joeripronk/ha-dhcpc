@@ -320,6 +320,7 @@ int main(int argc, char **argv)
     hadc_cluster_set_role_hook(cb_role_change, ctx);
     if (hadc_cluster_init(ctx) != 0)
         return 1;
+    hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
     if (hadc_executor_init(ctx) != 0)
         return 1;
 
