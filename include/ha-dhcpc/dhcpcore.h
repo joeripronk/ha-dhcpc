@@ -34,4 +34,14 @@ int hadc_dhcpcore_step(hadc_ctx_t *ctx);   /* pump engine + timers */
  * node resumes renew-only on the synced lease (plan §4/§5). */
 int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease);
 
+/* Config reload (plan §6): push the live-settable knobs (retention, rate
+ * limit, renew retry) to a running engine; requested options and the hook
+ * script are read at engine start, so a change there needs the restart below. */
+int hadc_dhcpcore_reload(hadc_ctx_t *ctx);
+
+/* The engine re-enters on the new interface: old interface registrations are
+ * dropped, sockets reopened, and the state machine re-enters (INIT-REBOOT on
+ * the existing lease, INIT-SELECT when there is none). Master-only. */
+int hadc_dhcpcore_restart(hadc_ctx_t *ctx);
+
 #endif /* HA_DHCPC_DHCPCORE_H */

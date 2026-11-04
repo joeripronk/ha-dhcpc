@@ -321,6 +321,104 @@ dhcp_core_set_renew_retry_interval_s(long s)
 	core_renew_retry_interval_s = s > 0 ? s : 0;
 }
 
+/* Daemon integration (config reload): point the lease DB at a new path. The
+ * file itself is not moved; the core simply reads and writes this path from
+ * now on (plan §6 lease_file). An empty path opts out of the file entirely. */
+void
+dhcp_core_set_lease_db(const char *lease_db)
+{
+	char *dup;
+
+	if (lease_db == NULL)
+		return;
+	dup = strdup(lease_db);
+	if (dup == NULL)
+		return;
+	free(path_dhclient_db);
+	path_dhclient_db = dup;
+}
+
+/* Daemon integration (plan §3/§5/§8): the persisted lease the core should
+ * resume on when there is no lease DB. Set before dhcp_core_start(). */
+static struct dhcp_core_lease core_preset;
+static int core_preset_set;
+
+void
+dhcp_core_preset_lease(const struct dhcp_core_lease *preset)
+{
+	if (preset == NULL) {
+		core_preset_set = 0;
+		return;
+	}
+	core_preset = *preset;
+	core_preset_set = 1;
+}
+
+/* Enter S_BOUND on the daemon's persisted lease: identity, pinned server-id
+ * and the timers are all we need, and nothing is sent until a timer is due
+ * (the renewal goes unicast to the server that owns the lease). */
+static void
+resume_on_preset(struct interface_info *ip)
+{
+	struct client_lease *lease;
+	struct option_data *opt;
+	struct {
+		int number;
+		const uint8_t *src;
+	} opts[4];
+	int i;
+
+	lease = malloc(sizeof(*lease));
+	if (lease == NULL) {
+		warning("resume: no memory for the persisted lease; re-selecting");
+		state_reboot(ip);
+		return;
+	}
+	memset(lease, 0, sizeof(*lease));
+
+	lease->address.len = 4;
+	memcpy(lease->address.iabuf, core_preset.address, 4);
+
+	opts[0].number = DHO_SUBNET_MASK;
+	opts[0].src = core_preset.netmask;
+	opts[1].number = DHO_ROUTERS;
+	opts[1].src = core_preset.gateway;
+	opts[2].number = DHO_DHCP_SERVER_IDENTIFIER;
+	opts[2].src = core_preset.server_id;
+	opts[3].number = -1;
+
+	for (i = 0; i < 3; i++) {
+		if (memcmp(opts[i].src, "\0\0\0\0", 4) == 0)
+			continue;
+		opt = &lease->options[opts[i].number];
+		opt->data = malloc(4);
+		if (opt->data == NULL)
+			continue;
+		memcpy(opt->data, opts[i].src, 4);
+		opt->len = 4;
+	}
+	if (core_preset.n_dns > 0) {
+		opt = &lease->options[DHO_DOMAIN_NAME_SERVERS];
+		opt->data = malloc(4 * core_preset.n_dns);
+		if (opt->data != NULL) {
+			memcpy(opt->data, core_preset.dns, 4 * core_preset.n_dns);
+			opt->len = 4 * core_preset.n_dns;
+		}
+	}
+
+	lease->renewal = cur_time + core_preset.t1_remaining_s;
+	lease->rebind = cur_time + core_preset.t2_remaining_s;
+	lease->expiry = cur_time + core_preset.t3_remaining_s;
+	lease->medium = ip->client->medium;
+
+	ip->client->active = lease;
+	ip->client->state = S_BOUND;
+	add_timeout(lease->renewal, state_bound, ip);
+
+	note("resumed on the daemon's persisted lease (no lease DB): %s, renewal in %d s",
+	    piaddr(lease->address), (int)(lease->renewal - cur_time));
+}
+
 /* Minimum retry interval implied by the send pacing window, in seconds. */
 static long
 paced_min_interval(void)
@@ -468,11 +566,15 @@ dhcp_core_start(const char *interface, const char *lease_db,
 
 	/* Read persisted leases (BSD used O_EXLOCK; lease-file locking is
 	   the daemon's concern on Linux). */
-	if ((fd = open(path_dhclient_db, O_RDONLY | O_CREAT, 0644)) == -1)
-		error("can't open %s: %m", path_dhclient_db);
-	read_client_leases();
-	rewrite_client_leases();
-	close(fd);
+	/* An empty lease DB means the daemon opted out of the file entirely: the
+	   core then starts with no stored lease (plan §6 lease_file: none). */
+	if (path_dhclient_db != NULL && *path_dhclient_db != '\0') {
+		if ((fd = open(path_dhclient_db, O_RDONLY | O_CREAT, 0644)) == -1)
+			error("can't open %s: %m", path_dhclient_db);
+		read_client_leases();
+		rewrite_client_leases();
+		close(fd);
+	}
 
 	/* rtnetlink link/address watch (replaces BSD PF_ROUTE). */
 	if ((routefd = linux_route_socket()) != -1)
@@ -480,6 +582,70 @@ dhcp_core_start(const char *interface, const char *lease_db,
 
 	ifi->client->state = S_INIT;
 	bootp_packet_handler = do_packet;
+	if (core_preset_set)
+		resume_on_preset(ifi);
+	else
+		state_reboot(ifi);
+
+	return (0);
+}
+
+/*
+ * Daemon integration: re-enter the engine on a different interface (config
+ * reload, plan §6). The old interface's protocol registrations are dropped and
+ * their fds closed — the daemon drops them from its own epoll set first — the
+ * interface identity is re-discovered (which reopens the packet and raw-UDP
+ * sockets and re-registers it), the lease-db path follows the new interface
+ * name, and the state machine re-enters on the lease we already hold
+ * (INIT-SELECT when there is none). The rtnetlink watch is untouched.
+ *
+ * Refuses without touching anything when the interface is absent. An interface
+ * that is present but has no carrier is accepted, exactly as at startup: the
+ * core keeps a carrier watch on it (SIOCGIFFLAGS cannot report IFF_LOWER_UP, so
+ * a carrier check here would refuse every live interface).
+ */
+int
+dhcp_core_restart(const char *interface, const char *lease_db)
+{
+	char *db = NULL;
+
+	if (ifi == NULL || ifi->client == NULL)
+		return (-1);
+	if (strlen(interface) >= IFNAMSIZ)
+		return (-1);
+	if (if_nametoindex(interface) == 0) {
+		warning("dhcp_core_restart: %s: not found", interface);
+		return (-1);
+	}
+	if (lease_db != NULL) {
+		db = strdup(lease_db); /* may be empty: lease DB opted out */
+	} else {
+		if (asprintf(&db, "%s.%s", _PATH_DHCLIENT_DB, interface) == -1)
+			db = NULL;
+	}
+	if (db == NULL)
+		return (-1);
+
+	/* The daemon has already dropped these fds from its epoll set. */
+	dhcp_core_drop_interface(ifi);
+
+	free(path_dhclient_db);
+	path_dhclient_db = db;
+
+	strlcpy(ifi->name, interface, IFNAMSIZ);
+	if (ifi->ifp != NULL) {
+		free(ifi->ifp);
+		ifi->ifp = NULL;
+	}
+	ifi->index = (u_int16_t)if_nametoindex(ifi->name);
+	ifi->errors = 0;
+	ifi->dead = 0;
+	ifi->linkstat = 1;
+
+	note("re-entering on %s (config reload)", ifi->name);
+	discover_interfaces(ifi);
+
+	ifi->client->state = S_INIT;
 	state_reboot(ifi);
 
 	return (0);
@@ -1916,6 +2082,9 @@ rewrite_client_leases(void)
 {
 	struct client_lease *lp;
 
+	if (path_dhclient_db == NULL || *path_dhclient_db == '\0')
+		return; /* lease DB opted out (plan §6 lease_file: none) */
+
 	if (!leaseFile) {
 		leaseFile = fopen(path_dhclient_db, "w");
 		if (!leaseFile)
@@ -1935,12 +2104,49 @@ rewrite_client_leases(void)
 	fsync(fileno(leaseFile));
 }
 
+/*
+ * The daemon runs its timers on CLOCK_MONOTONIC (plan §8), so the lease
+ * struct's renewal/rebind/expiry are monotonic-based. The lease file keeps
+ * dhclient-compatible wall-clock stamps, so convert at the file boundary using
+ * this offset — sampled once so the round-trip is stable.
+ */
+time_t
+dhcp_monotonic_to_epoch_offset(void)
+{
+	static time_t offset;
+	struct timespec mono, real;
+
+	if (offset == 0) {
+		clock_gettime(CLOCK_MONOTONIC, &mono);
+		clock_gettime(CLOCK_REALTIME, &real);
+		offset = real.tv_sec - mono.tv_sec;
+	}
+	return (offset);
+}
+
+time_t
+dhcp_mono_to_file_time(time_t mono)
+{
+	time_t off = dhcp_monotonic_to_epoch_offset();
+
+	if (mono > 0 && off > 0 && mono > TIME_MAX - off)
+		return (TIME_MAX);
+	return (mono + off);
+}
+
+time_t
+dhcp_file_to_mono_time(time_t epoch)
+{
+	return (epoch - dhcp_monotonic_to_epoch_offset());
+}
+
 void
 write_client_lease(struct interface_info *ip, struct client_lease *lease,
     int rewrite)
 {
 	static int leases_written;
 	struct tm *t;
+	time_t when;
 	int i;
 
 	if (!rewrite) {
@@ -1949,6 +2155,9 @@ write_client_lease(struct interface_info *ip, struct client_lease *lease,
 			leases_written = 0;
 		}
 	}
+
+	if (path_dhclient_db == NULL || *path_dhclient_db == '\0')
+		return; /* lease DB opted out (plan §6 lease_file: none) */
 
 	/* If the lease came from the config file, we don't need to stash
 	   a copy in the lease database. */
@@ -1985,15 +2194,18 @@ write_client_lease(struct interface_info *ip, struct client_lease *lease,
 			    pretty_print_option(i, lease->options[i].data,
 			    lease->options[i].len, 1, 1));
 
-	t = gmtime(&lease->renewal);
+	when = dhcp_mono_to_file_time(lease->renewal);
+	t = gmtime(&when);
 	fprintf(leaseFile, "  renew %d %d/%d/%d %02d:%02d:%02d;\n",
 	    t->tm_wday, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
 	    t->tm_hour, t->tm_min, t->tm_sec);
-	t = gmtime(&lease->rebind);
+	when = dhcp_mono_to_file_time(lease->rebind);
+	t = gmtime(&when);
 	fprintf(leaseFile, "  rebind %d %d/%d/%d %02d:%02d:%02d;\n",
 	    t->tm_wday, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
 	    t->tm_hour, t->tm_min, t->tm_sec);
-	t = gmtime(&lease->expiry);
+	when = dhcp_mono_to_file_time(lease->expiry);
+	t = gmtime(&when);
 	fprintf(leaseFile, "  expire %d %d/%d/%d %02d:%02d:%02d;\n",
 	    t->tm_wday, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
 	    t->tm_hour, t->tm_min, t->tm_sec);

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/persist.h"
@@ -142,6 +143,31 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         }
     }
 
+    json_t *sa = json_object_get(root, "saved_at_utc");
+    if (sa && json_is_integer(sa) && out->lease.address.s_addr != 0) {
+        long long elapsed = (long long)time(NULL) - json_integer_value(sa);
+        long long cap = 2 * (long long)out->lease.t3_remaining_s;
+        if (cap > 86400)
+            cap = 86400;
+        if (elapsed < 0)
+            hadc_warn("persist: saved_at_utc is %lld s ahead of the clock (jump); keeping "
+                      "the stored timers",
+                      -elapsed);
+        else if (elapsed > cap)
+            hadc_warn("persist: downtime %lld s exceeds the %lld s sanity cap; keeping the "
+                      "stored timers",
+                      elapsed, cap);
+        else if (elapsed > 0) {
+            uint32_t *rem[3] = { &out->lease.t1_remaining_s, &out->lease.t2_remaining_s,
+                                  &out->lease.t3_remaining_s };
+            for (int i = 0; i < 3; i++)
+                *rem[i] = (long long)*rem[i] > elapsed ? (uint32_t)((long long)*rem[i] -
+                                                                    elapsed)
+                                                       : 0;
+            hadc_info("persist: timers recalculated from UTC (downtime %lld s)", elapsed);
+        }
+    }
+
     json_decref(root);
     return 0;
 }
@@ -151,13 +177,14 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     json_t *lj = lease_json(&ctx->lease);
     if (!lj)
         return -1;
-    json_t *o = json_pack("{s:s, s:I, s:I, s:s, s:O}", "role",
+    json_t *o = json_pack("{s:s, s:I, s:I, s:s, s:s, s:I, s:O}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
                                                          : "unknown",
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
                           (json_int_t)ctx->acked_version, "interface", ctx->conf.interface,
-                          "lease", lj);
+                          "conf_sha256", ctx->conf.sha256, "saved_at_utc",
+                          (json_int_t)time(NULL), "lease", lj);
     if (!o) {
         json_decref(lj);
         return -1;

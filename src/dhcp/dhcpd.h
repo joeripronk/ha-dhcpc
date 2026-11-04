@@ -460,8 +460,31 @@ void dhcp_core_set_rate_limit_ms(long ms);
 void dhcp_core_set_renew_retry_interval_s(long s);
 int  dhcp_core_start(const char *interface, const char *lease_db,
     const char *hook_script);
+void dhcp_core_set_lease_db(const char *lease_db);
+/* Daemon integration (plan §3/§5/§8): resume on the daemon's persisted lease
+ * when there is no lease DB. Set before dhcp_core_start(): the core then
+ * enters S_BOUND on this lease and sends nothing until a timer is due (the
+ * renewal goes unicast to the pinned server-id) — a restart reuses the state
+ * instead of re-selecting. */
+struct dhcp_core_lease {
+	uint8_t address[4];
+	uint8_t netmask[4];
+	uint8_t gateway[4];
+	uint8_t server_id[4];
+	uint8_t dns[8][4];
+	int n_dns;
+	time_t t1_remaining_s;
+	time_t t2_remaining_s;
+	time_t t3_remaining_s;
+};
+void dhcp_core_preset_lease(const struct dhcp_core_lease *preset);
+time_t dhcp_monotonic_to_epoch_offset(void);
+time_t dhcp_mono_to_file_time(time_t mono);
+time_t dhcp_file_to_mono_time(time_t epoch);
 void dhcp_core_run_timeouts(void);
 long dhcp_core_next_timeout_ms(void);
 int  dhcp_core_get_fds(int *fds, int max);
+int  dhcp_core_restart(const char *interface, const char *lease_db);
+int  dhcp_core_drop_interface(struct interface_info *);
 void dispatch_step(void);
 int  linux_route_socket(void);

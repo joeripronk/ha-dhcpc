@@ -498,6 +498,29 @@ remove_protocol(struct protocol *proto)
 	}
 }
 
+/*
+ * Daemon integration (config reload): drop an interface's own protocol
+ * registrations and close their fds; returns how many were dropped. Other
+ * registrations that merely point at the interface (the rtnetlink watch) are
+ * left alone. The daemon drops the same fds from its own epoll set first.
+ */
+int
+dhcp_core_drop_interface(struct interface_info *ip)
+{
+	struct protocol *p, *next;
+	int n = 0;
+
+	for (p = protocols; p != NULL; p = next) {
+		next = p->next;
+		if ((void *)p->local != (void *)ip || p->handler != got_one)
+			continue;
+		close(p->fd);
+		remove_protocol(p);
+		n++;
+	}
+	return (n);
+}
+
 int
 interface_link_status(char *ifname)
 {

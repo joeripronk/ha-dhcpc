@@ -3,9 +3,11 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/persist.h"
@@ -82,6 +84,39 @@ int main(void)
         rc |= fail("timers");
     if (memcmp(pv.lease.config_hash, a->lease.config_hash, 32) != 0)
         rc |= fail("config_hash");
+
+    /* Restart recalculates remaining time from UTC (plan §8), with a sanity cap
+     * min(2*t3, 24 h) on crazy jumps. */
+    {
+        static const struct {
+            long long saved_delta; /* saved_at_utc = now + delta */
+            uint32_t t1, t2, t3;   /* expected after load */
+            const char *what;
+        } cases[] = {
+            { -300, 7700, 9700, 11700, "recalc within cap" },
+            { 300, 8000, 10000, 12000, "clock jump keeps stored timers" },
+            { -(long long)86401, 8000, 10000, 12000, "downtime beyond cap keeps stored timers" },
+            { -(long long)24000, 0, 0, 0, "downtime past expiry clamps to zero" },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            json_error_t jerr;
+            json_t *root = json_loadf(fopen(path, "r"), 0, &jerr);
+            if (!root)
+                return fail("reopen");
+            json_object_set_new(root, "saved_at_utc",
+                                json_integer((json_int_t)time(NULL) + cases[i].saved_delta));
+            FILE *f = fopen(path, "w");
+            json_dumpf(root, f, 0);
+            fclose(f);
+            json_decref(root);
+            hadc_persist_view_t v;
+            if (hadc_persist_load(b, &v) != 0)
+                return fail("recalc load");
+            if (v.lease.t1_remaining_s != cases[i].t1 || v.lease.t2_remaining_s != cases[i].t2 ||
+                v.lease.t3_remaining_s != cases[i].t3)
+                rc |= fail(cases[i].what);
+        }
+    }
 
     unlink(path);
     if (rc == 0)

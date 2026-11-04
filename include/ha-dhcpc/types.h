@@ -39,7 +39,7 @@ typedef uint8_t hadc_hash_t[32];
 typedef struct {
     char id[HADC_NODE_ID_MAX];
     struct in_addr sync_address; /* distinct per-node secondary addr, plan §2.2 */
-    int priority;                /* mirrors that node's slave.conf; default-role election */
+    int priority;                /* mirrors that node's local overlay; default-role election */
 } hadc_member_t;
 
 static inline bool hadc_mac_equal(const uint8_t a[HADC_MAC_LEN], const uint8_t b[HADC_MAC_LEN])

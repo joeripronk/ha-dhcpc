@@ -1,6 +1,7 @@
 build/
 /tests_sha256
 /tests_persist
+/tests_config
 *.d
 /ha-dhcpc
 /vendor/

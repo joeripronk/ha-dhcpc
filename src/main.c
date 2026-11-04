@@ -183,21 +183,21 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--master-conf PATH] [--slave-conf PATH] [--conf PATH]\n"
-            "       %s [--persist PATH] [--oneshot]\n"
-            "       %s [--conf PATH] ctl promote|demote|status [id]\n",
-            argv0, argv0, argv0);
+            "usage: %s [--conf PATH] [--local-conf PATH] [--persist PATH] [--oneshot]\n"
+            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update [id]\n"
+            "       (--persist default: state.json next to --conf)\n",
+            argv0, argv0);
 }
 
-/* Client mode: ha-dhcpc [conf path] ctl promote|demote|status [id] (plan §3). */
-static int ctl_client(const char *conf_path, const char *cmd_line)
+/* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update [id] (plan §3). */
+static int ctl_client(const char *conf_path, const char *local_path, const char *cmd_line)
 {
-    hadc_daemon_conf_t conf;
+    hadc_conf_t conf;
     char err[256];
     char line[256];
     char reply[4096];
 
-    if (hadc_config_load_daemon(conf_path, &conf, err, sizeof(err)) != 0) {
+    if (hadc_config_load(conf_path, local_path, &conf, err, sizeof(err)) != 0) {
         fprintf(stderr, "ha-dhcpc ctl: %s\n", err);
         return 1;
     }
@@ -227,16 +227,19 @@ static int ctl_client(const char *conf_path, const char *cmd_line)
 
 int main(int argc, char **argv)
 {
-    const char *master_path = "/etc/ha-dhcpc/master.conf";
-    const char *slave_path = "/etc/ha-dhcpc/slave.conf";
-    const char *conf_path = "/etc/ha-dhcpc/ha-dhcpc.yaml";
-    const char *persist_path = "/var/lib/ha-dhcpc/state.json";
+    const char *conf_path = "/etc/ha-dhcpc/ha-dhcpc.conf";
+    const char *local_path = "/etc/ha-dhcpc/ha-dhcpc-local.conf";
+    const char *persist_path = NULL; /* default: state.json next to the config */
     bool oneshot = false;
     hadc_ctx_t *ctx = &g_ctx;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--conf") && i + 1 < argc) {
             conf_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(argv[i], "--local-conf") && i + 1 < argc) {
+            local_path = argv[++i];
             continue;
         }
         if (!strcmp(argv[i], "ctl") && i + 1 < argc) {
@@ -246,17 +249,15 @@ int main(int argc, char **argv)
                     strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
                 strncat(cmd, argv[j], sizeof(cmd) - strlen(cmd) - 1);
             }
-            return ctl_client(conf_path, cmd);
+            return ctl_client(conf_path, local_path, cmd);
         }
     }
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--master-conf") && i + 1 < argc)
-            master_path = argv[++i];
-        else if (!strcmp(argv[i], "--slave-conf") && i + 1 < argc)
-            slave_path = argv[++i];
-        else if (!strcmp(argv[i], "--conf") && i + 1 < argc)
+        if (!strcmp(argv[i], "--conf") && i + 1 < argc)
             conf_path = argv[++i];
+        else if (!strcmp(argv[i], "--local-conf") && i + 1 < argc)
+            local_path = argv[++i];
         else if (!strcmp(argv[i], "--persist") && i + 1 < argc)
             persist_path = argv[++i];
         else if (!strcmp(argv[i], "--oneshot"))
@@ -267,21 +268,37 @@ int main(int argc, char **argv)
         }
     }
 
+    /* Default state file: next to the shared config file (plan §3/§6). */
+    char persist_default[PATH_MAX];
+    if (!persist_path) {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof(dir), "%s", conf_path); /* conf_path may be a literal */
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            *slash = '\0';
+            snprintf(persist_default, sizeof(persist_default), "%s/state.json", dir);
+        } else {
+            snprintf(persist_default, sizeof(persist_default), "/var/lib/ha-dhcpc/state.json");
+        }
+        persist_path = persist_default;
+    }
+
     char err[512];
-    if (hadc_config_load_master(master_path, &ctx->master, err, sizeof(err)) ||
-        hadc_config_load_slave(slave_path, &ctx->slave, err, sizeof(err)) ||
-        hadc_config_load_daemon(conf_path, &ctx->conf, err, sizeof(err))) {
+    if (hadc_config_load(conf_path, local_path, &ctx->conf, err, sizeof(err))) {
         hadc_err("config: %s", err);
         return 1;
     }
 
-    /* Initial role: obey persisted view, else the designated master in master.conf. */
+    /* Initial role: obey persisted view, else the designated master in the
+     * shared config. */
     hadc_persist_init(ctx, persist_path);
     hadc_persist_view_t pv;
     hadc_persist_load(ctx, &pv);
-    ctx->role = pv.found ? pv.role : (!strcmp(ctx->master.designated_master, ctx->slave.self)
-                                          ? HADC_ROLE_MASTER
-                                          : HADC_ROLE_SLAVE);
+    ctx->role = pv.found ? pv.role
+                         : (!strcmp(ctx->conf.designated_master, ctx->conf.self)
+                                ? HADC_ROLE_MASTER
+                                : HADC_ROLE_SLAVE);
+
     if (pv.found) {
         ctx->lease = pv.lease;
         ctx->lease.version = pv.lease_version;
@@ -299,15 +316,15 @@ int main(int argc, char **argv)
                   (unsigned long long)ctx->acked_version);
     }
 
-    const char *self_mac_src = "master.conf";
     char macstr[32];
-    snprintf(macstr, sizeof(macstr), "%02x:%02x:%02x:%02x:%02x:%02x", ctx->master.master_mac[0],
-             ctx->master.master_mac[1], ctx->master.master_mac[2], ctx->master.master_mac[3],
-             ctx->master.master_mac[4], ctx->master.master_mac[5]);
-    hadc_info("node %s priority=%d role=%s interface=%s (DHCP MAC %s copied from %s)",
-              ctx->slave.self, ctx->slave.priority,
+    snprintf(macstr, sizeof(macstr), "%02x:%02x:%02x:%02x:%02x:%02x", ctx->conf.master_mac[0],
+             ctx->conf.master_mac[1], ctx->conf.master_mac[2], ctx->conf.master_mac[3],
+             ctx->conf.master_mac[4], ctx->conf.master_mac[5]);
+    hadc_info("node %s priority=%d role=%s interface=%s (DHCP MAC %s; shared conf %s sha256=%s)",
+              ctx->conf.self, ctx->conf.priority,
               ctx->role == HADC_ROLE_MASTER ? "MASTER" : "SLAVE", ctx->conf.interface, macstr,
-              self_mac_src);
+              ctx->conf.base_path, ctx->conf.sha256);
+
 
     ctx->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (ctx->epfd < 0) {
@@ -333,11 +350,18 @@ int main(int argc, char **argv)
         return 1;
 
     /* Startup desired-state pass from the restored cache: apply the interface
-     * before the DHCP engine starts (idempotent, hooks fire only on delta). */
+     * before the DHCP engine starts (idempotent, hooks fire only on delta). A
+     * node that resumes on a persisted lease starts in retention (plan §5): the
+     * config is held, nothing is sent, and the engine acts only when a timer is
+     * due (renewal unicast to the pinned server-id). */
     {
         hadc_desired_t desired;
+        bool resume = pv.found && ctx->lease.address.s_addr != 0;
         hadc_executor_desired(ctx, &ctx->lease, &desired);
-        hadc_executor_apply(ctx, &desired, HADC_REASON_REBOOT);
+        if (resume && ctx->conf.dhcp.retention != HADC_RETENTION_OFF)
+            cb_retention(ctx, true);
+        else
+            hadc_executor_apply(ctx, &desired, HADC_REASON_REBOOT);
         ctx->acked_version = ctx->lease.version;
     }
 

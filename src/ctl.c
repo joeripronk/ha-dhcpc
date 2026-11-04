@@ -18,6 +18,7 @@
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/reload.h"
 #include "internal.h"
 
 static const char *role_name(hadc_role_t r)
@@ -25,24 +26,29 @@ static const char *role_name(hadc_role_t r)
     return r == HADC_ROLE_MASTER ? "master" : (r == HADC_ROLE_SLAVE ? "slave" : "unknown");
 }
 
+static char g_ctl_path[HADC_PATH_MAX]; /* where ctl_fd is bound (rebind check) */
+
 static json_t *status_object(hadc_ctx_t *ctx)
 {
     json_t *o = json_pack(
-        "{s:s, s:s, s:s, s:I, s:b, s:o}", "role", role_name(ctx->role), "self",
-        ctx->slave.self, "master", ctx->master.designated_master, "lease_version",
-        (json_int_t)ctx->lease.version, "retention", (int)ctx->lease.retention_active, "timers",
+        "{s:s, s:s, s:s, s:I, s:b, s:s, s:o}", "role", role_name(ctx->role), "self",
+        ctx->conf.self, "master", ctx->conf.designated_master, "lease_version",
+        (json_int_t)ctx->lease.version, "retention", (int)ctx->lease.retention_active,
+        "conf_sha256", ctx->conf.sha256, "timers",
         json_pack("{s:I, s:I}", "heartbeat_ms", (json_int_t)ctx->conf.cluster.heartbeat_ms,
                   "election_deadline_ms", (json_int_t)ctx->conf.cluster.election_deadline_ms));
     if (!o)
         return NULL;
     json_t *members = json_array();
-    for (size_t i = 0; i < ctx->master.n_members; i++) {
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
         char addr[64];
-        snprintf(addr, sizeof(addr), "%s", inet_ntoa(ctx->master.members[i].sync_address));
+        snprintf(addr, sizeof(addr), "%s", inet_ntoa(ctx->conf.members[i].sync_address));
         json_array_append_new(
-            members, json_pack("{s:s, s:s, s:b, s:I}", "id", ctx->master.members[i].id,
-                               "sync_address", addr, "alive", ctx->peers[i].alive,
-                               "acked_version", (json_int_t)ctx->peers[i].acked_version));
+            members,
+            json_pack("{s:s, s:s, s:b, s:I, s:s}", "id", ctx->conf.members[i].id, "sync_address",
+                      addr, "alive", ctx->peers[i].alive, "acked_version",
+                      (json_int_t)ctx->peers[i].acked_version, "conf_sha256",
+                      ctx->peers[i].conf_sha256));
     }
     json_object_set_new(o, "members", members);
     return o;
@@ -76,6 +82,23 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             (void)!write(reply_fd, &nl, 1);
             free(txt);
             reply = NULL;
+        }
+    } else if (!strcmp(cmd, "update")) {
+        /* The master's copy of the shared document is authoritative (plan §6):
+         * re-read it from disk, apply it here, then publish it to every member. */
+        if (ctx->role != HADC_ROLE_MASTER) {
+            hadc_warn("ctl: update refused here (role %s); only the master publishes",
+                      role_name(ctx->role));
+            reply = "{\"ok\":false,\"error\":\"not master\"}";
+        } else if (hadc_conf_reload(ctx, "ctl_update") != 0) {
+            reply = "{\"ok\":false,\"error\":\"reload failed; config in use unchanged\"}";
+        } else {
+            char out[192], nl = '\n';
+            snprintf(out, sizeof(out), "{\"ok\":true,\"conf_sha256\":\"%s\"}", ctx->conf.sha256);
+            (void)!write(reply_fd, out, strlen(out));
+            (void)!write(reply_fd, &nl, 1);
+            reply = NULL;
+            hadc_cluster_push_conf(ctx, NULL);
         }
     } else {
         hadc_warn("ctl: unknown command '%s'", cmd);
@@ -132,8 +155,41 @@ int hadc_ctl_init(hadc_ctx_t *ctx)
     }
     listen(ctx->ctl_fd, 8);
     hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, 0);
+    snprintf(g_ctl_path, sizeof(g_ctl_path), "%s", addr.sun_path);
     hadc_info("ctl: listening on %s", ctx->conf.ctl_socket);
     return 0;
+}
+
+/* Move the control socket after a reload changed ctl_socket; 0 when unchanged. */
+int hadc_ctl_rebind(hadc_ctx_t *ctx)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctx->conf.ctl_socket);
+    if (ctx->ctl_fd >= 0 && strcmp(addr.sun_path, g_ctl_path) == 0)
+        return 0;
+
+    if (ctx->ctl_fd >= 0) {
+        hadc_loop_del(ctx, ctx->ctl_fd);
+        close(ctx->ctl_fd);
+        ctx->ctl_fd = -1;
+        unlink(g_ctl_path);
+    }
+    ctx->ctl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (ctx->ctl_fd < 0) {
+        hadc_err("ctl: socket: %s", strerror(errno));
+        return -1;
+    }
+    if (bind(ctx->ctl_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        hadc_err("ctl: bind %s: %s", ctx->conf.ctl_socket, strerror(errno));
+        close(ctx->ctl_fd);
+        ctx->ctl_fd = -1;
+        return -1;
+    }
+    listen(ctx->ctl_fd, 8);
+    hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, 0);
+    snprintf(g_ctl_path, sizeof(g_ctl_path), "%s", addr.sun_path);
+    hadc_info("ctl: control socket moved to %s", g_ctl_path);
+    return 1;
 }
 
 int hadc_ctl_step(hadc_ctx_t *ctx)

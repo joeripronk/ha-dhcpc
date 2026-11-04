@@ -20,7 +20,7 @@ run() {
 }
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
-for f in ha-dhcpc.yaml master.conf slave.conf "$UNIT"; do
+for f in ha-dhcpc.conf ha-dhcpc-local.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done
 
@@ -28,12 +28,26 @@ make -C "$REPO_DIR" -s
 make -C "$REPO_DIR" -s test
 
 changed=0
-for f in ha-dhcpc.yaml master.conf slave.conf; do
+for f in ha-dhcpc.conf ha-dhcpc-local.conf; do
 	if [ ! -f "$CONF_DIR/$f" ] || ! cmp -s "$SRC_DIR/$f" "$CONF_DIR/$f"; then
 		changed=1
 		run "install -m 640 $SRC_DIR/$f $CONF_DIR/$f"
 	fi
 done
+# old three-file layout (plan §6): the daemon no longer reads these, so they
+# are removed to keep one source of truth on the node.
+retired=0
+for f in ha-dhcpc.yaml master.conf slave.conf; do
+	[ -f "$CONF_DIR/$f" ] || continue
+	retired=1
+	run "rm -f $CONF_DIR/$f"
+done
+[ "$retired" = 1 ] && changed=1
+# state file: the default moved next to the config (plan §3/§6); move a legacy
+# one over when the node has not written its new one yet.
+if [ ! -f "$CONF_DIR/state.json" ] && [ -f /var/lib/ha-dhcpc/state.json ]; then
+	run "mv /var/lib/ha-dhcpc/state.json $CONF_DIR/state.json"
+fi
 if ! cmp -s "$SRC_DIR/$UNIT" "/etc/systemd/system/$UNIT"; then
 	changed=1
 	run "install -m 644 $SRC_DIR/$UNIT /etc/systemd/system/$UNIT"

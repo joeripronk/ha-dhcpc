@@ -158,6 +158,7 @@ static int g_core_live;    /* core inited once; never re-inited */
 static int g_running;       /* fds + timerfd registered with the loop */
 static int g_core_fds[CORE_FDS_MAX];
 static int g_n_core_fds;
+static char g_lease_db[PATH_MAX]; /* lease DB we last told the core about */
 
 int hadc_dhcpcore_start(hadc_ctx_t *ctx)
 {
@@ -188,10 +189,29 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
         dhcp_core_set_rate_limit_ms(ctx->conf.dhcp.rate_limit_ms);
         dhcp_core_set_renew_retry_interval_s(ctx->conf.dhcp.renew_retry_interval_s);
 
-        if (dhcp_core_start(ctx->conf.interface, NULL, NULL) != 0) {
+        /* No lease DB on this node: hand the engine the daemon's persisted (or
+         * synced) lease, so a restart reuses the state and the next action is
+         * the renewal that is actually due (plan §3/§5/§8). */
+        if (!ctx->conf.lease_file[0] && ctx->lease.address.s_addr != 0) {
+            struct dhcp_core_lease p;
+            memset(&p, 0, sizeof(p));
+            memcpy(p.address, &ctx->lease.address, 4);
+            memcpy(p.netmask, &ctx->lease.netmask, 4);
+            memcpy(p.gateway, &ctx->lease.gateway, 4);
+            memcpy(p.server_id, &ctx->lease.server_id, 4);
+            for (size_t i = 0; i < ctx->lease.n_dns && p.n_dns < 8; i++)
+                memcpy(p.dns[p.n_dns++], &ctx->lease.dns[i], 4);
+            p.t1_remaining_s = (time_t)ctx->lease.t1_remaining_s;
+            p.t2_remaining_s = (time_t)ctx->lease.t2_remaining_s;
+            p.t3_remaining_s = (time_t)ctx->lease.t3_remaining_s;
+            dhcp_core_preset_lease(&p);
+        }
+
+        if (dhcp_core_start(ctx->conf.interface, ctx->conf.lease_file, NULL) != 0) {
             hadc_err("dhcpcore: core start failed");
             return -1;
         }
+        snprintf(g_lease_db, sizeof(g_lease_db), "%s", ctx->conf.lease_file);
         for (size_t i = 0; i < ctx->conf.dhcp.n_request_options; i++)
             dhcp_core_add_requested_option(ctx->conf.dhcp.request_options[i]);
         ctx->core_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -237,6 +257,60 @@ int hadc_dhcpcore_stop(hadc_ctx_t *ctx)
     return 0;
 }
 
+/* Config reload (plan §6): push the live-settable knobs to a running engine.
+ * The requested-options list and the hook script are read at engine start, so
+ * a change there needs the restart below. The lease DB path is re-pointed (the
+ * file itself is not moved by us). */
+int hadc_dhcpcore_reload(hadc_ctx_t *ctx)
+{
+    if (!g_running)
+        return 0;
+    dhcp_core_set_retention(ctx->conf.dhcp.retention != HADC_RETENTION_OFF,
+                             ctx->conf.dhcp.rediscover_in_retention ? 1 : 0, 0, 0);
+    dhcp_core_set_rate_limit_ms(ctx->conf.dhcp.rate_limit_ms);
+    dhcp_core_set_renew_retry_interval_s(ctx->conf.dhcp.renew_retry_interval_s);
+    if (strcmp(ctx->conf.lease_file, g_lease_db) != 0) {
+        dhcp_core_set_lease_db(ctx->conf.lease_file);
+        snprintf(g_lease_db, sizeof(g_lease_db), "%s", ctx->conf.lease_file);
+        hadc_info("dhcpcore: lease DB is now %s (the file itself is not moved)", g_lease_db);
+    }
+    return 0;
+}
+
+/* The interface changed: drop our epoll registrations for the core's fds before
+ * the core closes them, re-enter the engine on the new interface, then register
+ * its current fds again. The core refuses (and touches nothing) when the new
+ * interface is absent or has no carrier; our registrations are restored then. */
+int hadc_dhcpcore_restart(hadc_ctx_t *ctx)
+{
+    int fds[CORE_FDS_MAX];
+
+    if (!g_running)
+        return 0; /* nothing registered: the next start uses the new interface */
+
+    for (int i = 0; i < g_n_core_fds; i++)
+        hadc_loop_del(ctx, g_core_fds[i]);
+    g_n_core_fds = 0;
+
+    int refused = dhcp_core_restart(ctx->conf.interface, ctx->conf.lease_file) != 0;
+    if (!refused)
+        snprintf(g_lease_db, sizeof(g_lease_db), "%s", ctx->conf.lease_file);
+
+    int n = dhcp_core_get_fds(fds, CORE_FDS_MAX);
+    for (int i = 0; i < n; i++)
+        if (hadc_loop_add(ctx, fds[i], core_fd_ready, 0) == 0 && g_n_core_fds < CORE_FDS_MAX)
+            g_core_fds[g_n_core_fds++] = fds[i];
+    core_arm_timer(ctx);
+
+    if (refused) {
+        hadc_warn("dhcpcore: restart on %s refused; staying on the current setup",
+                  ctx->conf.interface);
+        return -1;
+    }
+    hadc_info("dhcpcore: re-entered on %s (%d fds)", ctx->conf.interface, n);
+    return 0;
+}
+
 int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
     char path[PATH_MAX], tmp[PATH_MAX + 8], buf[64], buf2[64];
@@ -245,8 +319,9 @@ int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 
     if (lease->address.s_addr == 0)
         return 0; /* nothing to cache yet */
-    snprintf(path, sizeof(path), "/var/lib/ha-dhcpc/dhclient.leases.%s",
-             ctx->conf.interface);
+    if (!ctx->conf.lease_file[0])
+        return 0; /* lease DB opted out (plan §6 lease_file: none) */
+    snprintf(path, sizeof(path), "%s", ctx->conf.lease_file);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     f = fopen(tmp, "w");
     if (!f) {

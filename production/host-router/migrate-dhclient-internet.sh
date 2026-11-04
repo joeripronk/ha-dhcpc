@@ -2,11 +2,13 @@
 # Migrate this host's DHCP on the internet VLAN from dhclient-internet.service
 # to ha-dhcpc. Dry-run by default; run with --apply to perform the migration.
 #
-# The current lease is carried over (state.json boot cache + engine lease DB),
-# so ha-dhcpc comes up on the same lease and continues renew-only against the
-# pinned server-id: no DISCOVER, no address flap. The executor applies nothing
-# to the interface yet (netlink reconcile pending), so the running config from
-# dhclient-script simply stays in place.
+# The current lease is carried over through state.json (which lives next to the
+# config), so the daemon comes up on the same lease and the executor applies
+# nothing to the interface yet (netlink reconcile pending): the running config
+# from dhclient-script simply stays in place. This host opts out of the
+# dhclient-format lease DB (lease_file: none), so the engine starts with no
+# stored lease and re-acquires via DISCOVER once the server confirms: the
+# address may change there, and the executor moves it idempotently.
 #
 # Rollback: systemctl stop ha-dhcpc.service && systemctl start dhclient-internet
 set -eu
@@ -14,7 +16,7 @@ set -eu
 IFACE=internet
 DHCLIENT_LEASES=/var/lib/dhcp/dhclient.leases
 CONF_DIR=/etc/ha-dhcpc
-STATE_DIR=/var/lib/ha-dhcpc
+STATE_DIR=/etc/ha-dhcpc   # state file lives next to the config
 UNIT=ha-dhcpc.service
 SRC_DIR=$(dirname "$0")
 BINARY=${BINARY:-/usr/local/bin/ha-dhcpc}
@@ -29,7 +31,7 @@ run() {
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 ip link show "$IFACE" >/dev/null || { echo "interface $IFACE missing" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "binary $BINARY missing (set BINARY=...)" >&2; exit 1; }
-for f in ha-dhcpc.yaml master.conf slave.conf "$UNIT"; do
+for f in ha-dhcpc.conf ha-dhcpc-local.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done
 [ -f "$DHCLIENT_LEASES" ] || { echo "no $DHCLIENT_LEASES to migrate from" >&2; exit 1; }
@@ -90,20 +92,16 @@ EOF
 
 echo "# would write $STATE_DIR/state.json:"
 echo "$STATE_JSON" | sed 's/^/# /'
-echo "# would write $STATE_DIR/dhclient.leases.internet:"
-echo "$LEASE_BLOCK" | sed 's/^/# /'
-
 run "mkdir -p $STATE_DIR && chmod 700 $STATE_DIR"
 run "mkdir -p $CONF_DIR"
-run "install -m 640 $SRC_DIR/ha-dhcpc.yaml $CONF_DIR/ha-dhcpc.yaml"
-run "install -m 640 $SRC_DIR/master.conf $CONF_DIR/master.conf"
-run "install -m 640 $SRC_DIR/slave.conf $CONF_DIR/slave.conf"
+run "install -m 640 $SRC_DIR/ha-dhcpc.conf $CONF_DIR/ha-dhcpc.conf"
+run "install -m 640 $SRC_DIR/ha-dhcpc-local.conf $CONF_DIR/ha-dhcpc-local.conf"
+
 [ "$BINARY" = /usr/local/bin/ha-dhcpc ] || run "install -m 755 $BINARY /usr/local/bin/ha-dhcpc"
 run "install -m 644 $SRC_DIR/$UNIT /etc/systemd/system/$UNIT"
 
 if [ "$APPLY" = 1 ]; then
 	printf '%s\n' "$STATE_JSON" > "$STATE_DIR/state.json"
-	printf '%s\n' "$LEASE_BLOCK" > "$STATE_DIR/dhclient.leases.internet"
 fi
 
 run "systemctl daemon-reload"

@@ -29,9 +29,10 @@ build/%.o: src/%.c | build
 build:
 	mkdir -p build
 
-test: tests_sha256 tests_persist
+test: tests_sha256 tests_persist tests_config
 	./tests_sha256
 	./tests_persist
+	./tests_config
 
 tests_sha256: tests/sha256_test.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/sha256_test.c src/sha256.c $(LDLIBS)
@@ -39,8 +40,11 @@ tests_sha256: tests/sha256_test.c src/sha256.c
 tests_persist: tests/persist_test.c src/persist.c src/log.c
 	$(CC) $(CFLAGS) -o $@ tests/persist_test.c src/persist.c src/log.c $(LDLIBS)
 
+tests_config: tests/config_test.c src/config.c src/sha256.c src/log.c
+	$(CC) $(CFLAGS) -o $@ tests/config_test.c src/config.c src/sha256.c src/log.c $(LDLIBS)
+
 clean:
-	rm -rf build tests_sha256 tests_persist ha-dhcpc
+	rm -rf build tests_sha256 tests_persist tests_config ha-dhcpc
 
 -include $(OBJS:.o=.d)
 

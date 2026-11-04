@@ -11,9 +11,7 @@
 #include <linux/limits.h>
 
 struct hadc_ctx {
-    hadc_master_conf_t master;
-    hadc_slave_conf_t slave;
-    hadc_daemon_conf_t conf;
+    hadc_conf_t conf; /* effective merged config: shared doc + local overlay */
 
     /* runtime state (frozen semantics: role is runtime state, not config) */
     hadc_role_t role;

@@ -56,7 +56,7 @@ static char client_script_name[] = "/sbin/dhclient-script";
 /*
  * Daemon integration: when set via dhcp_core_set_conf_text(), the client
  * configuration is parsed from this in-memory text instead of the config
- * file (the daemon synthesizes it from /etc/ha-dhcpc/ha-dhcpc.yaml).
+ * file (the daemon synthesizes it from /etc/ha-dhcpc/ha-dhcpc.conf).
  */
 const char *dhcp_core_conf_text;
 
@@ -688,13 +688,13 @@ parse_client_lease_declaration(FILE *cfile, struct client_lease *lease,
 		lease->server_name = parse_string(cfile);
 		return;
 	case RENEW:
-		lease->renewal = parse_date(cfile);
+		lease->renewal = dhcp_file_to_mono_time(parse_date(cfile));
 		return;
 	case REBIND:
-		lease->rebind = parse_date(cfile);
+		lease->rebind = dhcp_file_to_mono_time(parse_date(cfile));
 		return;
 	case EXPIRE:
-		lease->expiry = parse_date(cfile);
+		lease->expiry = dhcp_file_to_mono_time(parse_date(cfile));
 		return;
 	case OPTION:
 		parse_option_decl(cfile, lease->options);

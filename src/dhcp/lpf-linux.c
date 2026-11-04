@@ -130,6 +130,7 @@ send_packet_unpriv(int privfd, struct dhcp_packet *raw, size_t len,
 	unsigned char buf[65536 + 64];
 	struct iovec iov[2];
 	struct msghdr msg;
+	struct sockaddr_in sato;
 	size_t frame_len;
 	int result, bufp = 0;
 
@@ -160,8 +161,7 @@ send_packet_unpriv(int privfd, struct dhcp_packet *raw, size_t len,
 
 	memset(&msg, 0, sizeof(msg));
 	if (to.s_addr != INADDR_ANY) {
-		struct sockaddr_in sato;
-
+		memset(&sato, 0, sizeof(sato));
 		sato.sin_addr = to;
 		sato.sin_port = htons(REMOTE_PORT);
 		sato.sin_family = AF_INET;

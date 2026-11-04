@@ -19,6 +19,9 @@
 #define HADC_MSG_FULL_STATE_REQ     "full_state_req"     /* slave -> master on join/version gap > 1 */
 #define HADC_MSG_FULL_STATE         "full_state"         /* master -> slave; slave applies before ack */
 #define HADC_MSG_ROLE_CHANGE        "role_change"        /* promote/demote propagated cluster-wide */
+#define HADC_MSG_CONF_SYNC          "conf_sync"          /* master -> member: shared document (plan §6) */
+#define HADC_MSG_CONF_REQ           "conf_req"           /* member -> master: our shared digest differs */
+#define HADC_MSG_CONF_ACK           "conf_ack"           /* member -> master: document written + applied */
 
 /* Heartbeat payload (all messages carry origin/master/version). */
 typedef struct {
@@ -33,6 +36,11 @@ typedef struct {
     uint64_t acked_version;
     /* role-change fields */
     char new_master[HADC_NODE_ID_MAX];
+    /* conf-sync fields: sha256 of the shared document as bytes (plan §6). The
+     * document itself travels as text on conf_sync; heartbeat carries only the
+     * digest so a member can spot a stale copy and request it. */
+    char conf_sha256[HADC_CONF_SHA_HEX];
+    const char *conf_text;               /* conf_sync only; borrowed, not owned */
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -42,6 +50,7 @@ typedef struct {
     uint64_t last_seen_ms;        /* monotonic; 0 = never */
     uint64_t acked_version;       /* last apply-ack version */
     hadc_hash_t acked_config_hash;
+    char conf_sha256[HADC_CONF_SHA_HEX]; /* last conf-ack digest from this member */
     bool alive;
 } hadc_peer_t;
 
@@ -77,5 +86,17 @@ int hadc_cluster_demote(hadc_ctx_t *ctx);
 
 /* Master pushes lease state to slaves on change; slaves apply then ack. */
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease);
+
+/* Shared-config sync (plan §6). The master is authoritative: it pushes the
+ * shared document when a member joins (first traffic from it) and whenever
+ * ctl update runs on it. A member whose shared digest differs from the
+ * master's asks via conf_req. A receiver verifies the digest, writes the
+ * document to its own copy of the shared path (atomic overwrite), reloads and
+ * acks. member_id NULL = every other member. */
+int hadc_cluster_push_conf(hadc_ctx_t *ctx, const char *member_id);
+
+/* Rebind the UDP transport to the current conf (port / this node's
+ * sync_address) after a reload; 0 when nothing changed. */
+int hadc_cluster_rebind(hadc_ctx_t *ctx);
 
 #endif /* HA_DHCPC_CLUSTER_H */
