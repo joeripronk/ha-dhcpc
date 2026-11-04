@@ -1,6 +1,7 @@
 /* Persistence: cluster view JSON, atomic rename + fsync (plan §3/§8). */
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <jansson.h>
 #include <stdio.h>
@@ -13,6 +14,60 @@
 #include "internal.h"
 
 static char g_path[PATH_MAX];
+
+static hadc_lease_state_t name_to_state(const char *n)
+{
+    if (!strcmp(n, "NONE"))         return HADC_LEASE_NONE;
+    if (!strcmp(n, "INIT-SELECT"))  return HADC_LEASE_INIT_SELECT;
+    if (!strcmp(n, "INIT-REBOOT"))  return HADC_LEASE_INIT_REBOOT;
+    if (!strcmp(n, "BOUND"))        return HADC_LEASE_BOUND;
+    if (!strcmp(n, "RENEW"))        return HADC_LEASE_RENEW;
+    if (!strcmp(n, "REBIND"))       return HADC_LEASE_REBIND;
+    if (!strcmp(n, "RETAINED"))     return HADC_LEASE_RETAINED;
+    return HADC_LEASE_NONE;
+}
+
+static void put_addr(json_t *obj, const char *key, struct in_addr a)
+{
+    char buf[64];
+    json_object_set_new(obj, key, json_string(inet_ntop(AF_INET, &a, buf, sizeof(buf))));
+}
+
+static void get_addr(json_t *obj, const char *key, struct in_addr *out)
+{
+    json_t *v = json_object_get(obj, key);
+    if (v && json_is_string(v))
+        inet_pton(AF_INET, json_string_value(v), out);
+}
+
+static json_t *lease_json(const hadc_lease_t *l)
+{
+    char hex[65];
+    json_t *dns = json_array();
+
+    for (size_t i = 0; i < 32; i++)
+        sprintf(hex + 2 * i, "%02x", l->config_hash[i]);
+    for (size_t i = 0; i < l->n_dns; i++) {
+        char buf[64];
+        json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
+    }
+    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:s}",
+                           "state", hadc_lease_state_name(l->state), "retention_active",
+                           (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
+                           "server_id", "", "dns", dns, "t1_remaining_s",
+                           (json_int_t)l->t1_remaining_s, "t2_remaining_s",
+                           (json_int_t)l->t2_remaining_s, "t3_remaining_s",
+                           (json_int_t)l->t3_remaining_s, "config_hash", hex);
+    if (!o) {
+        json_decref(dns);
+        return NULL;
+    }
+    put_addr(o, "address", l->address);
+    put_addr(o, "netmask", l->netmask);
+    put_addr(o, "gateway", l->gateway);
+    put_addr(o, "server_id", l->server_id);
+    return o;
+}
 
 int hadc_persist_init(hadc_ctx_t *ctx, const char *path)
 {
@@ -48,18 +103,65 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         out->lease_version = (uint64_t)json_integer_value(v);
     if ((v = json_object_get(root, "acked_version")) && json_is_integer(v))
         out->acked_version = (uint64_t)json_integer_value(v);
+
+    json_t *lj = json_object_get(root, "lease");
+    if (lj && json_is_object(lj)) {
+        hadc_lease_t *l = &out->lease;
+        if ((v = json_object_get(lj, "state")) && json_is_string(v))
+            l->state = name_to_state(json_string_value(v));
+        if ((v = json_object_get(lj, "retention_active")) && json_is_boolean(v))
+            l->retention_active = json_is_true(v);
+        get_addr(lj, "address", &l->address);
+        get_addr(lj, "netmask", &l->netmask);
+        get_addr(lj, "gateway", &l->gateway);
+        get_addr(lj, "server_id", &l->server_id);
+        json_t *dns = json_object_get(lj, "dns");
+        if (dns && json_is_array(dns)) {
+            size_t idx;
+            json_t *e;
+            json_array_foreach(dns, idx, e) {
+                if (json_is_string(e) && l->n_dns < HADC_DNS_MAX &&
+                    inet_pton(AF_INET, json_string_value(e), &l->dns[l->n_dns]) == 1)
+                    l->n_dns++;
+            }
+        }
+        if ((v = json_object_get(lj, "t1_remaining_s")) && json_is_integer(v))
+            l->t1_remaining_s = (uint32_t)json_integer_value(v);
+        if ((v = json_object_get(lj, "t2_remaining_s")) && json_is_integer(v))
+            l->t2_remaining_s = (uint32_t)json_integer_value(v);
+        if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
+            l->t3_remaining_s = (uint32_t)json_integer_value(v);
+        if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
+            strlen(json_string_value(v)) == 64) {
+            for (size_t i = 0; i < 32; i++) {
+                unsigned b;
+                if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
+                    break;
+                l->config_hash[i] = (uint8_t)b;
+            }
+        }
+    }
+
     json_decref(root);
     return 0;
 }
 
 int hadc_persist_save(hadc_ctx_t *ctx)
 {
-    json_t *o = json_pack("{s:s, s:I, s:I, s:s}", "role",
+    json_t *lj = lease_json(&ctx->lease);
+    if (!lj)
+        return -1;
+    json_t *o = json_pack("{s:s, s:I, s:I, s:s, s:O}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
                                                          : "unknown",
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
-                          (json_int_t)0, "interface", ctx->conf.interface);
+                          (json_int_t)ctx->acked_version, "interface", ctx->conf.interface,
+                          "lease", lj);
+    if (!o) {
+        json_decref(lj);
+        return -1;
+    }
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);
     FILE *f = fopen(tmp, "w");

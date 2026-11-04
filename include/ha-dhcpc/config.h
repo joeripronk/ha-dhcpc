@@ -33,6 +33,8 @@ typedef struct {
         bool rediscover_in_retention;
         uint8_t request_options[HADC_OPTS_MAX]; /* DHCP option numbers */
         size_t n_request_options;
+        uint32_t rate_limit_ms; /* min ms between DHCP sends, 0=off;
+                                 * Odido NL fiber needs 10000 */
     } dhcp;
     struct {
         bool routes;

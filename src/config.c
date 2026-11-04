@@ -292,6 +292,12 @@ int hadc_config_load_daemon(const char *path, hadc_daemon_conf_t *out, char *err
     out->dhcp.retention_max_duration_s = (uint64_t)v;
     json_t *rr = d ? json_object_get(d, "rediscover_in_retention") : NULL;
     out->dhcp.rediscover_in_retention = rr && json_is_boolean(rr) ? json_is_true(rr) : true;
+    if (get_int(d ? d : root, "rate_limit_ms", &v, 0, false, "dhcp")) goto derr;
+    if (v < 0 || v > 3600000) {
+        snprintf(err, errlen, "ha-dhcpc.yaml: rate_limit_ms out of range 0..3600000");
+        goto derr;
+    }
+    out->dhcp.rate_limit_ms = (uint32_t)v;
     json_t *ro = d ? json_object_get(d, "request_options") : NULL;
     if (ro && json_is_array(ro)) {
         json_t *e;

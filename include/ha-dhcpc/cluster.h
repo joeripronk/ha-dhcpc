@@ -54,6 +54,11 @@ typedef struct hadc_ctx hadc_ctx_t; /* defined in internal.h; owns conf+state */
 int hadc_cluster_init(hadc_ctx_t *ctx);
 int hadc_cluster_step(hadc_ctx_t *ctx); /* pump transport; nonblocking */
 
+/* Heartbeat tick: called from the daemon's heartbeat timer every
+ * heartbeat_ms, on every role. Sends a heartbeat cluster-wide (plan §4:
+ * bidirectional) and runs the v1 dead-master alarm. */
+void hadc_cluster_heartbeat(hadc_ctx_t *ctx);
+
 /* Role change entrypoints (idempotent, cooldown-guarded, logged).
  * role_change propagates cluster-wide over the UDP control path. */
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id);

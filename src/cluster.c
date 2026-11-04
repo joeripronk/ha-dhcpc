@@ -1,6 +1,7 @@
 /* Cluster module: heartbeat + versioned sync + role handling (plan §4).
- * M1 scaffold: transport bound, messages encoded/decoded as canonical JSON;
- * send/receive wired, cluster decisions still keepalived-driven. */
+ * M2: heartbeats are sent cluster-wide, master pushes lease state on change,
+ * slaves pre-apply then ack; role changes propagate. Decisions stay
+ * keepalived-driven (v1: dead-master/quorum are alarms only). */
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
@@ -15,7 +16,9 @@
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
+#include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/persist.h"
 #include "internal.h"
 
 static hadc_ctx_t *g_ctx;
@@ -29,6 +32,149 @@ static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg)
     free(txt);
     json_decref(msg);
     return r < 0 ? -1 : 0;
+}
+
+static const hadc_member_t *member_by_id(hadc_ctx_t *ctx, const char *id)
+{
+    for (size_t i = 0; i < ctx->master.n_members; i++)
+        if (!strcmp(ctx->master.members[i].id, id))
+            return &ctx->master.members[i];
+    return NULL;
+}
+
+static hadc_peer_t *peer_entry(hadc_ctx_t *ctx, const char *id)
+{
+    for (size_t i = 0; i < ctx->n_peers; i++)
+        if (!strcmp(ctx->peers[i].id, id))
+            return &ctx->peers[i];
+    return NULL;
+}
+
+static int send_to_member(hadc_ctx_t *ctx, const hadc_member_t *m, json_t *msg)
+{
+    if (!msg)
+        return -1;
+    if (ctx->udp_fd < 0 || !m) {
+        json_decref(msg);
+        return -1;
+    }
+    struct sockaddr_in to = { .sin_family = AF_INET,
+                               .sin_port = htons(ctx->conf.cluster.port),
+                               .sin_addr = m->sync_address };
+    if (send_json(ctx, &to, msg) != 0) {
+        hadc_warn("cluster: send to %s failed", m->id);
+        return -1;
+    }
+    return 0;
+}
+
+static void put_addr(json_t *obj, const char *key, struct in_addr a)
+{
+    char buf[64];
+    json_object_set_new(obj, key, json_string(inet_ntop(AF_INET, &a, buf, sizeof(buf))));
+}
+
+static void get_addr(json_t *obj, const char *key, struct in_addr *out)
+{
+    json_t *v = json_object_get(obj, key);
+    if (v && json_is_string(v))
+        inet_pton(AF_INET, json_string_value(v), out);
+}
+
+static json_t *lease_json(const hadc_lease_t *l)
+{
+    char hex[65];
+    json_t *dns = json_array();
+
+    for (size_t i = 0; i < 32; i++)
+        sprintf(hex + 2 * i, "%02x", l->config_hash[i]);
+    for (size_t i = 0; i < l->n_dns; i++) {
+        char buf[64];
+        json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
+    }
+    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:s}",
+                           "state", hadc_lease_state_name(l->state), "retention_active",
+                           (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
+                           "server_id", "", "dns", dns, "t1_remaining_s",
+                           (json_int_t)l->t1_remaining_s, "t2_remaining_s",
+                           (json_int_t)l->t2_remaining_s, "t3_remaining_s",
+                           (json_int_t)l->t3_remaining_s, "config_hash", hex);
+    if (!o) {
+        json_decref(dns);
+        return NULL;
+    }
+    put_addr(o, "address", l->address);
+    put_addr(o, "netmask", l->netmask);
+    put_addr(o, "gateway", l->gateway);
+    put_addr(o, "server_id", l->server_id);
+    return o;
+}
+
+static hadc_lease_state_t name_to_state(const char *n)
+{
+    if (!strcmp(n, "BOUND"))        return HADC_LEASE_BOUND;
+    if (!strcmp(n, "RENEW"))        return HADC_LEASE_RENEW;
+    if (!strcmp(n, "REBIND"))       return HADC_LEASE_REBIND;
+    if (!strcmp(n, "RETAINED"))     return HADC_LEASE_RETAINED;
+    if (!strcmp(n, "INIT-REBOOT"))  return HADC_LEASE_INIT_REBOOT;
+    if (!strcmp(n, "INIT-SELECT"))  return HADC_LEASE_INIT_SELECT;
+    return HADC_LEASE_NONE;
+}
+
+static void parse_lease(json_t *lj, hadc_lease_t *out)
+{
+    json_t *v;
+
+    if (!lj || !json_is_object(lj))
+        return;
+    if ((v = json_object_get(lj, "state")) && json_is_string(v))
+        out->state = name_to_state(json_string_value(v));
+    if ((v = json_object_get(lj, "retention_active")) && json_is_boolean(v))
+        out->retention_active = json_is_true(v);
+    get_addr(lj, "address", &out->address);
+    get_addr(lj, "netmask", &out->netmask);
+    get_addr(lj, "gateway", &out->gateway);
+    get_addr(lj, "server_id", &out->server_id);
+    json_t *dns = json_object_get(lj, "dns");
+    if (dns && json_is_array(dns)) {
+        size_t idx;
+        json_t *e;
+        json_array_foreach(dns, idx, e) {
+            if (json_is_string(e) && out->n_dns < HADC_DNS_MAX &&
+                inet_pton(AF_INET, json_string_value(e), &out->dns[out->n_dns]) == 1)
+                out->n_dns++;
+        }
+    }
+    if ((v = json_object_get(lj, "t1_remaining_s")) && json_is_integer(v))
+        out->t1_remaining_s = (uint32_t)json_integer_value(v);
+    if ((v = json_object_get(lj, "t2_remaining_s")) && json_is_integer(v))
+        out->t2_remaining_s = (uint32_t)json_integer_value(v);
+    if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
+        out->t3_remaining_s = (uint32_t)json_integer_value(v);
+    if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
+        strlen(json_string_value(v)) == 64) {
+        for (size_t i = 0; i < 32; i++) {
+            unsigned b;
+            if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
+                break;
+            out->config_hash[i] = (uint8_t)b;
+        }
+    }
+}
+
+static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
+{
+    json_t *m = json_pack("{s:s, s:s, s:s, s:I}", "type", type, "origin", ctx->slave.self,
+                           "master_id", ctx->master.designated_master, "lease_version",
+                           (json_int_t)ctx->lease.version);
+    if (!m)
+        return NULL;
+    if (with_lease) {
+        json_t *lj = lease_json(&ctx->lease);
+        if (lj)
+            json_object_set_new(m, "lease", lj);
+    }
+    return m;
 }
 
 static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
@@ -50,6 +196,7 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
         out->acked_version = (uint64_t)json_integer_value(v);
     if ((s = json_string_value(json_object_get(m, "new_master"))))
         snprintf(out->new_master, sizeof(out->new_master), "%s", s);
+    parse_lease(json_object_get(m, "lease"), &out->lease);
 }
 
 static void peer_touch(hadc_ctx_t *ctx, const char *id)
@@ -64,6 +211,30 @@ static void peer_touch(hadc_ctx_t *ctx, const char *id)
             return;
         }
     }
+}
+
+/* Slave pre-apply: adopt the master's lease state, apply via executor, ack. */
+static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_full)
+{
+    hadc_desired_t desired;
+    const hadc_member_t *master = member_by_id(ctx, msg->origin);
+
+    ctx->lease = msg->lease;
+    ctx->lease.version = msg->lease_version;
+    hadc_executor_desired(ctx, &ctx->lease, &desired);
+    hadc_executor_apply(ctx, &desired, hadc_lease_state_name(ctx->lease.state));
+    ctx->acked_version = ctx->lease.version;
+    hadc_persist_save(ctx);
+
+    hadc_info("sync: %s v%llu adopted from %s; applied and acked",
+              is_full ? "full_state" : "state_push",
+              (unsigned long long)ctx->lease.version, msg->origin);
+
+    json_t *ack = json_pack("{s:s, s:s, s:s, s:I, s:I}", "type", HADC_MSG_APPLY_ACK, "origin",
+                             ctx->slave.self, "master_id", ctx->master.designated_master,
+                             "lease_version", (json_int_t)ctx->lease.version, "acked_version",
+                             (json_int_t)ctx->acked_version);
+    send_to_member(ctx, master, ack);
 }
 
 static void udp_ready(hadc_ctx_t *ctx, int fd)
@@ -86,22 +257,53 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
 
     hadc_msg_t msg;
     load_msg_fields(ctx, m, &msg);
+    int first_seen = peer_entry(ctx, msg.origin) == NULL;
     peer_touch(ctx, msg.origin);
 
     if (!strcmp(msg.type, HADC_MSG_HEARTBEAT)) {
         hadc_dbg("sync: heartbeat from %s (master=%s, version=%llu)", msg.origin, msg.master_id,
                  (unsigned long long)msg.lease_version);
+        if (ctx->role == HADC_ROLE_SLAVE && !strcmp(msg.origin, ctx->master.designated_master) &&
+            strcmp(ctx->master.designated_master, ctx->slave.self)) {
+            int gap = first_seen || msg.lease_version > ctx->lease.version + 1;
+            if (gap) {
+                hadc_info("sync: version gap (theirs=%llu ours=%llu%s); requesting full state",
+                          (unsigned long long)msg.lease_version,
+                          (unsigned long long)ctx->lease.version,
+                          first_seen ? ", join" : "");
+                json_t *req = json_pack("{s:s, s:s, s:s, s:I}", "type", HADC_MSG_FULL_STATE_REQ,
+                                        "origin", ctx->slave.self, "master_id",
+                                        ctx->master.designated_master, "lease_version",
+                                        (json_int_t)ctx->lease.version);
+                send_to_member(ctx, member_by_id(ctx, msg.origin), req);
+            }
+        }
     } else if (!strcmp(msg.type, HADC_MSG_STATE_PUSH) || !strcmp(msg.type, HADC_MSG_FULL_STATE)) {
-        /* M2: apply to executor, then ack. Scaffold: log only. */
-        hadc_info("sync: %s from %s version=%llu (apply pending M2)", msg.type, msg.origin,
-                  (unsigned long long)msg.lease_version);
+        if (ctx->role == HADC_ROLE_SLAVE && !strcmp(msg.origin, ctx->master.designated_master))
+            slave_adopt_and_ack(ctx, &msg, !strcmp(msg.type, HADC_MSG_FULL_STATE));
+        else
+            hadc_info("sync: %s from %s version=%llu (ignored: role/master mismatch)", msg.type,
+                      msg.origin, (unsigned long long)msg.lease_version);
     } else if (!strcmp(msg.type, HADC_MSG_APPLY_ACK)) {
+        hadc_peer_t *p = peer_entry(ctx, msg.origin);
+        if (p && msg.acked_version >= p->acked_version)
+            p->acked_version = msg.acked_version;
         hadc_info("sync: apply-ack from %s acked_version=%llu", msg.origin,
                   (unsigned long long)msg.acked_version);
+    } else if (!strcmp(msg.type, HADC_MSG_FULL_STATE_REQ)) {
+        if (ctx->role == HADC_ROLE_MASTER && strcmp(msg.origin, ctx->slave.self)) {
+            json_t *rep = build_msg(ctx, HADC_MSG_FULL_STATE, 1);
+            send_to_member(ctx, member_by_id(ctx, msg.origin), rep);
+            hadc_info("sync: full_state sent to %s", msg.origin);
+        }
     } else if (!strcmp(msg.type, HADC_MSG_ROLE_CHANGE)) {
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
-        if (msg.new_master[0])
+        if (msg.new_master[0]) {
             snprintf(ctx->master.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
+            ctx->role = !strcmp(msg.new_master, ctx->slave.self) ? HADC_ROLE_MASTER
+                                                                 : HADC_ROLE_SLAVE;
+            hadc_persist_save(ctx);
+        }
     } else {
         hadc_warn("sync: unknown message type '%s' from %s", msg.type, msg.origin);
     }
@@ -138,6 +340,36 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     hadc_info("cluster: transport bound to %s:%u for node %s (v1 unauthenticated trusted LAN)",
               inet_ntoa(self->sync_address), (unsigned)ctx->conf.cluster.port, ctx->slave.self);
     return 0;
+}
+
+/* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
+void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
+{
+    static uint64_t last_alarm_ms;
+
+    for (size_t i = 0; i < ctx->master.n_members; i++) {
+        const hadc_member_t *m = &ctx->master.members[i];
+        if (!strcmp(m->id, ctx->slave.self))
+            continue;
+        json_t *hb = build_msg(ctx, HADC_MSG_HEARTBEAT, 1);
+        send_to_member(ctx, m, hb);
+    }
+
+    /* Dead-master detection: alarm-only in v1 (no self-promotion). */
+    if (ctx->role != HADC_ROLE_MASTER && ctx->master.designated_master[0] &&
+        strcmp(ctx->master.designated_master, ctx->slave.self)) {
+        hadc_peer_t *p = peer_entry(ctx, ctx->master.designated_master);
+        uint64_t now = (uint64_t)hadc_now_ms();
+        if (p && p->last_seen_ms != 0 &&
+            now - p->last_seen_ms > ctx->conf.cluster.election_deadline_ms &&
+            now - last_alarm_ms >= ctx->conf.cluster.election_deadline_ms) {
+            last_alarm_ms = now;
+            hadc_warn("ALARM: no heartbeat from master %s for %llums (deadline %ums); "
+                      "v1 alarms only, no self-promotion",
+                      p->id, (unsigned long long)(now - p->last_seen_ms),
+                      (unsigned)ctx->conf.cluster.election_deadline_ms);
+        }
+    }
 }
 
 int hadc_cluster_step(hadc_ctx_t *ctx)
@@ -198,8 +430,21 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
 
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
-    (void)ctx;
-    (void)lease;
-    /* M2: push to all members; slaves apply then ack. */
+    if (ctx->udp_fd < 0 || ctx->role != HADC_ROLE_MASTER)
+        return 0;
+    for (size_t i = 0; i < ctx->master.n_members; i++) {
+        const hadc_member_t *m = &ctx->master.members[i];
+        if (!strcmp(m->id, ctx->slave.self))
+            continue;
+        json_t *msg = json_pack("{s:s, s:s, s:s, s:I}", "type", HADC_MSG_STATE_PUSH, "origin",
+                                ctx->slave.self, "master_id", ctx->master.designated_master,
+                                "lease_version", (json_int_t)lease->version);
+        json_t *lj = msg ? lease_json(lease) : NULL;
+        if (lj)
+            json_object_set_new(msg, "lease", lj);
+        if (msg && send_to_member(ctx, m, msg) == 0)
+            hadc_info("sync: state_push v%llu sent to %s",
+                      (unsigned long long)lease->version, m->id);
+    }
     return 0;
 }

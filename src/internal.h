@@ -18,6 +18,7 @@ struct hadc_ctx {
     /* runtime state (frozen semantics: role is runtime state, not config) */
     hadc_role_t role;
     hadc_lease_t lease; /* current lease state; slaves mirror the master's */
+    uint64_t acked_version; /* last version this node confirmed applied */
     uint64_t applied_hash_src; /* informational; config_hash holds the digest */
     hadc_peer_t peers[HADC_MEMBERS_MAX];
     size_t n_peers;
@@ -27,6 +28,7 @@ struct hadc_ctx {
 
     int epfd;
     int timerfd;   /* heartbeat */
+    int core_timerfd; /* DHCP core timers (dhcpcore adapter) */
     int ctl_fd;    /* unix control socket */
     int udp_fd;    /* cluster transport, bound to local sync_address */
     bool running;
