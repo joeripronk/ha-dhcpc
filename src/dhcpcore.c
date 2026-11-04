@@ -7,6 +7,8 @@
  * the frozen daemon callbacks. */
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,7 +98,7 @@ static int is_lease_reason(const char *reason)
 static void adapter_on_reason(void *arg, const char *reason,
                               struct client_lease *new_lease)
 {
-    (void)arg;
+    hadc_ctx_t *ctx = arg;
 
     if (g_cb == NULL)
         return;
@@ -127,6 +129,9 @@ static void adapter_on_reason(void *arg, const char *reason,
                 l.state = HADC_LEASE_REBIND;
             else
                 l.state = HADC_LEASE_BOUND;
+            /* Versions must never regress across role changes (plan §4). */
+            if (g_lease_version < ctx->lease.version)
+                g_lease_version = ctx->lease.version;
             l.version = ++g_lease_version;
             g_cb->on_lease_update(g_cbarg, &l);
         }
@@ -149,6 +154,11 @@ int hadc_dhcpcore_init(hadc_ctx_t *ctx, const hadc_dhcp_callbacks_t *cb, void *a
     return 0;
 }
 
+static int g_core_live;    /* core inited once; never re-inited */
+static int g_running;       /* fds + timerfd registered with the loop */
+static int g_core_fds[CORE_FDS_MAX];
+static int g_n_core_fds;
+
 int hadc_dhcpcore_start(hadc_ctx_t *ctx)
 {
     char conf[HADC_PATH_MAX + 32];
@@ -159,28 +169,39 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
         hadc_dbg("dhcpcore: not started (slaves are passive to DHCP)");
         return 0;
     }
+    if (g_running)
+        return 0;
 
-    conf[0] = '\0';
-    if (ctx->conf.apply.dns_hook[0] != '\0')
-        snprintf(conf, sizeof(conf), "script \"%s\";\n",
-                 ctx->conf.apply.dns_hook);
-    dhcp_core_set_conf_text(conf);
-    dhcp_core_set_hooks(adapter_on_reason, ctx);
-    dhcp_core_set_retention(ctx->conf.dhcp.retention != HADC_RETENTION_OFF,
-                             ctx->conf.dhcp.rediscover_in_retention ? 1 : 0, 0, 0);
-    dhcp_core_set_rate_limit_ms(ctx->conf.dhcp.rate_limit_ms);
+    if (!g_core_live) {
+        /* Options the daemon's lease summary needs must be declared in the
+         * core's config or ISC storage rules drop them from the lease. */
+        size_t n = snprintf(conf, sizeof(conf),
+                            "request subnet-mask, routers, domain-name-servers, "
+                            "dhcp-server-identifier;\n");
+        snprintf(conf + n, sizeof(conf) - n, "script \"%s\";\n",
+                 ctx->conf.apply.dns_hook[0] != '\0' ? ctx->conf.apply.dns_hook
+                                                    : "");
+        dhcp_core_set_conf_text(conf);
+        dhcp_core_set_hooks(adapter_on_reason, ctx);
+        dhcp_core_set_retention(ctx->conf.dhcp.retention != HADC_RETENTION_OFF,
+                                 ctx->conf.dhcp.rediscover_in_retention ? 1 : 0, 0, 0);
+        dhcp_core_set_rate_limit_ms(ctx->conf.dhcp.rate_limit_ms);
 
-    if (dhcp_core_start(ctx->conf.interface, NULL, NULL) != 0) {
-        hadc_err("dhcpcore: core start failed");
-        return -1;
+        if (dhcp_core_start(ctx->conf.interface, NULL, NULL) != 0) {
+            hadc_err("dhcpcore: core start failed");
+            return -1;
+        }
+        for (size_t i = 0; i < ctx->conf.dhcp.n_request_options; i++)
+            dhcp_core_add_requested_option(ctx->conf.dhcp.request_options[i]);
+        ctx->core_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (ctx->core_timerfd < 0) {
+            hadc_err("dhcpcore: timerfd failed");
+            return -1;
+        }
+        g_core_live = 1;
     }
 
-    for (size_t i = 0; i < ctx->conf.dhcp.n_request_options; i++)
-        dhcp_core_add_requested_option(ctx->conf.dhcp.request_options[i]);
-
-    ctx->core_timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (ctx->core_timerfd < 0 ||
-        hadc_loop_add(ctx, ctx->core_timerfd, core_timer_ready, 0) != 0) {
+    if (hadc_loop_add(ctx, ctx->core_timerfd, core_timer_ready, 0) != 0) {
         hadc_err("dhcpcore: core timer setup failed");
         return -1;
     }
@@ -190,8 +211,11 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
             hadc_err("dhcpcore: epoll register fd %d failed", fds[i]);
             return -1;
         }
+        if (g_n_core_fds < CORE_FDS_MAX)
+            g_core_fds[g_n_core_fds++] = fds[i];
     }
     core_arm_timer(ctx);
+    g_running = 1;
 
     hadc_info("dhcpcore: engine running on %s (%d fds, retention=%s)",
               ctx->conf.interface, nfds,
@@ -201,7 +225,72 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
 
 int hadc_dhcpcore_stop(hadc_ctx_t *ctx)
 {
-    (void)ctx;
+    if (!g_running)
+        return 0;
+    for (int i = 0; i < g_n_core_fds; i++)
+        hadc_loop_del(ctx, g_core_fds[i]);
+    g_n_core_fds = 0;
+    hadc_loop_del(ctx, ctx->core_timerfd);
+    g_running = 0;
+    hadc_info("dhcpcore: engine stopped (slaves are passive to DHCP)");
+    return 0;
+}
+
+int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
+{
+    char path[PATH_MAX], tmp[PATH_MAX + 8], buf[64], buf2[64];
+    time_t now = time(NULL);
+    FILE *f;
+
+    if (lease->address.s_addr == 0)
+        return 0; /* nothing to cache yet */
+    snprintf(path, sizeof(path), "/var/lib/ha-dhcpc/dhclient.leases.%s",
+             ctx->conf.interface);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "w");
+    if (!f) {
+        hadc_err("dhcpcore: fopen %s: %s", tmp, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "lease {\n  interface \"%s\";\n  fixed-address %s;\n",
+            ctx->conf.interface, inet_ntop(AF_INET, &lease->address, buf, sizeof(buf)));
+    if (lease->netmask.s_addr != 0)
+        fprintf(f, "  option subnet-mask %s;\n",
+                inet_ntop(AF_INET, &lease->netmask, buf, sizeof(buf)));
+    if (lease->gateway.s_addr != 0)
+        fprintf(f, "  option routers %s;\n",
+                inet_ntop(AF_INET, &lease->gateway, buf, sizeof(buf)));
+    if (lease->n_dns > 0) {
+        fprintf(f, "  option domain-name-servers ");
+        for (size_t i = 0; i < lease->n_dns; i++)
+            fprintf(f, "%s%s", i ? ", " : "",
+                    inet_ntop(AF_INET, &lease->dns[i], buf2, sizeof(buf2)));
+        fprintf(f, ";\n");
+    }
+    if (lease->server_id.s_addr != 0)
+        fprintf(f, "  option dhcp-server-identifier %s;\n",
+                inet_ntop(AF_INET, &lease->server_id, buf, sizeof(buf)));
+    /* Same format the fork's write_client_lease produces (gmtime). */
+    static const char *field[3] = { "renew", "rebind", "expire" };
+    uint32_t rem[3] = { lease->t1_remaining_s, lease->t2_remaining_s,
+                        lease->t3_remaining_s };
+    for (int i = 0; i < 3; i++) {
+        time_t when = now + (time_t)rem[i];
+        struct tm tm;
+        gmtime_r(&when, &tm);
+        fprintf(f, "  %s %d %d/%d/%d %02d:%02d:%02d;\n", field[i], tm.tm_wday,
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min,
+                tm.tm_sec);
+    }
+    fprintf(f, "}\n");
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, path) != 0) {
+        hadc_err("dhcpcore: rename to %s: %s", path, strerror(errno));
+        return -1;
+    }
+    hadc_dbg("dhcpcore: lease file refreshed for %s", path);
     return 0;
 }
 

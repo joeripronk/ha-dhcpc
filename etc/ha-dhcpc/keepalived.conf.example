@@ -1,0 +1,15 @@
+# keepalived example for ha-dhcpc (plan §4): VRRP decides, ha-dhcpc obeys.
+# priority mirrors each node's slave.conf (single source of truth);
+# the notify script dispatches type -> ctl promote/demote.
+vrrp_instance data {
+	state BACKUP              # both nodes start BACKUP; priority elects
+	interface data-if         # the shared L2 segment (VIP shared with data path)
+	virtual_router_id 50
+	priority 100              # node-a here; node-b: 90
+	advert_int 1
+	authentication {
+		auth_type PASS
+		auth_pass changeme
+	}
+	notify /usr/lib/ha-dhcpc/notify.sh
+}

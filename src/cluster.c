@@ -16,12 +16,33 @@
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
+#include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "internal.h"
 
 static hadc_ctx_t *g_ctx;
+
+static void (*g_role_hook)(void *arg, hadc_role_t old_role, hadc_role_t new_role);
+static void *g_role_hook_arg;
+
+void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
+                                           hadc_role_t new_role), void *arg)
+{
+    g_role_hook = fn;
+    g_role_hook_arg = arg;
+}
+
+static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
+{
+    hadc_role_t old_role = ctx->role;
+    if (old_role == new_role)
+        return;
+    ctx->role = new_role;
+    if (g_role_hook != NULL)
+        g_role_hook(g_role_hook_arg, old_role, new_role);
+}
 
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg)
 {
@@ -225,6 +246,7 @@ static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_f
     hadc_executor_apply(ctx, &desired, hadc_lease_state_name(ctx->lease.state));
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
+    hadc_dhcpcore_write_lease_file(ctx, &ctx->lease); /* for renew-only duty */
 
     hadc_info("sync: %s v%llu adopted from %s; applied and acked",
               is_full ? "full_state" : "state_push",
@@ -300,8 +322,8 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
         if (msg.new_master[0]) {
             snprintf(ctx->master.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
-            ctx->role = !strcmp(msg.new_master, ctx->slave.self) ? HADC_ROLE_MASTER
-                                                                 : HADC_ROLE_SLAVE;
+            set_role(ctx, !strcmp(msg.new_master, ctx->slave.self) ? HADC_ROLE_MASTER
+                                                                   : HADC_ROLE_SLAVE);
             hadc_persist_save(ctx);
         }
     } else {
@@ -406,7 +428,7 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         return 0;
     }
     snprintf(ctx->master.designated_master, HADC_NODE_ID_MAX, "%s", target);
-    ctx->role = !strcmp(target, ctx->slave.self) ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE;
+    set_role(ctx, !strcmp(target, ctx->slave.self) ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE);
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->master.designated_master,
               ctx->role == HADC_ROLE_MASTER ? "MASTER" : "SLAVE");
     propagate_role(ctx);
@@ -422,7 +444,7 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
         hadc_dbg("cluster: demote requested on this node; v1 defers role choice to keepalived");
         return 0;
     }
-    ctx->role = HADC_ROLE_SLAVE;
+    set_role(ctx, HADC_ROLE_SLAVE);
     hadc_info("cluster: demoted; master remains %s", target);
     propagate_role(ctx);
     return 0;

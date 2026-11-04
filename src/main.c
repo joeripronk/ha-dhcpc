@@ -27,6 +27,9 @@
 #include "ha-dhcpc/persist.h"
 #include "internal.h"
 
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #define MAX_FDS 16
 
 typedef struct {
@@ -49,6 +52,21 @@ int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
     if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
         hadc_err("loop: epoll add fd %d: %s", fd, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int hadc_loop_del(hadc_ctx_t *ctx, int fd)
+{
+    size_t j = 0;
+    while (j < g_nfds && g_fds[j].fd != fd)
+        j++;
+    if (j == g_nfds)
+        return -1;
+    g_fds[j] = g_fds[--g_nfds];
+    if (epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
+        hadc_err("loop: epoll del fd %d: %s", fd, strerror(errno));
         return -1;
     }
     return 0;
@@ -135,12 +153,68 @@ static void cb_carrier_return(void *arg)
     hadc_executor_apply(ctx, &desired, "CARRIER-RETURN");
 }
 
+/* Role transitions (ctl/keepalived/cluster-driven, plan §4): the engine runs
+ * only on the master; a promoted node resumes renew-only on the synced lease. */
+static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role)
+{
+    hadc_ctx_t *ctx = arg;
+    hadc_desired_t desired;
+
+    if (old_role == new_role)
+        return;
+    if (new_role == HADC_ROLE_MASTER)
+        hadc_dhcpcore_start(ctx);
+    else if (old_role == HADC_ROLE_MASTER)
+        hadc_dhcpcore_stop(ctx);
+    hadc_executor_desired(ctx, &ctx->lease, &desired);
+    hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
+    ctx->acked_version = ctx->lease.version;
+    hadc_persist_save(ctx);
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--master-conf PATH] [--slave-conf PATH] [--conf PATH]\n"
-            "       %s [--persist PATH] [--oneshot]\n",
-            argv0, argv0);
+            "       %s [--persist PATH] [--oneshot]\n"
+            "       %s [--conf PATH] ctl promote|demote|status [id]\n",
+            argv0, argv0, argv0);
+}
+
+/* Client mode: ha-dhcpc [conf path] ctl promote|demote|status [id] (plan §3). */
+static int ctl_client(const char *conf_path, const char *cmd_line)
+{
+    hadc_daemon_conf_t conf;
+    char err[256];
+    char line[256];
+    char reply[4096];
+
+    if (hadc_config_load_daemon(conf_path, &conf, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ha-dhcpc ctl: %s\n", err);
+        return 1;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", conf.ctl_socket);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "ha-dhcpc ctl: connect %s: %s\n", conf.ctl_socket, strerror(errno));
+        return 1;
+    }
+    snprintf(line, sizeof(line), "%s\n", cmd_line);
+    if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+        fprintf(stderr, "ha-dhcpc ctl: write: %s\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+    ssize_t n = read(fd, reply, sizeof(reply) - 1);
+    close(fd);
+    if (n <= 0) {
+        fprintf(stderr, "ha-dhcpc ctl: no reply from daemon\n");
+        return 1;
+    }
+    reply[n] = '\0';
+    fputs(reply, stdout);
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -151,6 +225,22 @@ int main(int argc, char **argv)
     const char *persist_path = "/var/lib/ha-dhcpc/state.json";
     bool oneshot = false;
     hadc_ctx_t *ctx = &g_ctx;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--conf") && i + 1 < argc) {
+            conf_path = argv[++i];
+            continue;
+        }
+        if (!strcmp(argv[i], "ctl") && i + 1 < argc) {
+            char cmd[256] = "";
+            for (int j = i + 1; j < argc; j++) {
+                if (cmd[0])
+                    strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
+                strncat(cmd, argv[j], sizeof(cmd) - strlen(cmd) - 1);
+            }
+            return ctl_client(conf_path, cmd);
+        }
+    }
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--master-conf") && i + 1 < argc)
@@ -227,6 +317,7 @@ int main(int argc, char **argv)
 
     if (hadc_ctl_init(ctx) != 0)
         return 1;
+    hadc_cluster_set_role_hook(cb_role_change, ctx);
     if (hadc_cluster_init(ctx) != 0)
         return 1;
     if (hadc_executor_init(ctx) != 0)

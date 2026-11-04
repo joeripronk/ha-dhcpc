@@ -30,4 +30,8 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx);  /* master-only; no-op on slaves */
 int hadc_dhcpcore_stop(hadc_ctx_t *ctx);   /* only the master may RELEASE */
 int hadc_dhcpcore_step(hadc_ctx_t *ctx);   /* pump engine + timers */
 
+/* Daemon-side: keep the engine's lease file current on slaves so a promoted
+ * node resumes renew-only on the synced lease (plan §4/§5). */
+int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease);
+
 #endif /* HA_DHCPC_DHCPCORE_H */

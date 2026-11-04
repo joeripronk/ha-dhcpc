@@ -59,6 +59,11 @@ int hadc_cluster_step(hadc_ctx_t *ctx); /* pump transport; nonblocking */
  * bidirectional) and runs the v1 dead-master alarm. */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx);
 
+/* Role-change hook: invoked when a promote/demote/role_change actually
+ * changes this node's role, after the change is applied locally. */
+void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
+                                           hadc_role_t new_role), void *arg);
+
 /* Role change entrypoints (idempotent, cooldown-guarded, logged).
  * role_change propagates cluster-wide over the UDP control path. */
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id);

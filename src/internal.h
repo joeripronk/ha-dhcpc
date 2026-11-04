@@ -39,6 +39,7 @@ void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 
 /* event loop registration */
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, void (*cb)(hadc_ctx_t *, int), int events);
+int hadc_loop_del(hadc_ctx_t *ctx, int fd);
 typedef void (*hadc_fd_cb_t)(hadc_ctx_t *, int);
 
 #endif /* HA_DHCPC_INTERNAL_H */
