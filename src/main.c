@@ -94,6 +94,8 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
 
 /* DHCP engine callbacks (dhcpcore adapter -> daemon). */
 
+static void cb_retention(void *arg, bool entered);
+
 static void cb_lease_update(void *arg, const hadc_lease_t *lease)
 {
     hadc_ctx_t *ctx = arg;
@@ -114,6 +116,12 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
                             : lease->state == HADC_LEASE_REBIND ? HADC_REASON_REBIND
                                                                 : HADC_REASON_BOUND);
         ctx->acked_version = ctx->lease.version;
+    } else if (ctx->conf.dhcp.retention != HADC_RETENTION_OFF &&
+               ctx->lease.address.s_addr != 0) {
+        /* Retention beats expiry (plan §5): the engine gave up (FAIL/EXPIRE)
+         * but we have a last-known-good cached lease — keep it applied. */
+        cb_retention(arg, true);
+        return;
     } else {
         hadc_warn("lease gone (EXPIRE/FAIL); no desired state");
         memset(&ctx->lease, 0, sizeof(ctx->lease));

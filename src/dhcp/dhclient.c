@@ -299,7 +299,8 @@ dhcp_core_set_retention(int enabled, int rediscover, long backoff_min_s,
 }
 
 static long core_rate_limit_ms;		/* 0 = no pacing */
-static time_t rate_last_send;		/* cur_time of last send; 0 = none */
+static long core_renew_retry_interval_s;	/* 0 = exponential backoff */
+static time_t rate_last_send;		/* scheduled time of last send; 0 = none */
 
 #define PACED_SLOTS 8
 struct paced_packet {
@@ -314,14 +315,38 @@ dhcp_core_set_rate_limit_ms(long ms)
 	core_rate_limit_ms = ms > 0 ? ms : 0;
 }
 
+void
+dhcp_core_set_renew_retry_interval_s(long s)
+{
+	core_renew_retry_interval_s = s > 0 ? s : 0;
+}
+
+/* Minimum retry interval implied by the send pacing window, in seconds. */
+static long
+paced_min_interval(void)
+{
+	return core_rate_limit_ms > 0 ? (core_rate_limit_ms + 999) / 1000 : 0;
+}
+
 static void
 paced_flush(void *x)
 {
 	struct paced_packet *p = x;
 	struct interface_info *ip = p->ip;
+	long remaining_ms;
 
 	if (ip == NULL)
 		return;
+	if (core_rate_limit_ms > 0 && rate_last_send != 0) {
+		remaining_ms = core_rate_limit_ms -
+		    (long)(cur_time - rate_last_send) * 1000;
+		if (remaining_ms > 0) {
+			/* Another slot took this window; re-arm. */
+			add_timeout(cur_time + (remaining_ms + 999) / 1000,
+			    paced_flush, p);
+			return;
+		}
+	}
 	p->ip = NULL;
 	rate_last_send = cur_time;
 	send_packet_unpriv(privfd, &ip->client->packet,
@@ -358,6 +383,10 @@ paced_send_packet(struct interface_info *ip, struct in_addr from,
 				add_timeout(cur_time +
 				    (remaining_ms + 999) / 1000,
 				    paced_flush, &paced_slots[i]);
+				/* Reserve the window so queued sends stay
+				   sequential instead of firing together. */
+				rate_last_send = cur_time +
+				    (remaining_ms + 999) / 1000;
 				debug("rate limit: send delayed %d s",
 				    (int)((remaining_ms + 999) / 1000));
 				return;
@@ -403,6 +432,11 @@ dhcp_core_start(const char *interface, const char *lease_db,
 
 	openlog(getprogname(), LOG_PID | LOG_NDELAY, DHCPD_LOG_FACILITY);
 	setlogmask(LOG_UPTO(LOG_DEBUG));
+
+	/* Single log sink: the daemon's own logger writes to stderr (captured
+	   by journald); the core must not ALSO write stderr, or journald shows
+	   every core note twice (syslog + stderr). Log only via syslog. */
+	log_perror = 0;
 
 	if ((ifi = calloc(1, sizeof(struct interface_info))) == NULL)
 		error("calloc");
@@ -1247,6 +1281,10 @@ again:
 			(ip->client->first_sending +
 			 ip->client->config->timeout) - cur_time + 1;
 
+	/* Never retry faster than the send pacing window allows. */
+	if (paced_min_interval() > ip->client->interval)
+		ip->client->interval = paced_min_interval();
+
 	/* Record the number of seconds since we started sending. */
 	if (interval < 65536)
 		ip->client->packet.secs = htons(interval);
@@ -1453,8 +1491,13 @@ cancel:
 		return;
 	}
 
-	/* Do the exponential backoff... */
-	if (!ip->client->interval)
+	/* Renewal retries use the configured fixed interval (default 30 s);
+	   the initial acquisition path keeps the exponential backoff. */
+	if (core_renew_retry_interval_s > 0 &&
+	    (ip->client->state == S_RENEWING ||
+	     ip->client->state == S_REBINDING))
+		ip->client->interval = core_renew_retry_interval_s;
+	else if (!ip->client->interval)
 		ip->client->interval = ip->client->config->initial_interval;
 	else
 		ip->client->interval += ((arc4random() >> 2) %
@@ -1462,7 +1505,10 @@ cancel:
 
 	/* Don't backoff past cutoff. */
 	if (ip->client->interval >
-	    ip->client->config->backoff_cutoff)
+	    ip->client->config->backoff_cutoff &&
+	    !(core_renew_retry_interval_s > 0 &&
+	    (ip->client->state == S_RENEWING ||
+	     ip->client->state == S_REBINDING)))
 		ip->client->interval =
 		    ((ip->client->config->backoff_cutoff / 2) +
 		    ((arc4random() >> 2) % ip->client->interval));
@@ -1474,6 +1520,10 @@ cancel:
 	    ip->client->active->expiry)
 		ip->client->interval =
 		    ip->client->active->expiry - cur_time + 1;
+
+	/* Never retry faster than the send pacing window allows. */
+	if (paced_min_interval() > ip->client->interval)
+		ip->client->interval = paced_min_interval();
 
 	/* If the lease T2 time has elapsed, or if we're not yet bound,
 	   broadcast the DHCPREQUEST rather than unicasting. */

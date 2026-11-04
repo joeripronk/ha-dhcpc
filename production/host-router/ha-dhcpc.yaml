@@ -10,6 +10,7 @@ dhcp:
   retention: forever
   rediscover_in_retention: true
   rate_limit_ms: 10000        # Odido NL fiber: >= 10 s between DHCP packets
+  renew_retry_interval_s: 30  # retry interval after a failed RENEW/REBIND
   request_options: [1, 3, 4, 6, 15, 26, 28, 42, 121]  # mirrors old dhclient.conf
 apply:
   routes: true

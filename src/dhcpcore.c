@@ -186,6 +186,7 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
         dhcp_core_set_retention(ctx->conf.dhcp.retention != HADC_RETENTION_OFF,
                                  ctx->conf.dhcp.rediscover_in_retention ? 1 : 0, 0, 0);
         dhcp_core_set_rate_limit_ms(ctx->conf.dhcp.rate_limit_ms);
+        dhcp_core_set_renew_retry_interval_s(ctx->conf.dhcp.renew_retry_interval_s);
 
         if (dhcp_core_start(ctx->conf.interface, NULL, NULL) != 0) {
             hadc_err("dhcpcore: core start failed");

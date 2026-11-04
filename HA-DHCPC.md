@@ -229,6 +229,10 @@ cluster:
 dhcp:
   retention: forever          # forever | max_duration | until_carrier_loss | off
   rediscover_in_retention: true
+  rate_limit_ms: 10000       # min ms between DHCP packets we send (0=off);
+                             # required for Odido NL fiber (>= 10 s spacing)
+  renew_retry_interval_s: 30 # retry interval after a failed RENEW/REBIND
+                             # (0 = exponential backoff)
   request_options: [1, 3, 6, 15, 26, 28, 42, 121]
 apply:
   routes: true

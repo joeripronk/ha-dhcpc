@@ -457,6 +457,7 @@ void dhcp_core_add_requested_option(unsigned num);
 void dhcp_core_set_retention(int enabled, int rediscover, long backoff_min_s,
     long backoff_max_s);
 void dhcp_core_set_rate_limit_ms(long ms);
+void dhcp_core_set_renew_retry_interval_s(long s);
 int  dhcp_core_start(const char *interface, const char *lease_db,
     const char *hook_script);
 void dhcp_core_run_timeouts(void);

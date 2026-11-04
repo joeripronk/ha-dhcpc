@@ -98,6 +98,7 @@ run "mkdir -p $CONF_DIR"
 run "install -m 640 $SRC_DIR/ha-dhcpc.yaml $CONF_DIR/ha-dhcpc.yaml"
 run "install -m 640 $SRC_DIR/master.conf $CONF_DIR/master.conf"
 run "install -m 640 $SRC_DIR/slave.conf $CONF_DIR/slave.conf"
+[ "$BINARY" = /usr/local/bin/ha-dhcpc ] || run "install -m 755 $BINARY /usr/local/bin/ha-dhcpc"
 run "install -m 644 $SRC_DIR/$UNIT /etc/systemd/system/$UNIT"
 
 if [ "$APPLY" = 1 ]; then

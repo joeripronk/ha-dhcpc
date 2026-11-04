@@ -315,6 +315,12 @@ int hadc_config_load_daemon(const char *path, hadc_daemon_conf_t *out, char *err
         goto derr;
     }
     out->dhcp.rate_limit_ms = (uint32_t)v;
+    if (get_int(d ? d : root, "renew_retry_interval_s", &v, 30, false, "dhcp")) goto derr;
+    if (v < 0 || v > 86400) {
+        snprintf(err, errlen, "ha-dhcpc.yaml: renew_retry_interval_s out of range 0..86400");
+        goto derr;
+    }
+    out->dhcp.renew_retry_interval_s = (uint32_t)v;
     json_t *ro = d ? json_object_get(d, "request_options") : NULL;
     if (ro && json_is_array(ro)) {
         json_t *e;

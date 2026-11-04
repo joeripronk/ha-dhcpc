@@ -37,6 +37,8 @@ typedef struct {
         size_t n_request_options;
         uint32_t rate_limit_ms; /* min ms between DHCP sends, 0=off;
                                  * Odido NL fiber needs 10000 */
+        uint32_t renew_retry_interval_s; /* retry interval after a failed
+                                          * RENEW/REBIND, 0 = exponential backoff */
     } dhcp;
     struct {
         bool routes;
