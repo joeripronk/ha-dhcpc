@@ -1,0 +1,15 @@
+[Unit]
+Description=HA-DHCPC DHCP client (internet VLAN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/chattr +i /etc/resolv.conf
+ExecStart=/usr/local/bin/ha-dhcpc
+ExecStop=/usr/bin/chattr -i /etc/resolv.conf
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
