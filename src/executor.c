@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <jansson.h>
 #include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <netlink/netlink.h>
 #include <netlink/route/link.h>
 #include <netlink/route/route.h>
@@ -408,4 +409,54 @@ out:
 	if (rcache)
 		nl_cache_put(rcache);
 	return rc;
+}
+
+/* Hand-built RTM_SETLINK, matching the addr/route helpers above. */
+static int nl_link_set_up(struct nl_sock *sk, int ifindex)
+{
+	struct nl_msg *m = nlmsg_alloc_simple(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK);
+	struct ifinfomsg *ifi;
+
+	if (!m)
+		return -1;
+	ifi = (struct ifinfomsg *) nlmsg_reserve(m, sizeof(*ifi), NLA_ALIGNTO);
+	if (!ifi) {
+		nlmsg_free(m);
+		return -1;
+	}
+	ifi->ifi_family = AF_UNSPEC;
+	ifi->ifi_index = ifindex;
+	ifi->ifi_flags = IFF_UP;
+	ifi->ifi_change = IFF_UP;
+	return nl_send_sync(sk, m); /* consumes m */
+}
+
+int hadc_executor_link_up(const char *ifname)
+{
+    struct nl_cache *lcache = NULL;
+    struct rtnl_link *link;
+    int rc = 0;
+
+    if (!g_sk) {
+        hadc_warn("executor: netlink socket not open");
+        return -1;
+    }
+    if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache) {
+        hadc_warn("executor: netlink cache dump failed");
+        return -1;
+    }
+    link = rtnl_link_get_by_name(lcache, ifname);
+    if (!link) {
+        hadc_warn("executor: interface %s not found", ifname);
+        nl_cache_put(lcache);
+        return -1;
+    }
+    if (!(rtnl_link_get_flags(link) & IFF_UP)) {
+        if ((rc = nl_link_set_up(g_sk, rtnl_link_get_ifindex(link))) < 0)
+            hadc_warn("executor: bringing link %s up failed: %s", ifname, nl_geterror(rc));
+        else
+            hadc_info("executor: link %s brought up", ifname);
+    }
+    nl_cache_put(lcache);
+    return rc;
 }

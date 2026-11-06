@@ -170,9 +170,10 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
 
     if (old_role == new_role)
         return;
-    if (new_role == HADC_ROLE_MASTER)
+    if (new_role == HADC_ROLE_MASTER) {
+        hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
         hadc_dhcpcore_start(ctx);
-    else if (old_role == HADC_ROLE_MASTER)
+    } else if (old_role == HADC_ROLE_MASTER)
         hadc_dhcpcore_stop(ctx);
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
@@ -347,9 +348,9 @@ int main(int argc, char **argv)
     if (hadc_cluster_init(ctx) != 0)
         return 1;
     hadc_cluster_timesync(ctx); /* sync CLOCK_REALTIME with the cluster first */
-    hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
     if (hadc_executor_init(ctx) != 0)
-        return 1;
+        return 1; /* before election: the role hook brings the link up */
+    hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
 
     /* Startup desired-state pass from the restored cache: apply the interface
      * before the DHCP engine starts (idempotent, hooks fire only on delta). A

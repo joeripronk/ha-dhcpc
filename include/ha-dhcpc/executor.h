@@ -48,4 +48,9 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease,
 int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired,
                         const char *reason);
 
+/* Bring the interface up if it is administratively down (RTM_SETLINK, no-op
+ * when already up). Called on promotion: the new master must be able to
+ * speak DHCP. */
+int hadc_executor_link_up(const char *ifname);
+
 #endif /* HA_DHCPC_EXECUTOR_H */
