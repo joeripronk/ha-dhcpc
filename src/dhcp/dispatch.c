@@ -182,7 +182,10 @@ dispatch_step(void)
 	for (l = protocols; l; l = l->next) {
 		struct interface_info *ip = l->local;
 
-		if (ip == NULL || ip->dead)
+		/* A dead interface's packet sockets are gone, but other
+		 * protocols it registered (the rtnetlink watch) still have to
+		 * be drained or their fd stays readable forever. */
+		if (ip == NULL || (ip->dead && l->handler == got_one))
 			continue;
 		fds[i].fd = l->fd;
 		fds[i].events = POLLIN;
@@ -201,12 +204,38 @@ dispatch_step(void)
 
 	i = 0;
 	for (l = protocols; l; l = l->next) {
-		struct interface_info *ip;
-		ip = l->local;
-		if ((fds[i].revents & (POLLIN | POLLHUP))) {
+		struct interface_info *ip = l->local;
+
+		/* Mirror the fill loop: skipped entries have no fds[] slot. */
+		if (ip == NULL || (ip->dead && l->handler == got_one))
+			continue;
+
+		if (fds[i].revents & (POLLERR | POLLNVAL | POLLHUP)) {
+			/* The fd is unusable for good. Drop the registration so a
+			 * permanently ready fd cannot spin the event loop, and
+			 * tell the daemon to forget its epoll entry while the
+			 * number is still closed. */
+			int dead = (l->handler == got_one);
+
+			warning("poll error on %s (revents=0x%x); dropping fd %d%s",
+			    ip->name, (unsigned)fds[i].revents, l->fd,
+			    dead ? ", interface dead" : "");
+			if (dead) {
+				/* Keep the interface_info: the daemon still
+				 * references it and may re-enter here later. */
+				ip->dead = 1;
+				interfaces_invalidated = 1;
+			}
+			int fd = l->fd;
+			close(fd);
+			remove_protocol(l);
+			dhcp_core_fd_closed(fd);
+			/* l is freed and the fds[] index no longer lines up. */
+			break;
+		}
+		if (fds[i].revents & POLLIN) {
 			fds[i].revents = 0;
-			if (ip && (l->handler != got_one ||
-			    !ip->dead))
+			if (l->handler != got_one || !ip->dead)
 				(*(l->handler))(l);
 			if (interfaces_invalidated)
 				break;
@@ -311,14 +340,18 @@ got_one(struct protocol *l)
 		ip->errors++;
 		if ((!interface_status(ip)) ||
 		    (ip->noifmedia && ip->errors > 20)) {
-			/* our interface has gone away. */
+			/* Our interface has gone away. Keep the
+			 * interface_info: the rtnetlink protocol and the global
+			 * ifi still reference it, and the daemon may re-enter on
+			 * this interface later. */
 			warning("Interface %s no longer appears valid.",
 			    ip->name);
 			ip->dead = 1;
 			interfaces_invalidated = 1;
-			close(l->fd);
+			int fd = l->fd;
+			close(fd);
 			remove_protocol(l);
-			free(ip);
+			dhcp_core_fd_closed(fd);
 		}
 		return;
 	}
@@ -346,28 +379,22 @@ interface_status(struct interface_info *ifinfo)
 	strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
 	if (ioctl(ifsock, SIOCGIFFLAGS, &ifr) < 0) {
 		syslog(LOG_ERR, "ioctl(SIOCGIFFLAGS) on %s: %m", ifname);
-		goto inactive;
+		return (0);
 	}
 
 	/*
 	 * if one of UP and RUNNING flags is dropped,
 	 * the interface is not active.
+	 *
+	 * Carrier check: BSD used SIOCGIFMEDIA; Linux clears IFF_RUNNING when
+	 * carrier drops, so UP|RUNNING is the carrier test. Do NOT test
+	 * IFF_LOWER_UP: it is bit 16 (0x10000), but struct ifreq.ifr_flags is
+	 * a 16-bit short that the kernel truncates, so SIOCGIFFLAGS can never
+	 * report it (the bit is always absent here).
 	 */
 	if ((ifr.ifr_flags & (IFF_UP|IFF_RUNNING)) != (IFF_UP|IFF_RUNNING))
-		goto inactive;
+		return (0);
 
-	/*
-	 * Carrier check: BSD used SIOCGIFMEDIA; Linux reports carrier via
-	 * IFF_LOWER_UP (carrier asserted) in the same flags word.
-	 */
-	if (ifinfo->noifmedia)
-		goto active;
-	if ((unsigned)ifr.ifr_flags & IFF_LOWER_UP)
-		goto active;
-
-inactive:
-	return (0);
-active:
 	return (1);
 }
 
@@ -540,8 +567,13 @@ interface_link_status(char *ifname)
 	}
 	close(sock);
 
-	/* Linux carrier: IFF_LOWER_UP (media), IFF_RUNNING (attached). */
-	if ((unsigned)ifr.ifr_flags & IFF_LOWER_UP)
+	/*
+	 * IFF_LOWER_UP (bit 16, 0x10000) does not fit in the 16-bit
+	 * ifr_flags that SIOCGIFFLAGS fills in, so it is never observable
+	 * here. The kernel keeps IFF_RUNNING in sync with carrier state;
+	 * UP|RUNNING is the link check.
+	 */
+	if ((ifr.ifr_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING))
 		return (1);
 	return (0);
 }

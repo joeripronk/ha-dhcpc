@@ -159,6 +159,23 @@ static int g_running;       /* fds + timerfd registered with the loop */
 static int g_core_fds[CORE_FDS_MAX];
 static int g_n_core_fds;
 static char g_lease_db[PATH_MAX]; /* lease DB we last told the core about */
+static hadc_ctx_t *g_ctx;         /* for the core's fd-closed notification */
+
+/* The core closed one of its protocol fds (dead packet socket, removed
+ * interface). Drop it from our bookkeeping and from the daemon's epoll set
+ * immediately, while the number is still closed: otherwise a later stop or
+ * restart would deregister whatever unrelated fd has since reused the
+ * number. */
+void dhcp_core_fd_closed(int fd)
+{
+    for (int i = 0; i < g_n_core_fds; i++)
+        if (g_core_fds[i] == fd) {
+            g_core_fds[i] = g_core_fds[--g_n_core_fds];
+            break;
+        }
+    if (g_ctx != NULL)
+        hadc_loop_del(g_ctx, fd);
+}
 
 int hadc_dhcpcore_start(hadc_ctx_t *ctx)
 {
@@ -172,6 +189,8 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
     }
     if (g_running)
         return 0;
+
+    g_ctx = ctx;
 
     if (!g_core_live) {
         /* Options the daemon's lease summary needs must be declared in the
@@ -228,7 +247,7 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
     }
     nfds = dhcp_core_get_fds(fds, CORE_FDS_MAX);
     for (int i = 0; i < nfds; i++) {
-        if (hadc_loop_add(ctx, fds[i], core_fd_ready, 0) != 0) {
+        if (hadc_loop_add(ctx, fds[i], core_fd_ready, HADC_FD_ERR_DROP) != 0) {
             hadc_err("dhcpcore: epoll register fd %d failed", fds[i]);
             return -1;
         }
@@ -298,7 +317,7 @@ int hadc_dhcpcore_restart(hadc_ctx_t *ctx)
 
     int n = dhcp_core_get_fds(fds, CORE_FDS_MAX);
     for (int i = 0; i < n; i++)
-        if (hadc_loop_add(ctx, fds[i], core_fd_ready, 0) == 0 && g_n_core_fds < CORE_FDS_MAX)
+        if (hadc_loop_add(ctx, fds[i], core_fd_ready, HADC_FD_ERR_DROP) == 0 && g_n_core_fds < CORE_FDS_MAX)
             g_core_fds[g_n_core_fds++] = fds[i];
     core_arm_timer(ctx);
 

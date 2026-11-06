@@ -35,6 +35,7 @@
 typedef struct {
     int fd;
     hadc_fd_cb_t cb;
+    int flags;
 } fd_entry_t;
 
 static fd_entry_t g_fds[MAX_FDS];
@@ -43,11 +44,11 @@ static hadc_ctx_t g_ctx;
 
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
 {
-    (void)events;
     if (g_nfds >= MAX_FDS || fd < 0)
         return -1;
     g_fds[g_nfds].fd = fd;
     g_fds[g_nfds].cb = cb;
+    g_fds[g_nfds].flags = events;
     g_nfds++;
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
     if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
@@ -66,8 +67,12 @@ int hadc_loop_del(hadc_ctx_t *ctx, int fd)
         return -1;
     g_fds[j] = g_fds[--g_nfds];
     if (epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
-        hadc_err("loop: epoll del fd %d: %s", fd, strerror(errno));
-        return -1;
+        /* The owner may already have closed the fd (Linux drops it from the
+         * epoll set automatically), so ENOENT/EBADF is not an error. */
+        if (errno != ENOENT && errno != EBADF) {
+            hadc_err("loop: epoll del fd %d: %s", fd, strerror(errno));
+            return -1;
+        }
     }
     return 0;
 }
@@ -401,9 +406,34 @@ int main(int argc, char **argv)
     while (ctx->running) {
         int n = epoll_wait(ctx->epfd, evs, MAX_FDS, 1000);
         for (int i = 0; i < n; i++) {
+            int fd = evs[i].data.fd;
+            fd_entry_t *e = NULL;
             for (size_t j = 0; j < g_nfds; j++)
-                if (g_fds[j].fd == evs[i].data.fd && g_fds[j].cb)
-                    g_fds[j].cb(ctx, g_fds[j].fd);
+                if (g_fds[j].fd == fd) {
+                    e = &g_fds[j];
+                    break;
+                }
+            if (evs[i].events & (EPOLLERR | EPOLLHUP)) {
+                hadc_warn("loop: fd %d reports %s%s", fd,
+                          (evs[i].events & EPOLLERR) ? "EPOLLERR" : "",
+                          (evs[i].events & EPOLLHUP)
+                              ? ((evs[i].events & EPOLLERR) ? "|EPOLLHUP" : "EPOLLHUP")
+                              : "");
+                /* A permanently erroring fd makes epoll_wait return
+                 * immediately on every pass, pegging a CPU core (an AF_PACKET
+                 * socket whose interface was removed). Owners that cannot
+                 * re-establish an errored fd mark it HADC_FD_ERR_DROP so we
+                 * clean up and deregister it; other subsystems keep their
+                 * registration and still get the event delivered. */
+                if (e != NULL && (e->flags & HADC_FD_ERR_DROP)) {
+                    if (e->cb)
+                        e->cb(ctx, fd);
+                    hadc_loop_del(ctx, fd);
+                    continue;
+                }
+            }
+            if (e != NULL && e->cb)
+                e->cb(ctx, fd);
         }
         hadc_cluster_step(ctx);
         hadc_ctl_step(ctx);

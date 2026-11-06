@@ -36,6 +36,9 @@ struct hadc_ctx {
 void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 
 /* event loop registration */
+/* Owner cleanup cannot re-establish this fd, so drop its registration when the
+ * fd reports EPOLLERR/EPOLLHUP instead of letting it spin the loop. */
+#define HADC_FD_ERR_DROP 0x1
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, void (*cb)(hadc_ctx_t *, int), int events);
 int hadc_loop_del(hadc_ctx_t *ctx, int fd);
 typedef void (*hadc_fd_cb_t)(hadc_ctx_t *, int);

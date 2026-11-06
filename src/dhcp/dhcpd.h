@@ -488,3 +488,5 @@ int  dhcp_core_restart(const char *interface, const char *lease_db);
 int  dhcp_core_drop_interface(struct interface_info *);
 void dispatch_step(void);
 int  linux_route_socket(void);
+/* Daemon-side notification: the core closed a protocol fd it no longer owns. */
+void dhcp_core_fd_closed(int fd);
