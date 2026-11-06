@@ -130,15 +130,15 @@ static void route_match_cb(struct nl_object *obj, void *p)
 	static const struct in_addr any;
 	int i;
 
-	if (rtnl_route_get_type(r) != RTN_UNICAST)
-		return;
+	if (m->gw && rtnl_route_get_type(r) != RTN_UNICAST)
+		return; /* exact match is our own unicast route */
 	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
 		return;
 	if (nl_addr_get_prefixlen(dst) != 0 ||
 	    memcmp(nl_addr_get_binary_addr(dst), &any, 4) != 0)
 		return;
 	if (!m->gw) {
-		m->found = r; /* any default route */
+		m->found = r; /* any default route, any type */
 		return;
 	}
 	for (i = 0; i < rtnl_route_get_nnexthops(r); i++) {
@@ -150,6 +150,28 @@ static void route_match_cb(struct nl_object *obj, void *p)
 			return;
 		}
 	}
+}
+
+/* All default-route entries that conflict with ours (any type, any gateway). */
+struct route_collect {
+	struct rtnl_route *out[16];
+	size_t n;
+};
+
+static void route_collect_cb(struct nl_object *obj, void *p)
+{
+	struct route_collect *c = p;
+	struct rtnl_route *r = (struct rtnl_route *)obj;
+	struct nl_addr *dst = rtnl_route_get_dst(r);
+	static const struct in_addr any;
+
+	if (c->n >= sizeof(c->out) / sizeof(c->out[0]))
+		return;
+	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
+		return;
+	if (nl_addr_get_prefixlen(dst) == 0 &&
+	    memcmp(nl_addr_get_binary_addr(dst), &any, 4) == 0)
+		c->out[c->n++] = r;
 }
 
 static struct rtnl_route *find_default(struct nl_cache *cache, const struct in_addr *gw)
@@ -267,6 +289,8 @@ static int nl_route_add_default(struct nl_sock *sk, int ifindex, const struct in
 	rt->rtm_protocol = RTPROT_BOOT;
 	rt->rtm_scope = RT_SCOPE_UNIVERSE;
 	rt->rtm_type = RTN_UNICAST;
+	rt->rtm_flags = RTNH_F_ONLINK; /* the gateway is on-link even when no
+	                                on-link route exists yet (slaves) */
 	nla_put(m, RTA_GATEWAY, 4, gw);
 	nla_put(m, RTA_OIF, 4, &ifindex);
 	return nl_send_sync(sk, m); /* consumes m */
@@ -360,22 +384,28 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 	}
 
 	if (desired->add_routes) {
+		struct route_collect conflicts = { { NULL }, 0 };
+		size_t ci;
+
 		if (desired->gateway.s_addr) {
 			sroute = find_default(rcache, &desired->gateway);
 			if (sroute) {
 				hadc_dbg("executor: default route via %s already present",
 				    inet_ntoa(desired->gateway));
 			} else {
-				/* Replace whatever default route is in the way
-				   (ours from before, or someone else's). */
-				sroute = find_default(rcache, NULL);
-				if (sroute) {
-					if ((rc = rtnl_route_delete(g_sk, sroute, 0)) < 0)
-						hadc_warn("executor: deleting existing "
-						    "default route failed: %s", nl_geterror(rc));
+				/* Remove every conflicting default-route entry
+				   (ours from before, netifd's, any type). */
+				nl_cache_foreach(rcache, route_collect_cb, &conflicts);
+				for (ci = 0; ci < conflicts.n; ci++) {
+					if ((rc = rtnl_route_delete(g_sk, conflicts.out[ci], 0)) < 0)
+						hadc_warn("executor: deleting conflicting "
+						    "default route (type %d) failed: %s",
+						    rtnl_route_get_type(conflicts.out[ci]),
+						    nl_geterror(rc));
 					else
-						hadc_info("executor: replaced existing "
-						    "default route (reason=%s)", reason);
+						hadc_info("executor: removed conflicting "
+						    "default route (type %d, reason=%s)",
+						    rtnl_route_get_type(conflicts.out[ci]), reason);
 				}
 				if ((rc = nl_route_add_default(g_sk, ifindex, &desired->gateway)) < 0)
 					hadc_warn("executor: adding default route via %s failed: %s",
