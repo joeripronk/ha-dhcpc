@@ -137,6 +137,10 @@ static void route_match_cb(struct nl_object *obj, void *p)
 	if (nl_addr_get_prefixlen(dst) != 0 ||
 	    memcmp(nl_addr_get_binary_addr(dst), &any, 4) != 0)
 		return;
+	if (!m->gw) {
+		m->found = r; /* any default route */
+		return;
+	}
 	for (i = 0; i < rtnl_route_get_nnexthops(r); i++) {
 		struct nl_addr *gw = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
 
@@ -356,8 +360,32 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 	}
 
 	if (desired->add_routes) {
-		if (prev && prev->gateway.s_addr &&
-		    prev->gateway.s_addr != desired->gateway.s_addr) {
+		if (desired->gateway.s_addr) {
+			sroute = find_default(rcache, &desired->gateway);
+			if (sroute) {
+				hadc_dbg("executor: default route via %s already present",
+				    inet_ntoa(desired->gateway));
+			} else {
+				/* Replace whatever default route is in the way
+				   (ours from before, or someone else's). */
+				sroute = find_default(rcache, NULL);
+				if (sroute) {
+					if ((rc = rtnl_route_delete(g_sk, sroute, 0)) < 0)
+						hadc_warn("executor: deleting existing "
+						    "default route failed: %s", nl_geterror(rc));
+					else
+						hadc_info("executor: replaced existing "
+						    "default route (reason=%s)", reason);
+				}
+				if ((rc = nl_route_add_default(g_sk, ifindex, &desired->gateway)) < 0)
+					hadc_warn("executor: adding default route via %s failed: %s",
+					    inet_ntoa(desired->gateway), nl_geterror(rc));
+				else
+					hadc_info("executor: added default route via %s on %s (reason=%s)",
+					    inet_ntoa(desired->gateway), desired->interface, reason);
+			}
+		} else if (prev && prev->gateway.s_addr) {
+			/* the gateway went away: drop what we applied */
 			sroute = find_default(rcache, &prev->gateway);
 			if (sroute) {
 				if ((rc = rtnl_route_delete(g_sk, sroute, 0)) < 0)
@@ -367,17 +395,6 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 					hadc_info("executor: removed default route via %s (reason=%s)",
 					    inet_ntoa(prev->gateway), reason);
 			}
-		}
-		if (desired->gateway.s_addr && !find_default(rcache, &desired->gateway)) {
-			if ((rc = nl_route_add_default(g_sk, ifindex, &desired->gateway)) < 0)
-				hadc_warn("executor: adding default route via %s failed: %s",
-				    inet_ntoa(desired->gateway), nl_geterror(rc));
-			else
-				hadc_info("executor: added default route via %s on %s (reason=%s)",
-				    inet_ntoa(desired->gateway), desired->interface, reason);
-		} else if (desired->gateway.s_addr) {
-			hadc_dbg("executor: default route via %s already present",
-			    inet_ntoa(desired->gateway));
 		}
 	}
 
