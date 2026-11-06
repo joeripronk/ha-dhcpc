@@ -3,5 +3,6 @@ build/
 /tests_persist
 /tests_config
 *.d
+!etc/init.d/
 /ha-dhcpc
 /vendor/

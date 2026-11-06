@@ -8,8 +8,9 @@
  *     the received document to its own copy of this path (atomic, digest-
  *     verified) so the cluster converges across restarts.
  *   /etc/ha-dhcpc/ha-dhcpc-local.conf  — per-node overlay, wins on conflict.
- *     `self` and `priority` are per-node here; any shared key may be overridden
- *     per node (interface and default_role are the usual ones).
+ *     `self` and `priority` are per-node here (`self` defaults to the system
+ *     hostname when set in neither file); any shared key may be overridden per
+ *     node (interface and default_role are the usual ones).
  *
  * The merged view is what the daemon runs; the digest below is the digest of
  * the shared document only (never of a node's merged view), so it is the value
@@ -20,6 +21,7 @@
 
 #include <jansson.h>
 
+#include "log.h"
 #include "types.h"
 
 #define HADC_CONF_SHA_HEX 65 /* sha256 hex + NUL */
@@ -39,6 +41,7 @@ typedef struct {
 
     /* daemon settings */
     char interface[HADC_IFNAME_MAX];
+    hadc_log_level_t loglevel; /* debug|info|warn|err, default info */
     struct {
         uint16_t port;                 /* UDP cluster transport, shared link */
         uint32_t heartbeat_ms;

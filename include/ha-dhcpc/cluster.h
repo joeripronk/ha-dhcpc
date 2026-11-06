@@ -41,6 +41,7 @@ typedef struct {
      * digest so a member can spot a stale copy and request it. */
     char conf_sha256[HADC_CONF_SHA_HEX];
     const char *conf_text;               /* conf_sync only; borrowed, not owned */
+    uint64_t ts_ms;                      /* sender's CLOCK_REALTIME ms at send time */
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -51,6 +52,7 @@ typedef struct {
     uint64_t acked_version;       /* last apply-ack version */
     hadc_hash_t acked_config_hash;
     char conf_sha256[HADC_CONF_SHA_HEX]; /* last conf-ack digest from this member */
+    int64_t clock_offset_ms;      /* peer CLOCK_REALTIME - ours, last heartbeat; 0 = unobserved */
     bool alive;
 } hadc_peer_t;
 
@@ -62,6 +64,14 @@ typedef struct hadc_ctx hadc_ctx_t; /* defined in internal.h; owns conf+state */
  * UDP transport on the local node's sync_address. */
 int hadc_cluster_init(hadc_ctx_t *ctx);
 int hadc_cluster_step(hadc_ctx_t *ctx); /* pump transport; nonblocking */
+
+/* Startup time sync: a starting node first syncs its CLOCK_REALTIME with the
+ * cluster before joining: heartbeats carry the sender's wall clock, the
+ * current master's vote wins, otherwise the median of observed peers. The
+ * clock is stepped only when the winning offset exceeds the step threshold;
+ * monotonic timers are unaffected. Returns 0 when done (synced, below
+ * threshold, or nothing to sync with). */
+int hadc_cluster_timesync(hadc_ctx_t *ctx);
 
 /* Heartbeat tick: called from the daemon's heartbeat timer every
  * heartbeat_ms, on every role. Sends a heartbeat cluster-wide (plan §4:

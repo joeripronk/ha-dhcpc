@@ -2827,16 +2827,29 @@ ipv4addrs(const char * buf)
 	struct in_addr jnk;
 	int count = 0;
 
-	while (inet_aton(buf, &jnk) == 1){
+	/* musl's inet_aton rejects trailing text, so validate each
+	 * space-separated address token instead of the whole buffer */
+	while (*buf != '\0') {
+		char tok[64];
+		size_t n = 0;
+		while (*buf != '\0' && *buf != ' ') {
+			if (n + 1 >= sizeof(tok))
+				return (0);
+			tok[n++] = *buf++;
+		}
+		tok[n] = '\0';
+		if (n == 0) {
+			while (*buf == ' ')
+				buf++;
+			continue;
+		}
+		if (inet_aton(tok, &jnk) != 1)
+			return (0);
 		count++;
-		while (periodchar(*buf) || digitchar(*buf))
-			buf++;
-		if (*buf == '\0')
-			return (count);
-		while (*buf ==  ' ')
+		while (*buf == ' ')
 			buf++;
 	}
-	return (0);
+	return (count);
 }
 
 

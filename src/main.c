@@ -288,6 +288,7 @@ int main(int argc, char **argv)
         hadc_err("config: %s", err);
         return 1;
     }
+    hadc_log_set_level(ctx->conf.loglevel);
 
     /* Initial role: obey persisted view, else the designated master in the
      * shared config. */
@@ -345,6 +346,7 @@ int main(int argc, char **argv)
     hadc_cluster_set_role_hook(cb_role_change, ctx);
     if (hadc_cluster_init(ctx) != 0)
         return 1;
+    hadc_cluster_timesync(ctx); /* sync CLOCK_REALTIME with the cluster first */
     hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
     if (hadc_executor_init(ctx) != 0)
         return 1;

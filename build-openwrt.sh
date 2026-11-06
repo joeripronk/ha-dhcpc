@@ -3,7 +3,7 @@
 # Usage: ./build-openwrt.sh [sdk-dir]   (or OPENWRT_SDK=/path/sdk ./build-openwrt.sh)
 set -eu
 
-SDK=${1:-${OPENWRT_SDK:-$HOME/src/openwrt-sdk-25.12.6-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64}}
+SDK=${1:-${OPENWRT_SDK:-$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64}}
 
 [ -d "$SDK" ] || { echo "SDK not found: $SDK" >&2; exit 1; }
 [ -f "$SDK/package/ha-dhcpc/Makefile" ] || { echo "package/ha-dhcpc missing in $SDK" >&2; exit 1; }

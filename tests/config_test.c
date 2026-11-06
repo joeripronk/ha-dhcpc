@@ -149,13 +149,44 @@ int main(void)
     else
         ok("digest mismatch refused");
 
-    /* required keys: self must come from somewhere */
+    /* self defaults to the hostname when set in neither file */
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
     write_file(base, "master_mac: \"aa:bb:cc:dd:ee:ff\"\ndesignated_master: node-a\ninterface: eth0\n");
     unlink(local);
-    if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
-        fail("missing self should be an error");
+    if (strlen(hostname) >= 64)
+        ok("self hostname default skipped (hostname too long)");
+    else if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+        fail("missing self should default to the hostname");
+    else if (strcmp(conf.self, hostname) != 0)
+        fail("self should default to the hostname");
     else
-        ok("missing self is an error");
+        ok("self defaults to the hostname");
+
+    /* loglevel: defaults to info, parses, rejects unknown values */
+    write_file(base, BASE_NOMAC);
+    unlink(local);
+    if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+        fail("loglevel default load");
+    else if (conf.loglevel != HADC_LOG_INFO)
+        fail("loglevel should default to info");
+    else
+        ok("loglevel defaults to info");
+    char llbuf[2048];
+    snprintf(llbuf, sizeof(llbuf), "%sloglevel: debug\n", BASE_NOMAC);
+    write_file(base, llbuf);
+    if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+        fail("loglevel parse");
+    else if (conf.loglevel != HADC_LOG_DEBUG)
+        fail("loglevel debug");
+    else
+        ok("loglevel debug parsed");
+    snprintf(llbuf, sizeof(llbuf), "%sloglevel: trace\n", BASE_NOMAC);
+    write_file(base, llbuf);
+    if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+        fail("unknown loglevel should be an error");
+    else
+        ok("unknown loglevel rejected");
 
     /* lease_file: relative resolves against the shared config's directory,
      * absolute is used as given, unset keeps the compiled-in default */

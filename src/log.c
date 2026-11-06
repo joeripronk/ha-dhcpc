@@ -9,12 +9,21 @@
 
 static const char *LEVELS[] = { "debug", "info", "warn", "err" };
 
+static hadc_log_level_t g_min_level = HADC_LOG_INFO;
+
+void hadc_log_set_level(hadc_log_level_t level)
+{
+    g_min_level = level;
+}
+
 void hadc_log(hadc_log_level_t level, const char *fmt, ...)
 {
     va_list ap;
     struct timespec ts;
     char tsbuf[32];
 
+    if (level < g_min_level)
+        return;
     clock_gettime(CLOCK_REALTIME, &ts);
     snprintf(tsbuf, sizeof(tsbuf), "%lld.%03lld", (long long)ts.tv_sec,
              (long long)(ts.tv_nsec / 1000000));

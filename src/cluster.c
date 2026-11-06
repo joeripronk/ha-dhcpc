@@ -9,10 +9,12 @@
 #include <fcntl.h>
 #include <jansson.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
@@ -31,6 +33,19 @@ static uint64_t g_cluster_start_ms;
 static struct sockaddr_in g_bound; /* what udp_fd is bound to (rebind check) */
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
+
+/* CLOCK_REALTIME ms — the clock messages timestamp (heartbeats carry it so a
+ * starting node can sync and peers can spot drift; timers stay monotonic). */
+static uint64_t realtime_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Step the clock during startup timesync / alarm at runtime when a peer's
+ * clock differs from ours by more than this many milliseconds. */
+#define HADC_TIMESYNC_STEP_MS 2000
 
 void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
                                            hadc_role_t new_role), void *arg)
@@ -203,6 +218,7 @@ static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
     /* every message carries our shared-document digest so a member can spot a
      * stale copy (plan §6) */
     json_object_set_new(m, "conf_sha256", json_string(ctx->conf.sha256));
+    json_object_set_new(m, "ts_ms", json_integer((json_int_t)realtime_ms()));
     return m;
 }
 
@@ -228,6 +244,9 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
     if ((s = json_string_value(json_object_get(m, "conf_sha256"))))
         snprintf(out->conf_sha256, sizeof(out->conf_sha256), "%s", s);
     out->conf_text = json_string_value(json_object_get(m, "conf_text"));
+    v = json_object_get(m, "ts_ms");
+    if (v && json_is_integer(v))
+        out->ts_ms = (uint64_t)json_integer_value(v);
     parse_lease(json_object_get(m, "lease"), &out->lease);
 }
 
@@ -430,10 +449,28 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     load_msg_fields(ctx, m, &msg);
     int first_seen = peer_entry(ctx, msg.origin) == NULL;
     peer_touch(ctx, msg.origin);
+    hadc_peer_t *p = peer_entry(ctx, msg.origin);
+
+    /* timestamps: every message carries the sender's CLOCK_REALTIME ms; keep
+     * the observed offset per peer (startup timesync + drift alarm below) */
+    if (p && msg.ts_ms != 0 && strcmp(msg.origin, ctx->conf.self))
+        p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
 
     if (!strcmp(msg.type, HADC_MSG_HEARTBEAT)) {
+        static uint64_t last_drift_alarm_ms;
         hadc_dbg("sync: heartbeat from %s (master=%s, version=%llu)", msg.origin, msg.master_id,
                  (unsigned long long)msg.lease_version);
+        if (p && p->clock_offset_ms != 0 &&
+            llabs(p->clock_offset_ms) > HADC_TIMESYNC_STEP_MS &&
+            (strcmp(msg.origin, ctx->conf.designated_master) == 0 ||
+             strcmp(msg.master_id, msg.origin) == 0) &&
+            (uint64_t)hadc_now_ms() - last_drift_alarm_ms >=
+                ctx->conf.cluster.election_deadline_ms) {
+            last_drift_alarm_ms = (uint64_t)hadc_now_ms();
+            hadc_warn("ALARM: master %s clock is %lld ms off ours (heartbeat ts); startup "
+                      "timesync only, no runtime step",
+                      msg.origin, (long long)p->clock_offset_ms);
+        }
         /* Shared-config sync (plan §6): the master's copy is authoritative, so a
          * member whose digest differs asks for it, and a member that just showed
          * up gets it pushed. */
@@ -710,5 +747,133 @@ int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
             hadc_info("sync: state_push v%llu sent to %s",
                       (unsigned long long)lease->version, m->id);
     }
+    return 0;
+}
+
+/* Startup time sync (plan §4): a starting node syncs its CLOCK_REALTIME with
+ * the cluster before joining. It heartbeats, listens for one window, and
+ * collects each peer's wall clock from the timestamps its messages carry. The
+ * current master's vote wins; otherwise the median of the observed offsets
+ * decides. The clock is stepped only when the winning offset exceeds
+ * HADC_TIMESYNC_STEP_MS; monotonic timers are unaffected. */
+int hadc_cluster_timesync(hadc_ctx_t *ctx)
+{
+    struct {
+        char id[HADC_NODE_ID_MAX];
+        int64_t offset_ms;
+        bool claims_master;
+        uint64_t seen_ms;
+    } seen[HADC_MEMBERS_MAX];
+    size_t n_seen = 0;
+
+    size_t others = 0;
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (strcmp(ctx->conf.members[i].id, ctx->conf.self))
+            others++;
+    if (ctx->udp_fd < 0 || others == 0)
+        return 0;
+
+    uint64_t window = 3 * ctx->conf.cluster.heartbeat_ms;
+    if (window < 1000)
+        window = 1000;
+    if (window > 10000)
+        window = 10000;
+
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        if (!strcmp(m->id, ctx->conf.self))
+            continue;
+        send_to_member(ctx, m, build_msg(ctx, HADC_MSG_HEARTBEAT, 1));
+    }
+
+    hadc_info("timesync: listening %llums for cluster clocks", (unsigned long long)window);
+    uint64_t deadline = (uint64_t)hadc_now_ms() + window;
+    while ((uint64_t)hadc_now_ms() < deadline) {
+        struct pollfd pfd = { .fd = ctx->udp_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)(deadline - (uint64_t)hadc_now_ms()));
+        if (pr <= 0)
+            break;
+        char buf[65536];
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n = recvfrom(ctx->udp_fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from,
+                             &fromlen);
+        if (n <= 0)
+            continue;
+        buf[n] = '\0';
+        json_error_t jerr;
+        json_t *m = json_loads(buf, 0, &jerr);
+        if (!m)
+            continue;
+        hadc_msg_t msg;
+        load_msg_fields(ctx, m, &msg);
+        char mtype[64];
+        snprintf(mtype, sizeof(mtype), "%s", msg.type ? msg.type : "");
+        json_decref(m);
+        if (strcmp(mtype, HADC_MSG_HEARTBEAT) || !msg.ts_ms ||
+            !strcmp(msg.origin, ctx->conf.self))
+            continue;
+        int64_t offset = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
+        size_t j = 0;
+        for (; j < n_seen; j++)
+            if (!strcmp(seen[j].id, msg.origin))
+                break;
+        if (j == n_seen && n_seen < HADC_MEMBERS_MAX)
+            n_seen++;
+        if (j == n_seen)
+            continue;
+        snprintf(seen[j].id, sizeof(seen[j].id), "%s", msg.origin);
+        seen[j].offset_ms = offset;
+        seen[j].claims_master = !strcmp(msg.master_id, msg.origin);
+        seen[j].seen_ms = (uint64_t)hadc_now_ms();
+    }
+
+    if (n_seen == 0) {
+        hadc_info("timesync: no cluster clocks seen, keeping ours");
+        return 0;
+    }
+
+    /* the (recent) master's vote wins; otherwise the median of the peers */
+    size_t pick = n_seen;
+    for (size_t j = 0; j < n_seen; j++)
+        if (seen[j].claims_master && seen[j].seen_ms > (pick == n_seen ? 0 : seen[pick].seen_ms))
+            pick = j;
+    int64_t offset;
+    const char *from_id;
+    if (pick < n_seen) {
+        offset = seen[pick].offset_ms;
+        from_id = seen[pick].id;
+    } else {
+        int64_t sorted[HADC_MEMBERS_MAX];
+        for (size_t j = 0; j < n_seen; j++)
+            sorted[j] = seen[j].offset_ms;
+        for (size_t a = 0; a < n_seen; a++)
+            for (size_t b = a + 1; b < n_seen; b++)
+                if (sorted[b] < sorted[a]) {
+                    int64_t t = sorted[a];
+                    sorted[a] = sorted[b];
+                    sorted[b] = t;
+                }
+        offset = sorted[n_seen / 2]; /* even counts take the upper median */
+        from_id = "cluster median";
+    }
+
+    if (llabs(offset) <= HADC_TIMESYNC_STEP_MS) {
+        hadc_info("timesync: clock agrees with the cluster (winning offset %lld ms from %s)",
+                  (long long)offset, from_id);
+        return 0;
+    }
+
+    uint64_t target = realtime_ms() + (uint64_t)offset;
+    struct timespec ts = {
+        .tv_sec = (time_t)(target / 1000),
+        .tv_nsec = (long)(target % 1000) * 1000000,
+    };
+    if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
+        hadc_warn("timesync: clock_settime failed (%s), keeping ours", strerror(errno));
+        return 0;
+    }
+    hadc_info("timesync: CLOCK_REALTIME stepped by %+lld ms (voted by %s)", (long long)offset,
+              from_id);
     return 0;
 }

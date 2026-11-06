@@ -105,6 +105,7 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         snprintf(changes, sizeof(changes), "unspecified");
 
     ctx->conf = next;
+    hadc_log_set_level(ctx->conf.loglevel);
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);
 
     if (heartbeat) {

@@ -381,10 +381,20 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     }
     free(bytes);
 
-    /* identity: per-node (the local overlay is where these usually live) */
-    if (get_str(root, "self", out->self, HADC_NODE_ID_MAX, true, "config")) {
+    /* identity: per-node (the local overlay is where these usually live);
+     * defaults to the system hostname when set in neither file */
+    if (get_str(root, "self", out->self, HADC_NODE_ID_MAX, false, "config")) {
         snprintf(err, errlen, "%s", g_errbuf);
         goto derr;
+    }
+    if (out->self[0] == '\0') {
+        char host[256];
+        if (gethostname(host, sizeof(host)) != 0 || host[0] == '\0' ||
+            strlen(host) >= HADC_NODE_ID_MAX) {
+            snprintf(err, errlen, "config: self not set and hostname unavailable");
+            goto derr;
+        }
+        snprintf(out->self, sizeof(out->self), "%s", host);
     }
     if (get_int(root, "priority", &v, 100, false, "config"))
         goto derr;
@@ -429,6 +439,27 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
 
     if (get_str(root, "interface", out->interface, HADC_IFNAME_MAX, true, "config")) {
         snprintf(err, errlen, "%s", g_errbuf);
+        goto derr;
+    }
+
+    const char *ll = "info";
+    json_t *llv = json_object_get(root, "loglevel");
+    if (llv && !json_is_string(llv)) {
+        snprintf(err, errlen, "config: loglevel must be a string");
+        goto derr;
+    }
+    if (llv)
+        ll = json_string_value(llv);
+    if (!strcmp(ll, "debug"))
+        out->loglevel = HADC_LOG_DEBUG;
+    else if (!strcmp(ll, "info"))
+        out->loglevel = HADC_LOG_INFO;
+    else if (!strcmp(ll, "warn"))
+        out->loglevel = HADC_LOG_WARN;
+    else if (!strcmp(ll, "err"))
+        out->loglevel = HADC_LOG_ERR;
+    else {
+        snprintf(err, errlen, "config: unknown loglevel %s", ll);
         goto derr;
     }
 
