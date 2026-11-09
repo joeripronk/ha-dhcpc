@@ -9,6 +9,8 @@
 #include "lease.h"
 #include "types.h"
 
+#include <jansson.h>
+
 /* dhclient-script compatible reasons (frozen set). */
 #define HADC_REASON_BOUND   "BOUND"
 #define HADC_REASON_RENEW   "RENEW"
@@ -54,9 +56,29 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease,
 
 /* Idempotent reconcile: no-op when current state already matches desired;
  * never flaps, never restarts services. reason is a HADC_REASON_* string
- * passed to hooks when a change is actually applied. */
+ * passed to hooks when a change is actually applied. The applied-state memo
+ * is a fast path, not the truth: when the hash matches, verification against
+ * live kernel state decides whether this is really a no-op (drift self-heal). */
 int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired,
                         const char *reason);
+
+/* Drift self-heal (plan §3): subscribe to the rtnetlink groups covering the
+ * resources we own; a managed address/route/neighbor/link changing underneath
+ * us (netifd reloads, ip addr flush) queues a verify, acted on the first
+ * heartbeat tick after HADC_EXECUTOR_RECONCILE_MIN_INTERVAL_MS so bursts
+ * settle first. The periodic audit (at most one verify per
+ * HADC_EXECUTOR_AUDIT_MS) covers missed events. Both only re-apply when
+ * verification against live state shows drift, so our own changes do not
+ * feed back. */
+#define HADC_EXECUTOR_AUDIT_MS 30000
+#define HADC_EXECUTOR_RECONCILE_MIN_INTERVAL_MS 1000
+int hadc_executor_monitor_start(hadc_ctx_t *ctx); /* needs hadc_executor_init first */
+void hadc_executor_audit_tick(hadc_ctx_t *ctx);
+
+/* Executor facet of the status JSON: applied hash, last verification
+ * (-1 = not verified yet, 0 = live state matches desired, 1 = drift seen),
+ * reconciliations performed, and whether the rtnetlink monitor is active. */
+json_t *hadc_executor_status(void);
 
 /* Bring the interface up if it is administratively down (RTM_SETLINK, no-op
  * when already up). Called on promotion: the new master must be able to

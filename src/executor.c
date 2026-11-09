@@ -34,8 +34,21 @@
 static int nl_addr_add(struct nl_sock *sk, int ifindex, const struct in_addr *ip,
                        unsigned prefixlen);
 static int nl_link_set_state(struct nl_sock *sk, int ifindex, bool up);
+static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d);
+static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+                                 const char *reason, bool from_drift);
+static void monitor_ready(hadc_ctx_t *ctx, int fd);
 
 static struct nl_sock *g_sk;
+
+/* Drift self-heal state: the applied-set memo is a fast path, not the truth. */
+static struct nl_sock *g_mon_sk;
+static int g_mon_fd = -1;
+static uint64_t g_mon_last_reconcile_ms;
+static bool g_mon_pending; /* monitor events set this; a heartbeat tick acts on it */
+static uint64_t g_last_audit_ms;
+static uint64_t g_drift_reconciled;
+static int g_last_verify = -1; /* -1 = unverified, 0 = matches, 1 = drift */
 
 bool executor_action_is_fatal(int action_rc, bool action_is_fatal)
 {
@@ -604,7 +617,238 @@ out:
 	return rc;
 }
 
+/* Does the neighbor cache hold an entry for gw carrying exactly this lladdr? */
+static bool neigh_holds(struct nl_cache *ncache, int ifindex,
+    const struct in_addr *gw, const uint8_t mac[HADC_MAC_LEN])
+{
+	struct nl_addr *dst = nl_addr_build(AF_INET, (void *)gw, 4);
+	struct rtnl_neigh *n;
+	bool ok = false;
+
+	if (!dst)
+		return false;
+	n = rtnl_neigh_get(ncache, ifindex, dst);
+	if (n) {
+		struct nl_addr *ll = rtnl_neigh_get_lladdr(n);
+		ok = ll && nl_addr_get_len(ll) == HADC_MAC_LEN &&
+		     memcmp(nl_addr_get_binary_addr(ll), mac, HADC_MAC_LEN) == 0;
+	}
+	nl_addr_put(dst);
+	return ok;
+}
+
+/* Drift verification: compare the desired state against live kernel state for
+ * the resources we own (lease address, cluster addresses, default routes,
+ * programmed neighbor entry, link state). DNS is hook-managed and not
+ * verified here. Returns the number of diverged managed rows (0 = matches),
+ * or -1 when live state cannot be read. */
+static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
+{
+	struct nl_cache *lcache = NULL, *acache = NULL, *rcache = NULL, *ncache = NULL;
+	struct rtnl_link *link;
+	int drift = 0;
+
+	if (!g_sk)
+		return -1;
+	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 ||
+	    rtnl_addr_alloc_cache(g_sk, &acache) < 0 ||
+	    rtnl_route_alloc_cache(g_sk, AF_INET, 0, &rcache) < 0 ||
+	    rtnl_neigh_alloc_cache(g_sk, &ncache) < 0) {
+		hadc_dbg("executor: drift verify: netlink cache dump failed");
+		drift = -1;
+		goto out;
+	}
+	link = rtnl_link_get_by_name(lcache, d->interface);
+	if (!link) {
+		hadc_dbg("executor: drift verify: interface %s not found", d->interface);
+		drift = -1;
+		goto out;
+	}
+	{
+		int ifindex = rtnl_link_get_ifindex(link);
+		bool up = rtnl_link_get_flags(link) & IFF_UP;
+
+		if ((d->link_state == 1 && !up) || (d->link_state == 2 && up))
+			drift++;
+		if (d->present && !find_addr(acache, ifindex, &d->address,
+		    (int)d->prefixlen))
+			drift++;
+		/* The cluster address set is ours in both roles: the master must hold
+		 * it, a slave must not (a leftover from a previous life as master
+		 * counts as drift, matching apply_cluster_addrs). */
+		if (d->cluster_addrs_present ||
+		    (g_applied_valid && g_applied.cluster_addrs_present)) {
+			for (size_t i = 0; i < d->n_cluster_ifaces; i++) {
+				const hadc_cluster_if_t *ci = &d->cluster_ifaces[i];
+				struct rtnl_link *cl = rtnl_link_get_by_name(lcache,
+				    ci->interface);
+				if (!cl) {
+					if (ci->n_addrs)
+						drift++;
+					continue;
+				}
+				for (size_t j = 0; j < ci->n_addrs; j++) {
+					struct rtnl_addr *a = find_addr(acache,
+					    rtnl_link_get_ifindex(cl), &ci->addrs[j].address, -1);
+					bool exact = a && (unsigned)rtnl_addr_get_prefixlen(a) ==
+					    ci->addrs[j].prefixlen;
+					if (d->cluster_addrs_present ? !exact
+					    : (a && exact))
+						drift++;
+				}
+			}
+		}
+		if (d->add_routes) {
+			if (d->gateway.s_addr && !find_default(rcache, &d->gateway))
+				drift++;
+			if (d->backup_route && d->backup_gateway.s_addr &&
+			    d->backup_gateway.s_addr != d->gateway.s_addr &&
+			    !find_default(rcache, &d->backup_gateway))
+				drift++;
+			if (d->gw_mac_valid && d->gateway.s_addr &&
+			    !neigh_holds(ncache, ifindex, &d->gateway, d->gw_mac))
+				drift++;
+		}
+	}
+out:
+	if (lcache)
+		nl_cache_put(lcache);
+	if (acache)
+		nl_cache_put(acache);
+	if (rcache)
+		nl_cache_put(rcache);
+	if (ncache)
+		nl_cache_put(ncache);
+	(void)ctx;
+	return drift;
+}
+
+static void reconcile_now(hadc_ctx_t *ctx, const char *reason)
+{
+	hadc_desired_t desired;
+	int v;
+
+	if (!g_applied_valid)
+		return; /* nothing applied yet: nothing to reconcile against */
+	hadc_executor_desired(ctx, &ctx->lease, &desired);
+	v = verify_desired(ctx, &desired);
+	g_last_verify = v < 0 ? -1 : (v > 0 ? 1 : 0);
+	if (v <= 0)
+		return;
+	g_drift_reconciled++;
+	hadc_info("executor: drift detected (%d managed row(s) diverged, reason=%s); "
+	    "re-applying", v, reason);
+	executor_apply_locked(ctx, &desired, reason, true);
+}
+
+void hadc_executor_audit_tick(hadc_ctx_t *ctx)
+{
+	/* Pending monitor events are acted on the first heartbeat tick after the
+	 * debounce interval, so a burst (netifd flush+re-add) settles first. */
+	if (g_mon_pending && (uint64_t)hadc_now_ms() - g_mon_last_reconcile_ms >=
+	    HADC_EXECUTOR_RECONCILE_MIN_INTERVAL_MS) {
+		g_mon_pending = false;
+		g_mon_last_reconcile_ms = (uint64_t)hadc_now_ms();
+		reconcile_now(ctx, "RECONCILE");
+		return;
+	}
+	if ((uint64_t)hadc_now_ms() - g_last_audit_ms < HADC_EXECUTOR_AUDIT_MS)
+		return;
+	g_last_audit_ms = (uint64_t)hadc_now_ms();
+	reconcile_now(ctx, "AUDIT");
+}
+
+int hadc_executor_monitor_start(hadc_ctx_t *ctx)
+{
+	if (!g_sk) {
+		hadc_warn("executor: monitor start needs the netlink command socket first");
+		return -1;
+	}
+	g_mon_sk = nl_socket_alloc();
+	if (!g_mon_sk) {
+		hadc_warn("executor: monitor nl_socket_alloc failed");
+		return -1;
+	}
+	if (nl_connect(g_mon_sk, NETLINK_ROUTE) != 0) {
+		hadc_warn("executor: monitor netlink connect failed; drift detection "
+		    "falls back to the periodic audit");
+		nl_socket_free(g_mon_sk);
+		g_mon_sk = NULL;
+		return -1;
+	}
+	/* libnl group numbers, i.e. the RTMGRP bind-mask bit + 1: 1 = link,
+	 * 3 = neighbor (RTMGRP_NEIGH), 5 = IPv4 ifaddr, 7 = IPv4 route. */
+	if (nl_socket_add_memberships(g_mon_sk, 1, 3, 5, 7, 0) < 0) {
+		hadc_warn("executor: monitor netlink memberships failed; drift detection "
+		    "falls back to the periodic audit");
+		nl_socket_free(g_mon_sk);
+		g_mon_sk = NULL;
+		return -1;
+	}
+	nl_socket_set_nonblocking(g_mon_sk);
+	g_mon_fd = nl_socket_get_fd(g_mon_sk);
+	if (hadc_loop_add(ctx, g_mon_fd, monitor_ready, 0) != 0) {
+		hadc_warn("executor: monitor fd could not be registered");
+		nl_socket_free(g_mon_sk);
+		g_mon_sk = NULL;
+		g_mon_fd = -1;
+		return -1;
+	}
+	hadc_info("executor: rtnetlink drift monitor active (addr/route/neigh/link groups)");
+	return 0;
+}
+
+/* Drain the multicast queue and mark a pending verify; the heartbeat tick
+ * acts on it after the debounce interval, so a burst settles first. Our own
+ * changes arrive here too — verify then matches and nothing re-applies. */
+static void monitor_ready(hadc_ctx_t *ctx, int fd)
+{
+	char buf[4096];
+
+	(void)ctx;
+	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0)
+		g_mon_pending = true;
+}
+
+json_t *hadc_executor_status(void)
+{
+	char hash[65] = "";
+
+	if (g_applied_valid) {
+		for (size_t i = 0; i < 32; i++)
+			snprintf(hash + i * 2, 3, "%02x", g_applied.config_hash[i]);
+	}
+	return json_pack("{s:s, s:I, s:I, s:b}", "applied_hash", hash, "verified",
+	    (json_int_t)g_last_verify, "drift_reconciled", (json_int_t)g_drift_reconciled,
+	    "monitor", g_mon_fd >= 0);
+}
+
 int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const char *reason)
+{
+	if (g_applied_valid && !memcmp(g_applied.config_hash, desired->config_hash,
+	    sizeof(g_applied.config_hash))) {
+		/* The memo says applied — but it is a fast path, not the truth: an
+		 * external manager (netifd reload, ip addr flush) may have removed
+		 * what we applied. Verify against live state before declaring a
+		 * no-op. */
+		int v = verify_desired(ctx, desired);
+		g_last_verify = v < 0 ? -1 : (v > 0 ? 1 : 0);
+		if (v == 0) {
+			hadc_dbg("executor: desired state already applied (no delta, reason=%s)",
+			    reason);
+			return 0;
+		}
+		if (v > 0) {
+			g_drift_reconciled++;
+			hadc_info("executor: drift detected during apply (%d managed row(s) "
+			    "diverged, reason=%s); reconciling live state", v, reason);
+		}
+	}
+	return executor_apply_locked(ctx, desired, reason, false);
+}
+
+static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+    const char *reason, bool from_drift)
 {
 	struct nl_cache *lcache = NULL, *acache = NULL, *rcache = NULL;
 	struct rtnl_link *link;
@@ -613,18 +857,14 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 	const hadc_desired_t *prev = g_applied_valid ? &g_applied : NULL;
 	int ifindex, fatal = 0, ar = 0;
 
-	if (g_applied_valid && !memcmp(g_applied.config_hash, desired->config_hash,
-	    sizeof(g_applied.config_hash))) {
-		hadc_dbg("executor: desired state already applied (no delta, reason=%s)", reason);
-		return 0;
-	}
 	if (!g_sk) {
 		hadc_err("executor: netlink socket not open");
 		return -1;
 	}
-	hadc_info("executor: apply delta reason=%s interface=%s present=%d hash=%02x%02x%02x%02x",
-	    reason, desired->interface, desired->present, desired->config_hash[0],
-	    desired->config_hash[1], desired->config_hash[2], desired->config_hash[3]);
+	hadc_info("executor: apply %s reason=%s interface=%s present=%d hash=%02x%02x%02x%02x",
+	    from_drift ? "drift" : "delta", reason, desired->interface, desired->present,
+	    desired->config_hash[0], desired->config_hash[1], desired->config_hash[2],
+	    desired->config_hash[3]);
 
 	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 ||
 	    rtnl_addr_alloc_cache(g_sk, &acache) < 0 ||

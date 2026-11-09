@@ -17,6 +17,7 @@
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
+#include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/reload.h"
@@ -67,6 +68,7 @@ static json_t *status_object(hadc_ctx_t *ctx)
                       ctx->role == HADC_ROLE_MASTER, "addresses", addrs));
     }
     json_object_set_new(o, "cluster_addresses", cluster);
+    json_object_set_new(o, "executor", hadc_executor_status());
     return o;
 }
 

@@ -87,6 +87,7 @@ static void timer_ready(hadc_ctx_t *ctx, int fd)
     uint64_t exp;
     (void)!read(fd, &exp, sizeof(exp));
     heartbeat_fire(ctx);
+    hadc_executor_audit_tick(ctx); /* rate-limited live-state audit (plan §3) */
 }
 
 static void signal_ready(hadc_ctx_t *ctx, int fd)
@@ -390,6 +391,8 @@ int main(int argc, char **argv)
     hadc_cluster_timesync(ctx); /* sync CLOCK_REALTIME with the cluster first */
     if (hadc_executor_init(ctx) != 0)
         return 1; /* before election: the role hook brings the link up */
+    hadc_executor_monitor_start(ctx); /* drift self-heal: re-apply when managed
+                                       * resources change underneath us */
     hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
 
     /* Startup desired-state pass from the restored cache: apply the interface

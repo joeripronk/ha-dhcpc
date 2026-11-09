@@ -350,6 +350,14 @@ roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault
   BOOTP vs DHCP options sanity, clock skew between members (informational only).
 - Config executor must never fight other managers (networkd/NetworkManager must be
   disabled for the interface — documented prerequisite).
+- Drift self-heal: the executor's applied-state memo is a fast path, not the
+  truth — when the hash matches, verification against live kernel state decides
+  whether the apply is really a no-op, so resources removed externally (netifd
+  reloads, `ip addr flush`) are re-added. The rtnetlink monitor (link, neigh and
+  IPv4 addr/route groups) queues a verify that the heartbeat tick acts on after
+  a short debounce (so flush bursts settle first); a periodic audit (30 s)
+  catches missed events; the status JSON reports the applied hash, last
+  verification, reconciliation count and monitor state.
 - Role changes can race (flapping, split brain); `ctl promote/demote` and the
   automatic election are idempotent, prio/id-tiebroken and cooldown-guarded.
 
