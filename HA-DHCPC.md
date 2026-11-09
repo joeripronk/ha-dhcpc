@@ -214,9 +214,10 @@ member, and the master is authoritative for it.
 - When a member joins (first traffic from it), the master pushes its copy.
 - `ha-dhcpc ctl update` (master-only) re-reads the file from disk, applies it
   here and publishes it to every member. On a slave it is refused.
-- `ha-dhcpc ctl renew` (master-only) forces a RENEW DHCPREQUEST on the configured
-  DHCP interface using the active lease and pinned server-id. On a slave it is
-  refused.
+- `ha-dhcpc ctl renew` (master-only) forces a RENEW DHCPREQUEST on the
+  configured DHCP interface using the active lease and pinned server-id; when
+  there is no active lease to renew it falls back to a fresh DISCOVER. On a
+  slave it is refused.
 - A receiver verifies the sha256 the master claims, writes the pushed copy to its
   own copy of this path (atomic, digest-verified) so the cluster converges across
   restarts, then reloads and acks. A member whose digest differs from the master's

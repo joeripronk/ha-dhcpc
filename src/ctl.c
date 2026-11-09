@@ -124,7 +124,13 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
                       role_name(ctx->role));
             reply = "{\"ok\":false,\"error\":\"not master\"}";
         } else if (hadc_dhcpcore_force_renew(ctx) != 0) {
-            reply = "{\"ok\":false,\"error\":\"renew failed\"}";
+            /* Stale lease: nothing to renew — fall back to a fresh lease
+             * (plan §5: RENEW → REBIND → fresh DISCOVER). */
+            if (hadc_dhcpcore_force_discover(ctx) != 0)
+                reply = "{\"ok\":false,\"error\":\"renew failed\"}";
+            else
+                hadc_info("ctl: no active lease to renew; fell back to a fresh "
+                    "DISCOVER");
         } else {
             hadc_info("ctl: renew forced a DHCPREQUEST");
         }
