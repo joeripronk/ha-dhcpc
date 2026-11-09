@@ -81,15 +81,18 @@ int hadc_executor_init(hadc_ctx_t *ctx)
 static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
 {
     char addr[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN], backup[INET_ADDRSTRLEN];
+    char via[INET_ADDRSTRLEN];
 
     inet_ntop(AF_INET, &d->address, addr, sizeof(addr));
     inet_ntop(AF_INET, &d->gateway, gw, sizeof(gw));
     inet_ntop(AF_INET, &d->backup_gateway, backup, sizeof(backup));
+    inet_ntop(AF_INET, &d->default_via, via, sizeof(via));
     json_t *o = json_pack(
-        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I}", "interface", d->interface,
+        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s}", "interface", d->interface,
         "present", d->present, "address", addr, "prefixlen", (json_int_t)d->prefixlen,
         "gateway", gw, "backup_gateway", backup, "backup_route", d->backup_route, "dns", "",
-        "routes", d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state);
+        "routes", d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state,
+        "default_via", via);
     json_t *dns = json_array();
     for (size_t i = 0; i < d->n_dns; i++)
         json_array_append_new(dns, json_string(inet_ntoa(d->dns[i])));
@@ -114,6 +117,14 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
     snprintf(out, outsz, "%s", txt ? txt : "");
     free(txt);
     json_decref(o);
+}
+
+/* Default-route nexthop: the lease gateway, or the master backup router while
+ * the gateway probe is failing or there is no lease IP yet. Neighbor entries
+ * keep the lease gateway (its lladdr is what the lease cached). */
+static const struct in_addr *default_nexthop(const hadc_desired_t *d)
+{
+    return d->default_via.s_addr ? &d->default_via : &d->gateway;
 }
 
 void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desired_t *out)
@@ -155,6 +166,14 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         out->link_state = 2;
         out->present = false;
     }
+    /* Master-only failover: while the gateway probe is failing or we have no
+     * lease IP yet, the default route goes to the configured backup router and
+     * hands back to the lease gateway as soon as the gateway answers again. */
+    out->default_via.s_addr = 0;
+    if (ctx->role == HADC_ROLE_MASTER &&
+        ctx->conf.apply.master_backup_gateway.s_addr != 0 &&
+        (hadc_gwping_unreachable() || lease->address.s_addr == 0))
+        out->default_via = ctx->conf.apply.master_backup_gateway;
     char canon[8192]; /* 8 ifaces x 16 addrs, worst-case CIDR text */
     canonical_desired(out, canon, sizeof(canon));
     hadc_sha256(canon, strlen(canon), out->config_hash);
@@ -699,10 +718,12 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 			}
 		}
 		if (d->add_routes) {
-			if (d->gateway.s_addr && !find_default(rcache, &d->gateway))
+			const struct in_addr *via = default_nexthop(d);
+
+			if (via->s_addr && !find_default(rcache, via))
 				drift++;
 			if (d->backup_route && d->backup_gateway.s_addr &&
-			    d->backup_gateway.s_addr != d->gateway.s_addr &&
+			    d->backup_gateway.s_addr != via->s_addr &&
 			    !find_default(rcache, &d->backup_gateway))
 				drift++;
 			if (d->gw_mac_valid && d->gateway.s_addr &&
@@ -946,19 +967,20 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 
 	if (desired->add_routes) {
 		struct route_collect conflicts = { { NULL }, 0 };
+		const struct in_addr *via = default_nexthop(desired);
 		size_t ci;
 		bool wiped = false;
 		bool want_backup = desired->backup_route && desired->backup_gateway.s_addr != 0 &&
-		    desired->backup_gateway.s_addr != desired->gateway.s_addr;
+		    desired->backup_gateway.s_addr != via->s_addr;
 
 		if (desired->gateway.s_addr && desired->gw_mac_valid)
 			apply_gw_neigh(ifindex, &desired->gateway, desired->gw_mac, reason);
 
-		if (desired->gateway.s_addr) {
-			sroute = find_default(rcache, &desired->gateway);
+		if (via->s_addr) {
+			sroute = find_default(rcache, via);
 			if (sroute) {
 				hadc_dbg("executor: default route via %s already present",
-				    inet_ntoa(desired->gateway));
+				    inet_ntoa(*via));
 			} else {
 				/* Remove every conflicting default-route entry
 				   (ours from before, netifd's, any type). */
@@ -974,28 +996,33 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 						    "default route (type %d, reason=%s)",
 						    rtnl_route_get_type(conflicts.out[ci]), reason);
 				}
-				if ((ar = nl_route_add_default(g_sk, ifindex, &desired->gateway, 0)) < 0)
+				/* The override nexthop lives on another link (the
+				   backup router is on the LAN), so let the kernel pick
+				   the device; only the lease gateway is on-link on the
+				   DHCP interface. */
+				int oif = desired->default_via.s_addr ? 0 : ifindex;
+				if ((ar = nl_route_add_default(g_sk, oif, via, 0)) < 0)
 					hadc_warn("executor: adding default route via %s failed: %s",
-					    inet_ntoa(desired->gateway), nl_geterror(ar));
+					    inet_ntoa(*via), nl_geterror(ar));
 				else
 					hadc_info("executor: added default route via %s on %s (reason=%s)",
-					    inet_ntoa(desired->gateway), desired->interface, reason);
+					    inet_ntoa(*via), desired->interface, reason);
 				wiped = true;
 			}
-		} else if (prev && prev->gateway.s_addr) {
+		} else if (prev && default_nexthop(prev)->s_addr) {
 			/* the gateway went away: drop what we applied */
-			sroute = find_default(rcache, &prev->gateway);
+			sroute = find_default(rcache, default_nexthop(prev));
 			if (sroute) {
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting default route via %s failed: %s",
-					    inet_ntoa(prev->gateway), nl_geterror(ar));
+					    inet_ntoa(*default_nexthop(prev)), nl_geterror(ar));
 				else
 					hadc_info("executor: removed default route via %s (reason=%s)",
-					    inet_ntoa(prev->gateway), reason);
+					    inet_ntoa(*default_nexthop(prev)), reason);
 			}
 		}
 
-		if (!desired->gateway.s_addr && want_backup) {
+		if (!via->s_addr && want_backup) {
 			/* Slave-only mode: only the backup default may remain. */
 			nl_cache_foreach(rcache, route_collect_cb, &conflicts);
 			for (ci = 0; ci < conflicts.n; ci++) {
@@ -1032,7 +1059,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 				    inet_ntoa(desired->backup_gateway));
 			}
 		} else if (prev && prev->backup_route && prev->backup_gateway.s_addr &&
-		    prev->backup_gateway.s_addr != desired->gateway.s_addr) {
+		    prev->backup_gateway.s_addr != via->s_addr) {
 			sroute = find_default(rcache, &prev->backup_gateway);
 			if (sroute) {
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)

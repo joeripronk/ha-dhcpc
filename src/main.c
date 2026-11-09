@@ -88,13 +88,21 @@ static void timer_ready(hadc_ctx_t *ctx, int fd)
     (void)!read(fd, &exp, sizeof(exp));
     heartbeat_fire(ctx);
     hadc_executor_audit_tick(ctx); /* rate-limited live-state audit (plan §3) */
+    hadc_gwping_tick(ctx); /* 10 s gateway probes + reply timeouts */
 }
 
 static void signal_ready(hadc_ctx_t *ctx, int fd)
 {
     struct signalfd_siginfo si;
     (void)!read(fd, &si, sizeof(si));
-    hadc_info("signal %u received; shutting down", si.ssi_signo);
+    /* Graceful exit: a master hands the role to the best live peer so the
+     * cluster elects a new master immediately. With no live peer (or not the
+     * master) it just shuts down and leaves service intact — a lone/partitioned
+     * master must not withdraw the VIP. */
+    if (ctx->role == HADC_ROLE_MASTER && hadc_cluster_handoff(ctx))
+        hadc_info("signal %u received; handed off before shutdown", si.ssi_signo);
+    else
+        hadc_info("signal %u received; shutting down", si.ssi_signo);
     ctx->running = false;
 }
 
@@ -208,8 +216,11 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         hadc_dhcpcore_stop(ctx);
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
-    if (new_role == HADC_ROLE_MASTER)
+    if (new_role == HADC_ROLE_MASTER) {
         hadc_executor_announce_cluster(ctx);
+        hadc_gwping_start(ctx); /* verify the gateway after a promote */
+    } else if (old_role == HADC_ROLE_MASTER)
+        hadc_gwping_stop(ctx);
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
 }
@@ -484,6 +495,7 @@ int main(int argc, char **argv)
         hadc_dhcpcore_step(ctx);
     }
     hadc_dhcpcore_stop(ctx);
+    hadc_gwping_stop(ctx);
     hadc_persist_save(ctx);
     return 0;
 }

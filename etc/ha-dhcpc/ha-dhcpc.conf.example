@@ -37,6 +37,9 @@ apply:
   # backup_gateway: 192.168.10.1  # slave-only backup default route (higher
                                   # metric, removed on promotion); usually set
                                   # per node in ha-dhcpc-local.conf
+  # master_backup_gateway: 192.168.10.3  # master-only: takes over the default
+                                  # route while the gateway probe is unanswered
+                                  # or there is no lease IP yet
   suppress_member_dad: true    # compatibility no-op
   arp_responder: true          # compatibility no-op (the VIP owner answers)
   announce_gratuitous: true    # gratuitous ARP on promotion

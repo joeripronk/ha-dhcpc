@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -36,10 +37,116 @@ static struct sockaddr_in g_bound; /* what udp_fd is bound to (rebind check) */
 
 static void propagate_role(hadc_ctx_t *ctx);
 static bool beats(const hadc_member_t *a, const char *b_id, int b_prio);
+static const hadc_member_t *election_winner(hadc_ctx_t *ctx);
 int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz);
 static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
+static uint64_t realtime_ms(void);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
+
+static const char *role_name(hadc_role_t r)
+{
+    return r == HADC_ROLE_MASTER ? "master" : (r == HADC_ROLE_SLAVE ? "slave" : "unknown");
+}
+
+/* Compact binary heartbeat (minimum-frame sized): 16-byte payload, 64-byte
+ * Ethernet frame. Members are referenced by index into the shared config, so
+ * index identity assumes the same shared document cluster-wide; a sender whose
+ * index is unknown here is skipped by the assertion paths, which are driven by
+ * role_change propagation and the conf-sync push instead.
+ *
+ *   0  type: 0 = heartbeat (JSON datagrams start with '{', so 0 is the
+ *      discriminator for the whole wire)
+ *   1  origin member index (255 = unknown)
+ *   2  master member index (254 = no master, 255 = unknown)
+ *   3  role wire code (HADC_WIRE_ROLE_*)
+ *   4  lease_version, big-endian u64
+ *   12 ts_ms, big-endian u32 low bits of CLOCK_REALTIME ms (decoded to the
+ *      nearest full ms to our clock, so the ~49-day wrap is harmless)
+ */
+#define HADC_WIRE_HB_LEN       16
+#define HADC_WIRE_IDX_UNKNOWN  255
+#define HADC_WIRE_IDX_NONE     254
+
+static size_t put_be(uint8_t *p, uint64_t v, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        p[i] = (uint8_t)(v >> (8 * (n - 1 - i)));
+    return n;
+}
+
+static uint64_t get_be(const uint8_t *p, size_t n)
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++)
+        v = (v << 8) | p[i];
+    return v;
+}
+
+/* Reconstruct a full CLOCK_REALTIME ms from the 32-bit wire field: the nearest
+ * value to our own clock (peers are seconds apart, never ~24 days apart), so a
+ * wrap does not turn the timestamp into garbage. */
+static uint64_t unwrap_ms(uint32_t low32)
+{
+    uint64_t now = realtime_ms();
+    int32_t delta = (int32_t)(uint32_t)(low32 - (uint32_t)now);
+    return (uint64_t)((int64_t)now + delta);
+}
+
+static int member_index(const hadc_ctx_t *ctx, const char *id)
+{
+    if (!id[0])
+        return HADC_WIRE_IDX_NONE;
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (!strcmp(ctx->conf.members[i].id, id))
+            return (int)i;
+    return HADC_WIRE_IDX_UNKNOWN;
+}
+
+static const char *member_id_by_index(const hadc_ctx_t *ctx, int idx)
+{
+    if (idx == HADC_WIRE_IDX_NONE)
+        return "";
+    if (idx < 0 || idx >= (int)ctx->conf.n_members)
+        return NULL;
+    return ctx->conf.members[idx].id;
+}
+
+static void build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
+{
+    memset(out, 0, HADC_WIRE_HB_LEN);
+    out[1] = (uint8_t)member_index(ctx, ctx->conf.self);
+    out[2] = (uint8_t)member_index(ctx, ctx->conf.designated_master);
+    out[3] = (uint8_t)ctx->role; /* matches the HADC_WIRE_ROLE_* codes */
+    put_be(out + 4, ctx->lease.version, 8);
+    put_be(out + 12, realtime_ms() & 0xffffffffu, 4);
+}
+
+static int decode_bin_heartbeat(const hadc_ctx_t *ctx, const uint8_t *p, size_t len,
+                                hadc_msg_t *out)
+{
+    if (len != HADC_WIRE_HB_LEN || p[0] != 0)
+        return -1;
+    const char *id;
+    memset(out, 0, sizeof(*out));
+    out->type = HADC_MSG_HEARTBEAT;
+    id = member_id_by_index(ctx, p[1]);
+    if (!id)
+        return -1; /* sender is not in our shared copy: indices disagree */
+    snprintf(out->origin, sizeof(out->origin), "%s", id);
+    id = member_id_by_index(ctx, p[2]);
+    if (id)
+        snprintf(out->master_id, sizeof(out->master_id), "%s", id);
+    if (p[3] == HADC_WIRE_ROLE_MASTER)
+        snprintf(out->role, sizeof(out->role), "master");
+    else if (p[3] == HADC_WIRE_ROLE_SLAVE)
+        snprintf(out->role, sizeof(out->role), "slave");
+    else
+        snprintf(out->role, sizeof(out->role), "unknown");
+    out->lease_version = get_be(p + 4, 8);
+    out->ts_ms = unwrap_ms((uint32_t)get_be(p + 12, 4));
+    return 0;
+}
 
 /* CLOCK_REALTIME ms — the clock messages timestamp (heartbeats carry it so a
  * starting node can sync and peers can spot drift; timers stay monotonic). */
@@ -53,6 +160,10 @@ static uint64_t realtime_ms(void)
 /* Step the clock during startup timesync / alarm at runtime when a peer's
  * clock differs from ours by more than this many milliseconds. */
 #define HADC_TIMESYNC_STEP_MS 2000
+
+/* Startup-timesync sanity: a peer clock that predates this has not been set
+ * (unsynced boot clock); its vote is ignored. */
+#define HADC_TIMESYNC_MIN_MS 1767225600000LL /* 2026-01-01T00:00:00Z */
 
 void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
                                            hadc_role_t new_role), void *arg)
@@ -79,6 +190,15 @@ static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg)
     ssize_t r = sendto(ctx->udp_fd, txt, strlen(txt), 0, (const struct sockaddr *)to, sizeof(*to));
     free(txt);
     json_decref(msg);
+    return r < 0 ? -1 : 0;
+}
+
+static int send_bytes(hadc_ctx_t *ctx, const struct sockaddr_in *to, const uint8_t *buf,
+                      size_t len)
+{
+    if (ctx->udp_fd < 0)
+        return -1;
+    ssize_t r = sendto(ctx->udp_fd, buf, len, 0, (const struct sockaddr *)to, sizeof(*to));
     return r < 0 ? -1 : 0;
 }
 
@@ -236,9 +356,9 @@ static void parse_lease(json_t *lj, hadc_lease_t *out)
 
 static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
 {
-    json_t *m = json_pack("{s:s, s:s, s:s, s:I}", "type", type, "origin", ctx->conf.self,
+    json_t *m = json_pack("{s:s, s:s, s:s, s:I, s?:s}", "type", type, "origin", ctx->conf.self,
                            "master_id", ctx->conf.designated_master, "lease_version",
-                           (json_int_t)ctx->lease.version);
+                           (json_int_t)ctx->lease.version, "role", role_name(ctx->role));
     if (!m)
         return NULL;
     if (with_lease) {
@@ -278,6 +398,8 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
     v = json_object_get(m, "ts_ms");
     if (v && json_is_integer(v))
         out->ts_ms = (uint64_t)json_integer_value(v);
+    if ((s = json_string_value(json_object_get(m, "role"))))
+        snprintf(out->role, sizeof(out->role), "%s", s);
     parse_lease(json_object_get(m, "lease"), &out->lease);
 }
 
@@ -475,16 +597,24 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         return;
     buf[n] = '\0';
 
-    json_error_t jerr;
-    json_t *m = json_loads(buf, 0, &jerr);
-    if (!m) {
-        hadc_warn("sync: malformed datagram from %s:%d (ignored): %s", inet_ntoa(from.sin_addr),
-                  ntohs(from.sin_port), jerr.text);
-        return;
-    }
-
     hadc_msg_t msg;
-    load_msg_fields(ctx, m, &msg);
+    json_t *m = NULL;
+    if ((uint8_t)buf[0] == 0) { /* compact binary heartbeat (JSON starts with '{') */
+        if (decode_bin_heartbeat(ctx, (const uint8_t *)buf, (size_t)n, &msg) != 0) {
+            hadc_warn("sync: malformed binary heartbeat from %s:%d (%zd bytes, ignored)",
+                      inet_ntoa(from.sin_addr), ntohs(from.sin_port), n);
+            return;
+        }
+    } else {
+        json_error_t jerr;
+        m = json_loads(buf, 0, &jerr);
+        if (!m) {
+            hadc_warn("sync: malformed datagram from %s:%d (ignored): %s",
+                      inet_ntoa(from.sin_addr), ntohs(from.sin_port), jerr.text);
+            return;
+        }
+        load_msg_fields(ctx, m, &msg);
+    }
     int first_seen = peer_entry(ctx, msg.origin) == NULL;
     peer_touch(ctx, msg.origin);
     hadc_peer_t *p = peer_entry(ctx, msg.origin);
@@ -496,10 +626,14 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
 
     if (!strcmp(msg.type, HADC_MSG_HEARTBEAT)) {
         static uint64_t last_drift_alarm_ms;
-        hadc_dbg("sync: heartbeat from %s (master=%s, version=%llu)", msg.origin, msg.master_id,
-                 (unsigned long long)msg.lease_version);
-        if (p)
+        hadc_dbg("sync: heartbeat from %s (master=%s, role=%s, version=%llu)", msg.origin,
+                 msg.master_id[0] ? msg.master_id : "(none)",
+                 msg.role[0] ? msg.role : "unknown", (unsigned long long)msg.lease_version);
+        if (p) {
             snprintf(p->master_view, sizeof(p->master_view), "%s", msg.master_id);
+            if (msg.role[0])
+                snprintf(p->role_view, sizeof(p->role_view), "%s", msg.role);
+        }
 
         /* A peer that names itself master is asserting the role. If we are the
          * master too, the higher priority (ties by id) wins; the loser demotes.
@@ -596,10 +730,35 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     } else if (!strcmp(msg.type, HADC_MSG_ROLE_CHANGE)) {
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
         if (msg.new_master[0]) {
-            snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
-            set_role(ctx, !strcmp(msg.new_master, ctx->conf.self) ? HADC_ROLE_MASTER
-                                                                   : HADC_ROLE_SLAVE);
-            hadc_persist_save(ctx);
+            const hadc_member_t *claim = member_by_id(ctx, msg.new_master);
+            bool ours = !strcmp(msg.new_master, ctx->conf.self);
+            bool authority = !strcmp(msg.origin, ctx->conf.designated_master);
+            const hadc_member_t *winner = election_winner(ctx);
+
+            /* Plan §4: only the election winner's announcements (or a push from
+               the master we already follow) move the role; a lower-ranked
+               member's self-announcement must not demote the master. Without
+               preemption, an existing live master is left alone. */
+            bool accept = ours || authority;
+
+            if (!accept && claim && winner && !strcmp(winner->id, claim->id))
+                accept = ctx->conf.cluster.preempt || !master_is_alive(ctx, ctx->conf.designated_master);
+            if (!accept && claim)
+                /* The master we follow (or a peer during the brief post-handoff
+                   election cooldown) may push a lower-ranked member as the new
+                   master; accept that authority to honour an operator handoff. */
+                accept = !authority && (ctx->role == HADC_ROLE_SLAVE) &&
+                    (uint64_t)hadc_now_ms() < g_no_elect_until_ms;
+
+            if (!accept) {
+                hadc_info("cluster: role_change from %s ignored (%s stays master)", msg.origin,
+                          ctx->conf.designated_master[0] ? ctx->conf.designated_master : "(none)");
+                propagate_role(ctx);
+            } else {
+                snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
+                set_role(ctx, ours ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE);
+                hadc_persist_save(ctx);
+            }
         }
     } else if (!strcmp(msg.type, HADC_MSG_CONF_SYNC)) {
         if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.origin, ctx->conf.designated_master))
@@ -621,7 +780,8 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     } else {
         hadc_warn("sync: unknown message type '%s' from %s", msg.type, msg.origin);
     }
-    json_decref(m);
+    if (m) /* load_msg_fields borrows strings from the parsed JSON */
+        json_decref(m);
 }
 
 int hadc_cluster_init(hadc_ctx_t *ctx)
@@ -708,6 +868,28 @@ static bool beats(const hadc_member_t *a, const char *b_id, int b_prio)
 {
     return a->priority > b_prio ||
         (a->priority == b_prio && strcmp(a->id, b_id) < 0);
+}
+
+/* The member that should be master under plan §4, among the members we
+ * consider live (ourself included). */
+static const hadc_member_t *election_winner(hadc_ctx_t *ctx)
+{
+    const hadc_member_t *best = NULL;
+
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        bool live = !strcmp(m->id, ctx->conf.self);
+
+        if (!live) {
+            hadc_peer_t *p = peer_entry(ctx, m->id);
+            live = p && p->alive;
+        }
+        if (!live)
+            continue;
+        if (!best || beats(m, best->id, best->priority))
+            best = m;
+    }
+    return best;
 }
 
 /* Highest-priority live member; ties by lowest node id. */
@@ -847,10 +1029,15 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
+        uint8_t hb[HADC_WIRE_HB_LEN];
         if (!strcmp(m->id, ctx->conf.self))
             continue;
-        json_t *hb = build_msg(ctx, HADC_MSG_HEARTBEAT, 1);
-        send_to_member(ctx, m, hb);
+        build_bin_heartbeat(ctx, hb);
+        struct sockaddr_in to = { .sin_family = AF_INET,
+                                   .sin_port = htons(ctx->conf.cluster.port),
+                                   .sin_addr = m->sync_address };
+        if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
+            hadc_warn("cluster: send heartbeat to %s failed", m->id);
     }
 
     age_peers(ctx);
@@ -982,15 +1169,23 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
 {
     const char *target = (new_master_id && *new_master_id) ? new_master_id : ctx->conf.self;
-    if (!strcmp(ctx->conf.designated_master, target)) {
+    bool handoff = strcmp(target, ctx->conf.self) != 0;
+
+    if (!strcmp(ctx->conf.designated_master, target) && ctx->role == (handoff ? HADC_ROLE_SLAVE : HADC_ROLE_MASTER)) {
         hadc_dbg("cluster: promote(%s) is idempotent (already master)", target);
         return 0;
     }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
-    set_role(ctx, !strcmp(target, ctx->conf.self) ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE);
+    set_role(ctx, handoff ? HADC_ROLE_SLAVE : HADC_ROLE_MASTER);
+    if (handoff)
+        /* An operator handoff to a lower-ranked member must not be immediately
+           undone by this node's own preempt/election; the authority push below
+           carries it cluster-wide. Failover (a dead master) is never suppressed. */
+        g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->conf.designated_master,
               ctx->role == HADC_ROLE_MASTER ? "MASTER" : "SLAVE");
     propagate_role(ctx);
+    hadc_persist_save(ctx);
     return 0;
 }
 
@@ -1027,6 +1222,26 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
     propagate_role(ctx);
     hadc_persist_save(ctx);
     return 0;
+}
+
+int hadc_cluster_handoff(hadc_ctx_t *ctx)
+{
+    /* Graceful shutdown: hand the master role to the best live peer when one
+     * exists. With no live peer the serving master must not withdraw service
+     * (VIP/routes) — it just shuts down and stays master in state, so a
+     * restart or partition heal can resume. Returns 1 if a handoff was made. */
+    if (ctx->role != HADC_ROLE_MASTER)
+        return 0;
+    age_peers(ctx);
+    const hadc_member_t *best = best_alive(ctx, false);
+    if (!best)
+        return 0;
+    snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
+    set_role(ctx, HADC_ROLE_SLAVE);
+    hadc_info("cluster: handing the master role to %s before shutdown", best->id);
+    propagate_role(ctx);
+    hadc_persist_save(ctx);
+    return 1;
 }
 
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
@@ -1103,9 +1318,14 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
 
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
+        uint8_t hb[HADC_WIRE_HB_LEN];
         if (!strcmp(m->id, ctx->conf.self))
             continue;
-        send_to_member(ctx, m, build_msg(ctx, HADC_MSG_HEARTBEAT, 1));
+        build_bin_heartbeat(ctx, hb);
+        struct sockaddr_in to = { .sin_family = AF_INET,
+                                   .sin_port = htons(ctx->conf.cluster.port),
+                                   .sin_addr = m->sync_address };
+        send_bytes(ctx, &to, hb, sizeof(hb));
     }
 
     hadc_info("timesync: listening %llums for cluster clocks", (unsigned long long)window);
@@ -1123,18 +1343,30 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
         if (n <= 0)
             continue;
         buf[n] = '\0';
-        json_error_t jerr;
-        json_t *m = json_loads(buf, 0, &jerr);
-        if (!m)
-            continue;
         hadc_msg_t msg;
-        load_msg_fields(ctx, m, &msg);
+        json_t *m = NULL;
+        if ((uint8_t)buf[0] == 0) { /* compact binary heartbeat */
+            if (decode_bin_heartbeat(ctx, (const uint8_t *)buf, (size_t)n, &msg) != 0)
+                continue;
+        } else {
+            json_error_t jerr;
+            m = json_loads(buf, 0, &jerr);
+            if (!m)
+                continue;
+            load_msg_fields(ctx, m, &msg);
+        }
         char mtype[64];
         snprintf(mtype, sizeof(mtype), "%s", msg.type ? msg.type : "");
-        json_decref(m);
+        if (m)
+            json_decref(m);
         if (strcmp(mtype, HADC_MSG_HEARTBEAT) || !msg.ts_ms ||
             !strcmp(msg.origin, ctx->conf.self))
             continue;
+        if ((int64_t)msg.ts_ms < HADC_TIMESYNC_MIN_MS) {
+            hadc_dbg("timesync: %s clock (%llu ms) predates the sanity floor, vote "
+                     "ignored", msg.origin, (unsigned long long)msg.ts_ms);
+            continue;
+        }
         int64_t offset = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
         size_t j = 0;
         for (; j < n_seen; j++)

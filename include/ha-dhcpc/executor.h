@@ -30,6 +30,10 @@ typedef struct {
     struct in_addr address;
     unsigned prefixlen;
     struct in_addr gateway;    /* 0 = no default route */
+    struct in_addr default_via; /* master-only override: while the gateway probe
+                                 * is failing or there is no lease IP yet, the
+                                 * default route goes here instead of gateway
+                                 * (the neighbor entry keeps the lease gateway) */
     uint8_t gw_mac[HADC_MAC_LEN]; /* cached gateway lladdr from the lease */
     bool gw_mac_valid;         /* program the gateway neighbor entry */
     struct in_addr backup_gateway; /* apply.backup_gateway; 0 = off */

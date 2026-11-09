@@ -146,10 +146,13 @@ Components:
 
 ## 4. Cluster protocol & roles
 
-- **Heartbeat** (default every 2 s, bidirectional): cluster id, master id, node id
-  (from the local overlay), lease-state version (monotonic), lease summary (state,
-  address, mask, gateway, server-id, t1/t2/t3 remaining, retention flag, config
-  hash). Node identity for sync is the configured id — never the (shared) MAC.
+- **Heartbeat** (default every 2 s, bidirectional): a compact binary frame sized
+  for the minimum Ethernet frame (~62 bytes on the wire; layout in
+  `src/cluster.c`): message type, node id, master id and own role
+  (master/slave), lease-state version (monotonic), sender wall clock. Members
+  are referenced by index into the shared config; the lease summary is not
+  carried (state pushes carry it). All other message types stay canonical JSON.
+  Node identity for sync is the configured id — never the (shared) MAC.
 - **State push:** master pushes on every lease change (new ACK, renew, rebind,
   server change, retention entry/exit). Slaves confirm with an **apply-ack**
   (applied version + config hash) so cluster status is observable.
@@ -174,6 +177,14 @@ Components:
   applied config; it resumes at RENEW/REBIND timers against the pinned server-id on
   the synced lease — no DISCOVER, no config churn — adds the cluster addresses and
   announces them with a gratuitous ARP.
+- **Gateway probes:** after a promote the master pings the lease gateway at once
+  and then every 10 s (2 s reply timeout) to surface a silent uplink outage in
+  the log — warn on first failure only (repeats at debug), info when it answers
+  again. While a probe is unanswered, or while there is no lease IP yet, the
+  default route moves to `apply.master_backup_gateway` if it is set, and hands
+  back to the lease gateway as soon as the gateway answers again. Gateways that
+  filter ICMP echo therefore also trigger the failover (routing/ARP is
+  otherwise unaffected).
 - **Safety rules:** only the master sends DHCP packets; only the master may
   DECLINE/RELEASE; slaves never expire the lease; a node in the minority partition
   keeps its config (retention) and does not self-promote (`quorum: majority`);
@@ -228,9 +239,11 @@ member, and the master is authoritative for it.
   slave it is refused.
 - A receiver verifies the sha256 the master claims, writes the pushed copy to its
   own copy of this path (atomic, digest-verified) so the cluster converges across
-  restarts, then reloads and acks. A member whose digest differs from the master's
-  heartbeat digest asks for it (`conf_req`); digests are of the shared file's
-  bytes, so a pushed copy keeps its comments and formatting.
+  restarts, then reloads and acks. Convergence is push-driven (on join and on
+  `ctl update`); a member that learns its digest differs (via `conf_ack`/JSON
+  digests) asks for it (`conf_req`) — the binary heartbeat has no room for a
+  digest. Digests are of the shared file's bytes, so a pushed copy keeps its
+  comments and formatting.
 
 ```yaml
 designated_master: node-a
@@ -269,6 +282,10 @@ apply:
                               # with a higher metric while the node is a slave
                               # and removed again on promotion; usually set per
                               # node in ha-dhcpc-local.conf.
+  master_backup_gateway: ""   # optional; master-only: this nexthop takes over
+                              # the default route while the gateway probe is
+                              # unanswered or there is no lease IP yet, and hands
+                              # back when the gateway answers again.
   dns_hook: /usr/lib/ha-dhcpc/hooks/resolvconf   # optional
   ddclient: /usr/bin/ddclient   # optional; run as a one-shot (ddclient -daemon=0
                                 # -syslog) when the applied address changes, on the

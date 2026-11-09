@@ -340,6 +340,64 @@ int main(void)
             ok("bad backup_gateway rejected");
     }
 
+    /* master_backup_gateway: parsed from apply, overlay wins, unset is off,
+     * bad values are refused */
+    {
+        struct in_addr want_gw;
+        char with_bg[2048];
+        inet_pton(AF_INET, "192.168.10.3", &want_gw);
+
+        snprintf(with_bg, sizeof(with_bg),
+                 "%sapply:\n  master_backup_gateway: 192.168.10.3\n", BASE_NOMAC);
+        write_file(base, with_bg);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("master_backup_gateway parse");
+        else if (conf.apply.master_backup_gateway.s_addr != want_gw.s_addr)
+            fail("master_backup_gateway parsed from the shared document");
+        else
+            ok("master_backup_gateway parsed from the shared document");
+
+        write_file(base, BASE_NOMAC);
+        write_file(local,
+                   "self: node-b\npriority: 90\napply:\n  master_backup_gateway: 192.168.10.3\n");
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("master_backup_gateway overlay load");
+        else if (conf.apply.master_backup_gateway.s_addr != want_gw.s_addr)
+            fail("master_backup_gateway overlay wins");
+        else
+            ok("master_backup_gateway overlay wins");
+        write_file(local, "self: node-b\npriority: 90\n");
+
+        write_file(base, BASE_NOMAC);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("unset master_backup_gateway load");
+        else if (conf.apply.master_backup_gateway.s_addr != 0)
+            fail("unset master_backup_gateway is off");
+        else
+            ok("unset master_backup_gateway is off");
+
+        const char *off_forms[] = {"none", "off", "~"};
+        for (int i = 0; i < 3; i++) {
+            snprintf(with_bg, sizeof(with_bg),
+                     "%sapply:\n  master_backup_gateway: %s\n", BASE_NOMAC, off_forms[i]);
+            write_file(base, with_bg);
+            if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+                fail("master_backup_gateway off form load");
+            else if (conf.apply.master_backup_gateway.s_addr != 0)
+                fail("master_backup_gateway none/off/~ should be off");
+            else
+                ok("master_backup_gateway none/off/~ is off");
+        }
+
+        snprintf(with_bg, sizeof(with_bg),
+                 "%sapply:\n  master_backup_gateway: not-an-address\n", BASE_NOMAC);
+        write_file(base, with_bg);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("bad master_backup_gateway should be an error");
+        else
+            ok("bad master_backup_gateway rejected");
+    }
+
     /* slave_link_down: defaults off, parses from the shared document */
     {
         char with_sld[2048];

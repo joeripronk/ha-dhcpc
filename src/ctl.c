@@ -47,10 +47,12 @@ static json_t *status_object(hadc_ctx_t *ctx)
         snprintf(addr, sizeof(addr), "%s", inet_ntoa(ctx->conf.members[i].sync_address));
         json_array_append_new(
             members,
-            json_pack("{s:s, s:s, s:b, s:I, s:s}", "id", ctx->conf.members[i].id, "sync_address",
-                      addr, "alive", ctx->peers[i].alive, "acked_version",
+            json_pack("{s:s, s:s, s:b, s:I, s:s, s:s, s:s}", "id", ctx->conf.members[i].id,
+                      "sync_address", addr, "alive", ctx->peers[i].alive, "acked_version",
                       (json_int_t)ctx->peers[i].acked_version, "conf_sha256",
-                      ctx->peers[i].conf_sha256));
+                      ctx->peers[i].conf_sha256, "role",
+                      ctx->peers[i].role_view[0] ? ctx->peers[i].role_view : "unknown",
+                      "master_view", ctx->peers[i].master_view));
     }
     json_object_set_new(o, "members", members);
     json_t *cluster = json_array();

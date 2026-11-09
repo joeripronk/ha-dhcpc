@@ -126,6 +126,15 @@ static int core_retention;
 static int core_retention_rediscover;
 static long core_retention_backoff_min = 30;
 static long core_retention_backoff_max = 600;
+/* 0 while we are running on the daemon's persisted lease: the transaction id
+   the servers answer is not one we generated in this lifetime. */
+static int core_xid_known = 1;
+
+/* State names for "answer ignored" logging (indexes match enum dhcp_state). */
+static const char *const state_names[] = {
+	"REBOOTING", "INIT", "SELECTING", "REQUESTING",
+	"BOUND", "RENEWING", "REBINDING"
+};
 
 void		 usage(void);
 int		 check_option(struct client_lease *l, int option);
@@ -348,10 +357,12 @@ dhcp_core_preset_lease(const struct dhcp_core_lease *preset)
 {
 	if (preset == NULL) {
 		core_preset_set = 0;
+		core_xid_known = 1;
 		return;
 	}
 	core_preset = *preset;
 	core_preset_set = 1;
+	core_xid_known = 0; /* we will run on a transaction id we did not pick */
 }
 
 /* Enter S_BOUND on the daemon's persisted lease: identity, pinned server-id
@@ -413,6 +424,7 @@ resume_on_preset(struct interface_info *ip)
 
 	ip->client->active = lease;
 	ip->client->state = S_BOUND;
+	core_xid_known = 0;
 	add_timeout(lease->renewal, state_bound, ip);
 
 	note("resumed on the daemon's persisted lease (no lease DB): %s, renewal in %d s",
@@ -750,6 +762,7 @@ state_reboot(void *ipp)
 	   from the DHCPDISCOVER, but we haven't sent a DHCPDISCOVER,
 	   so pick an xid now. */
 	ip->client->xid = arc4random();
+	core_xid_known = 1;
 
 	/* Make a DHCPREQUEST packet, and set appropriate per-interface
 	   flags. */
@@ -780,6 +793,7 @@ state_init(void *ipp)
 	   flags. */
 	make_discover(ip, ip->client->active);
 	ip->client->xid = ip->client->packet.xid;
+	core_xid_known = 1;
 	ip->client->destination = iaddr_broadcast;
 	ip->client->state = S_SELECTING;
 	ip->client->first_sending = cur_time;
@@ -817,6 +831,16 @@ state_selecting(void *ipp)
 		/* Check to see if we got an ARPREPLY for the address
 		   in this particular lease. */
 		if (!picked) {
+			/* An offer for the address we already hold is not a
+			   conflict: the ARPCHECK would only answer ourselves. */
+			if (ip->client->active &&
+			    lp->address.len == ip->client->active->address.len &&
+			    !memcmp(lp->address.iabuf,
+			    ip->client->active->address.iabuf, lp->address.len)) {
+				picked = lp;
+				picked->next = NULL;
+				continue;
+			}
 			script_init("ARPCHECK", lp->medium);
 			script_write_params("check_", lp);
 
@@ -825,6 +849,9 @@ state_selecting(void *ipp)
 			   nonzero.  We need to send a DHCPDECLINE and
 			   toss the lease. */
 			if (script_go()) {
+				debug("offer of %s ignored: ARPCHECK found "
+				    "another user, declining",
+				    piaddr(lp->address));
 				make_decline(ip, lp);
 				send_decline(ip);
 				goto freeit;
@@ -891,17 +918,29 @@ dhcpack(struct packet *packet)
 
 	/* If we're not receptive to an offer right now, or if the offer
 	   has an unrecognizable transaction id, then just drop it. */
-	if (packet->interface->client->xid != packet->raw->xid ||
-	    (packet->interface->hw_address.hlen != packet->raw->hlen) ||
-	    (memcmp(packet->interface->hw_address.haddr,
-	    packet->raw->chaddr, packet->raw->hlen)))
+	if (packet->interface->client->xid != packet->raw->xid) {
+		debug("DHCPACK from %s ignored: xid 0x%x != our xid 0x%x",
+		    piaddr(packet->client_addr), packet->raw->xid,
+		    packet->interface->client->xid);
 		return;
+	}
+	if ((packet->interface->hw_address.hlen != packet->raw->hlen) ||
+	    (memcmp(packet->interface->hw_address.haddr,
+	    packet->raw->chaddr, packet->raw->hlen))) {
+		debug("DHCPACK from %s ignored: chaddr does not match ours",
+		    piaddr(packet->client_addr));
+		return;
+	}
 
 	if (ip->client->state != S_REBOOTING &&
 	    ip->client->state != S_REQUESTING &&
 	    ip->client->state != S_RENEWING &&
-	    ip->client->state != S_REBINDING)
+	    ip->client->state != S_REBINDING) {
+		debug("DHCPACK from %s ignored: state is %s",
+		    piaddr(packet->client_addr),
+		    state_names[ip->client->state]);
 		return;
+	}
 
 	note("DHCPACK from %s", piaddr(packet->client_addr));
 
@@ -1167,15 +1206,40 @@ dhcpoffer(struct packet *packet)
 
 	const char *name = packet->options[DHO_DHCP_MESSAGE_TYPE].len ?
 	    "DHCPOFFER" : "BOOTREPLY";
+	int answered_request = 0;
 
 	/* If we're not receptive to an offer right now, or if the offer
 	   has an unrecognizable transaction id, then just drop it. */
-	if (ip->client->state != S_SELECTING ||
-	    packet->interface->client->xid != packet->raw->xid ||
-	    (packet->interface->hw_address.hlen != packet->raw->hlen) ||
-	    (memcmp(packet->interface->hw_address.haddr,
-	    packet->raw->chaddr, packet->raw->hlen)))
+	if (ip->client->state != S_SELECTING) {
+		/* A server that cannot honour our renewal answers the
+		   REQUEST with an OFFER for a new lease; the xid check
+		   below proves this one answers our transaction, so take
+		   it when a renewal is in flight, or with retention on
+		   (the failed renew is being retried on the
+		   last-known-good lease). */
+		if (!(core_retention && (ip->client->state == S_RENEWING ||
+		    ip->client->state == S_REBINDING ||
+		    ip->client->state == S_BOUND))) {
+			debug("%s from %s ignored: state is %s, not SELECTING",
+			    name, piaddr(packet->client_addr),
+			    state_names[ip->client->state]);
+			return;
+		}
+		answered_request = 1;
+	}
+	if (packet->interface->client->xid != packet->raw->xid) {
+		debug("%s from %s ignored: xid 0x%x != our xid 0x%x",
+		    name, piaddr(packet->client_addr),
+		    packet->raw->xid, packet->interface->client->xid);
 		return;
+	}
+	if ((packet->interface->hw_address.hlen != packet->raw->hlen) ||
+	    (memcmp(packet->interface->hw_address.haddr,
+	    packet->raw->chaddr, packet->raw->hlen))) {
+		debug("%s from %s ignored: chaddr does not match ours",
+		    name, piaddr(packet->client_addr));
+		return;
+	}
 
 	note("%s from %s", name, piaddr(packet->client_addr));
 
@@ -1196,7 +1260,8 @@ dhcpoffer(struct packet *packet)
 		if (lease->address.len == sizeof(packet->raw->yiaddr) &&
 		    !memcmp(lease->address.iabuf,
 		    &packet->raw->yiaddr, lease->address.len)) {
-			debug("%s already seen.", name);
+			debug("%s already seen (%s).", name,
+			    piaddr(lease->address));
 			return;
 		}
 	}
@@ -1261,6 +1326,16 @@ dhcpoffer(struct packet *packet)
 				;	/* nothing */
 			lp->next = lease;
 		}
+	}
+
+	/* Accepted straight from a bound/renewal state: this offer answered
+	   the REQUEST we sent, so there is no selection window to wait
+	   for — pick it now. Stop resending the renewal REQUEST first. */
+	if (answered_request) {
+		cancel_timeout(send_request, ip);
+		ip->client->state = S_SELECTING;
+		state_selecting(ip);
+		return;
 	}
 
 	/* If we're supposed to stop selecting before we've had time
@@ -1373,26 +1448,71 @@ packet_to_lease(struct packet *packet)
 	return lease;
 }
 
+/* Retention only: a NAK that answers the persisted lease we resumed on. We
+   never generated that transaction id in this lifetime, so the only proof it
+   is about us is that it comes from the server the lease is pinned to
+   (RFC 2131: only that server can relinquish the lease) and is for our
+   hardware address. Relayed NAKs often carry no server identifier, so the
+   packet source stands in for it. */
+static int
+nak_answers_persisted_lease(struct interface_info *ip, struct packet *packet)
+{
+	struct option_data *ours, *theirs;
+	struct in_addr ours_id, from;
+
+	if (core_xid_known || ip->client->active == NULL)
+		return (0);
+	ours = &ip->client->active->options[DHO_DHCP_SERVER_IDENTIFIER];
+	if (ours->len != 4)
+		return (0);
+	memcpy(&ours_id, ours->data, 4);
+	theirs = &packet->options[DHO_DHCP_SERVER_IDENTIFIER];
+	if (theirs->len == 4)
+		memcpy(&from, theirs->data, 4);
+	else if (packet->client_addr.len == 4)
+		memcpy(&from, packet->client_addr.iabuf, 4);
+	else
+		return (0);
+	return (memcmp(&ours_id, &from, 4) == 0);
+}
+
 void
 dhcpnak(struct packet *packet)
 {
 	struct interface_info *ip = packet->interface;
+	int answers_persisted = core_retention &&
+	    nak_answers_persisted_lease(ip, packet);
 
 	/* If we're not receptive to an offer right now, or if the offer
 	   has an unrecognizable transaction id, then just drop it. */
-	if (packet->interface->client->xid != packet->raw->xid ||
-	    (packet->interface->hw_address.hlen != packet->raw->hlen) ||
-	    (memcmp(packet->interface->hw_address.haddr,
-	    packet->raw->chaddr, packet->raw->hlen)))
+	if (packet->interface->client->xid != packet->raw->xid &&
+	    !answers_persisted) {
+		debug("DHCPNAK from %s ignored: xid 0x%x != our xid 0x%x",
+		    piaddr(packet->client_addr), packet->raw->xid,
+		    packet->interface->client->xid);
 		return;
+	}
+	if ((packet->interface->hw_address.hlen != packet->raw->hlen) ||
+	    (memcmp(packet->interface->hw_address.haddr,
+	    packet->raw->chaddr, packet->raw->hlen))) {
+		debug("DHCPNAK from %s ignored: chaddr does not match ours",
+		    piaddr(packet->client_addr));
+		return;
+	}
 
 	if (ip->client->state != S_REBOOTING &&
 	    ip->client->state != S_REQUESTING &&
 	    ip->client->state != S_RENEWING &&
-	    ip->client->state != S_REBINDING)
+	    ip->client->state != S_REBINDING &&
+	    !(answers_persisted && ip->client->state == S_BOUND)) {
+		debug("DHCPNAK from %s ignored: state is %s",
+		    piaddr(packet->client_addr),
+		    state_names[ip->client->state]);
 		return;
+	}
 
-	note("DHCPNAK from %s", piaddr(packet->client_addr));
+	note("DHCPNAK from %s%s", piaddr(packet->client_addr),
+	    answers_persisted ? " (answers the lease we resumed on)" : "");
 
 	if (!ip->client->active) {
 		note("DHCPNAK with no active lease.\n");
@@ -1637,6 +1757,9 @@ send_request(void *ipp)
 	if ((ip->client->state == S_REBOOTING ||
 	    ip->client->state == S_REQUESTING) &&
 	    interval > ip->client->config->reboot_timeout) {
+		debug("no answer after %d s (reboot timeout %d s): "
+		    "going back to INIT", interval,
+		    (int)ip->client->config->reboot_timeout);
 cancel:
 		ip->client->state = S_INIT;
 		cancel_timeout(send_request, ip);
@@ -1663,6 +1786,10 @@ cancel:
 	   to the INIT state. */
 	if (ip->client->state != S_REQUESTING &&
 	    cur_time > ip->client->active->expiry) {
+		debug("lease %s expired (expiry %d s ago) in state %s: "
+		    "relinquishing", piaddr(ip->client->active->address),
+		    (int)(cur_time - ip->client->active->expiry),
+		    state_names[ip->client->state]);
 		/* Retention beats expiry (plan §5): keep the last-known-good
 		   configuration applied and keep trying. */
 		if (core_retention) {

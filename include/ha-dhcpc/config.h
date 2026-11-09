@@ -74,6 +74,12 @@ typedef struct {
         struct in_addr backup_gateway; /* 0 = off; higher-metric default route
                                         * installed while this node is a slave
                                         * and removed again on promotion */
+        struct in_addr master_backup_gateway; /* 0 = off; on the master this
+                                               * nexthop takes over the default
+                                               * route while the gateway probe is
+                                               * failing or there is no lease IP
+                                               * yet, and hands back when the
+                                               * gateway answers again */
         char dns_hook[HADC_PATH_MAX];  /* empty = no hook */
         char ddclient[HADC_PATH_MAX];  /* empty = off; run as a one-shot when the
                                         * applied address changes (master-only) */

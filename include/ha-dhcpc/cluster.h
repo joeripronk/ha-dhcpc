@@ -3,8 +3,10 @@
  * Transport: UDP on the shared L2 segment via distinct per-node secondary
  * addresses (sync_address). v1 is unauthenticated/unencrypted (trusted LAN).
  * Wire encoding for v1 is canonical JSON (jansson), one message per datagram;
- * message type is the "type" key. Message ids are strings, not enums, so the
- * wire stays canonical: see HADC_MSG_* below.
+ * the heartbeat is the one exception: a compact binary frame sized for the
+ * minimum Ethernet frame (layout in src/cluster.c). Message type is the "type"
+ * key. Message ids are strings, not enums, so the wire stays canonical: see
+ * HADC_MSG_* below.
  */
 #ifndef HA_DHCPC_CLUSTER_H
 #define HA_DHCPC_CLUSTER_H
@@ -23,13 +25,21 @@
 #define HADC_MSG_CONF_REQ           "conf_req"           /* member -> master: our shared digest differs */
 #define HADC_MSG_CONF_ACK           "conf_ack"           /* member -> master: document written + applied */
 
-/* Heartbeat payload (all messages carry origin/master/version). */
+/* Wire role codes for the compact binary heartbeat (the only binary message
+ * type; its first byte is 0, so JSON datagrams — which always start with '{'
+ * — stay unambiguous on the same socket). */
+#define HADC_WIRE_ROLE_UNKNOWN      0
+#define HADC_WIRE_ROLE_MASTER       1
+#define HADC_WIRE_ROLE_SLAVE        2
+
+/* Heartbeat payload (all JSON messages carry origin/master/version/role; the
+ * binary heartbeat carries them as bytes and has no room for the digest). */
 typedef struct {
     const char *type;                    /* HADC_MSG_* */
     char origin[HADC_NODE_ID_MAX];       /* sender node id — never the shared MAC */
     char master_id[HADC_NODE_ID_MAX];    /* cluster-wide agreed master */
     uint64_t lease_version;              /* monotonic lease-state version */
-    hadc_lease_t lease;                  /* summary on heartbeat; full on FULL_STATE */
+    hadc_lease_t lease;                  /* full on FULL_STATE; the binary heartbeat has no room */
     bool retention_flag;
     hadc_hash_t config_hash;
     /* apply-ack fields */
@@ -37,11 +47,13 @@ typedef struct {
     /* role-change fields */
     char new_master[HADC_NODE_ID_MAX];
     /* conf-sync fields: sha256 of the shared document as bytes (plan §6). The
-     * document itself travels as text on conf_sync; heartbeat carries only the
-     * digest so a member can spot a stale copy and request it. */
+     * document itself travels as text on conf_sync; the digest travels on the
+     * JSON messages so a member can spot a stale copy and request it (the
+     * binary heartbeat has no room for it). */
     char conf_sha256[HADC_CONF_SHA_HEX];
     const char *conf_text;               /* conf_sync only; borrowed, not owned */
     uint64_t ts_ms;                      /* sender's CLOCK_REALTIME ms at send time */
+    char role[16];                       /* sender's own role: master|slave|unknown */
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -54,6 +66,7 @@ typedef struct {
     char conf_sha256[HADC_CONF_SHA_HEX]; /* last conf-ack digest from this member */
     int64_t clock_offset_ms;      /* peer CLOCK_REALTIME - ours, last heartbeat; 0 = unobserved */
     char master_view[HADC_NODE_ID_MAX]; /* peer's master_id from its last heartbeat */
+    char role_view[16];           /* peer's self-reported role from its last heartbeat */
     bool alive;
 } hadc_peer_t;
 
@@ -100,6 +113,11 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx);
  * role_change propagates cluster-wide over the UDP control path. */
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id);
 int hadc_cluster_demote(hadc_ctx_t *ctx);
+
+/* Graceful handoff for shutdown: hands the master role to the best live peer
+ * when one exists and returns 1; returns 0 (and leaves service intact) when
+ * there is no live peer, so a lone/partitioned master does not withdraw. */
+int hadc_cluster_handoff(hadc_ctx_t *ctx);
 
 /* Master pushes lease state to slaves on change; slaves apply then ack. */
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease);

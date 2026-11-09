@@ -64,7 +64,7 @@ static json_t *parse_node(yaml_document_t *doc, yaml_node_t *n)
         json_t *arr = json_array();
         for (item = n->data.sequence.items.start; item < n->data.sequence.items.top; item++) {
             yaml_node_t *child = yaml_document_get_node(doc, *item);
-            json_array_append(arr, parse_node(doc, child));
+            json_array_append_new(arr, parse_node(doc, child));
         }
         return arr;
     }
@@ -75,7 +75,8 @@ static json_t *parse_node(yaml_document_t *doc, yaml_node_t *n)
             yaml_node_t *v = yaml_document_get_node(doc, pair->value);
             if (k->type != YAML_SCALAR_NODE)
                 continue; /* non-scalar keys not used by our schema */
-            json_object_set(obj, (const char *)k->data.scalar.value, parse_node(doc, v));
+            json_object_set_new(obj, (const char *)k->data.scalar.value,
+                                parse_node(doc, v));
         }
         return obj;
     }
@@ -312,6 +313,27 @@ static int get_bool(json_t *o, const char *key, bool *dst, bool dflt)
         return -1;
     }
     *dst = json_is_true(v);
+    return 0;
+}
+
+static int get_addr(json_t *o, const char *key, struct in_addr *dst)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    if (!v || json_is_null(v) || (json_is_boolean(v) && !json_is_true(v))) {
+        dst->s_addr = 0; /* null and bare false count as "off" */
+        return 0;
+    }
+    if (!json_is_string(v)) {
+        snprintf(g_errbuf, sizeof(g_errbuf), "config: apply.%s must be an IPv4 address", key);
+        return -1;
+    }
+    const char *s = json_string_value(v);
+    dst->s_addr = 0;
+    if (*s && strcmp(s, "none") && strcmp(s, "off") && strcmp(s, "no") &&
+        inet_pton(AF_INET, s, dst) != 1) {
+        snprintf(g_errbuf, sizeof(g_errbuf), "config: bad apply.%s %s", key, s);
+        return -1;
+    }
     return 0;
 }
 
@@ -652,21 +674,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     } else {
         out->apply.routes = true;
     }
-    out->apply.backup_gateway.s_addr = 0;
-    json_t *bg = a ? json_object_get(a, "backup_gateway") : NULL;
-    /* null and bare false count as "off" (YAML resolves off/~ that way). */
-    if (bg && !json_is_null(bg) && !(json_is_boolean(bg) && !json_is_true(bg))) {
-        if (!json_is_string(bg)) {
-            snprintf(err, errlen, "config: apply.backup_gateway must be an IPv4 address");
-            goto derr;
-        }
-        const char *bgs = json_string_value(bg);
-        if (*bgs && strcmp(bgs, "none") && strcmp(bgs, "off") && strcmp(bgs, "no") &&
-            inet_pton(AF_INET, bgs, &out->apply.backup_gateway) != 1) {
-            snprintf(err, errlen, "config: bad apply.backup_gateway %s", bgs);
-            goto derr;
-        }
-    }
+    if (get_addr(a, "backup_gateway", &out->apply.backup_gateway)) goto derr;
+    if (get_addr(a, "master_backup_gateway", &out->apply.master_backup_gateway)) goto derr;
     snprintf(out->apply.dns_hook, HADC_PATH_MAX, "%s",
              (a && json_object_get(a, "dns_hook") && json_is_string(json_object_get(a, "dns_hook")))
                  ? json_string_value(json_object_get(a, "dns_hook"))
