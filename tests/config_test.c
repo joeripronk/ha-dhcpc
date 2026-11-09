@@ -370,8 +370,31 @@ int main(void)
         fail("cluster defaults load");
     else if (conf.cluster.quorum != HADC_QUORUM_MAJORITY || conf.cluster.n_ifaces != 0)
         fail("cluster defaults (majority, no addresses)");
+    else if (!conf.cluster.preempt)
+        fail("cluster default: preempt on");
     else
-        ok("cluster defaults: majority, no addresses");
+        ok("cluster defaults: majority, no addresses, preempt on");
+
+    /* cluster.preempt: explicit false parses; non-boolean is refused */
+    {
+        char cbuf[2048];
+        snprintf(cbuf, sizeof(cbuf), "%scluster:\n  preempt: false\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("cluster preempt=false load");
+        } else if (conf.cluster.preempt) {
+            fail("cluster preempt=false parsed");
+        } else {
+            ok("cluster preempt=false parsed");
+        }
+        snprintf(cbuf, sizeof(cbuf), "%scluster:\n  preempt: sometimes\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("cluster preempt non-boolean refused");
+        else
+            ok("cluster preempt non-boolean refused");
+    }
 
     {
         char cbuf[4096];

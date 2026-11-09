@@ -524,6 +524,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     }
     if (get_int(c ? c : root, "cluster_timeout_ms", &v, 0, false, "cluster")) goto derr;
     out->cluster.cluster_timeout_ms = (uint32_t)v;
+    if (get_bool(c ? c : root, "preempt", &out->cluster.preempt, true)) goto derr;
 
     /* cluster.addresses: interface name -> list of address/prefix entries.
      * Every member loads the same list; only the master puts them on the

@@ -74,6 +74,12 @@ int hadc_cluster_step(hadc_ctx_t *ctx); /* pump transport; nonblocking */
  * threshold, or nothing to sync with). */
 int hadc_cluster_timesync(hadc_ctx_t *ctx);
 
+/* Startup gate (call right after the timesync window): never a second master.
+ * If a live peer that outranks us by (priority, id) asserted itself as master
+ * during the window, follow it instead of resuming the persisted master role.
+ * Returns 1 when the role was changed (before any state is applied). */
+int hadc_cluster_startup_gate(hadc_ctx_t *ctx);
+
 /* Heartbeat tick: called from the daemon's heartbeat timer every
  * heartbeat_ms, on every role. Sends a heartbeat cluster-wide (plan §4:
  * bidirectional) and runs the v1 dead-master alarm. */

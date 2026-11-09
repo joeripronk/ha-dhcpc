@@ -389,6 +389,8 @@ int main(int argc, char **argv)
     if (hadc_cluster_init(ctx) != 0)
         return 1;
     hadc_cluster_timesync(ctx); /* sync CLOCK_REALTIME with the cluster first */
+    hadc_cluster_startup_gate(ctx); /* never a second master: a live, higher-ranked
+                                     * master seen during the window is followed */
     if (hadc_executor_init(ctx) != 0)
         return 1; /* before election: the role hook brings the link up */
     hadc_executor_monitor_start(ctx); /* drift self-heal: re-apply when managed

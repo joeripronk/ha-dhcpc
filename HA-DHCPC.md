@@ -162,6 +162,14 @@ Components:
   no-master bootstrap, and `ctl promote/demote` overrides everything. Dual-master
   is settled by comparing `(priority, id)` on heartbeats and propagating the
   winner; a demote issued anywhere also settles it cluster-wide.
+- **Election guards & preemption (`cluster.preempt`, default on):** election only
+  fires when no live peer already asserts master (a live claimant is followed
+  instead), and every election announces its winner cluster-wide via the normal
+  role-change propagation path. With preemption on, the cluster converges on the
+  highest-priority live member: a live slave that outranks the current master
+  promotes itself, so a returning best master takes the role back. With it off,
+  members are only elected when no live master is present — the incumbent is
+  never preempted.
 - **The new master's duty is renew-only:** it already has the master MAC and the
   applied config; it resumes at RENEW/REBIND timers against the pinned server-id on
   the synced lease — no DISCOVER, no config churn — adds the cluster addresses and
@@ -228,15 +236,19 @@ member, and the master is authoritative for it.
 designated_master: node-a
 master_mac: "aa:bb:cc:dd:ee:ff"
 members:
-  - { id: node-a, sync_address: 10.10.0.1 }   # distinct secondary addrs, same link
-  - { id: node-b, sync_address: 10.10.0.2 }
-  - { id: node-c, sync_address: 10.10.0.3 }
+  # priority mirrors each member's local priority: every node must compute the
+  # same election winner from the shared list.
+  - { id: node-a, sync_address: 10.10.0.1, priority: 100 }   # distinct secondary addrs, same link
+  - { id: node-b, sync_address: 10.10.0.2, priority: 90 }
+  - { id: node-c, sync_address: 10.10.0.3, priority: 80 }
 interface: eth0              # DHCP/data interface (MAC comes from master_mac)
 cluster:
   port: 4227
   heartbeat_ms: 2000
   election_deadline_ms: 6000  # dead-master timeout before failover
   quorum: majority             # majority | none (two-node clusters need none)
+  preempt: true                # converge on the best live master (off = elect
+                               # only when no live master is present)
   cluster_timeout_ms: 0        # default-role bootstrap deadline (0=off)
   addresses:                   # VIPs owned by the master, keyed by interface
     br-lan: [192.168.10.1/24]  # CIDR or dotted netmask (192.168.10.1/255.255.255.0)
@@ -335,10 +347,13 @@ roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault
   stored remainders are kept as they are.
 - Master restart: rejoin via persistence + full-state exchange; the persisted
   `master_id` restores the agreed master, so a restarting master either resumes
-  its role or follows the current master. A restart **reuses the persisted state**: the daemon
+  its role or follows the current master. A startup gate makes "never a second
+  master" literal: if a live, higher-ranked master asserted itself during the
+  startup timesync window, the node follows it instead of resuming the role. A
+  restart **reuses the persisted state**: the daemon
   hands the engine the lease (address, server-id, timers as remaining time), the
-  core enables the IP and enters BOUND quietly, and only acts when a timer is due
-  (the renewal goes unicast to the pinned server-id) — no DISCOVER just because
+  core enables the IP and enters BOUND quietly, and only acts when a timer is
+  due (the renewal goes unicast to the pinned server-id) — no DISCOVER just because
   the process started, and a node with `lease_file: none` needs no lease DB for
   this.
 - Duplicate transaction safety: server-id pinned per lease (RFC 2131) — only the

@@ -49,6 +49,9 @@ typedef struct {
         uint32_t election_deadline_ms; /* dead-master detection before failover */
         hadc_quorum_mode_t quorum;     /* majority (default) or none */
         uint32_t cluster_timeout_ms;   /* default-role bootstrap deadline, 0=off */
+        bool preempt; /* true (default): the cluster converges on the
+                       * highest-priority live member; false: members are only
+                       * elected when no live master is present */
         /* Virtual/shared addresses owned by the master, keyed by interface.
          * Order and contents are part of the shared document. */
         hadc_cluster_if_t ifaces[HADC_CLUSTER_IF_MAX];

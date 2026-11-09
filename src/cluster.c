@@ -35,6 +35,8 @@ static uint64_t g_no_elect_until_ms; /* manual demote cooldown */
 static struct sockaddr_in g_bound; /* what udp_fd is bound to (rebind check) */
 
 static void propagate_role(hadc_ctx_t *ctx);
+static bool beats(const hadc_member_t *a, const char *b_id, int b_prio);
+int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz);
 static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
@@ -522,9 +524,8 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             } else if (strcmp(msg.master_id, ctx->conf.designated_master)) {
                 const hadc_member_t *cur = member_by_id(ctx, ctx->conf.designated_master);
                 bool take = !master_is_alive(ctx, ctx->conf.designated_master) ||
-                    (om && (!cur || om->priority > cur->priority ||
-                            (om->priority == cur->priority &&
-                             strcmp(om->id, cur->id) < 0)));
+                    (ctx->conf.cluster.preempt && om &&
+                     (!cur || beats(om, cur->id, cur->priority)));
                 if (om && take) {
                     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", om->id);
                     set_role(ctx, HADC_ROLE_SLAVE);
@@ -701,6 +702,14 @@ static bool master_is_alive(hadc_ctx_t *ctx, const char *id)
     return p && p->alive;
 }
 
+/* (priority, ties by lowest node id) ordering from plan §4: does a outrank
+ * the member b_id/b_prio? */
+static bool beats(const hadc_member_t *a, const char *b_id, int b_prio)
+{
+    return a->priority > b_prio ||
+        (a->priority == b_prio && strcmp(a->id, b_id) < 0);
+}
+
 /* Highest-priority live member; ties by lowest node id. */
 static const hadc_member_t *best_alive(hadc_ctx_t *ctx, bool include_self)
 {
@@ -782,6 +791,38 @@ static void failover_check(hadc_ctx_t *ctx)
     hadc_cluster_promote(ctx, ctx->conf.self);
 }
 
+/* Preemption (cluster.preempt, plan §4): when enabled, the cluster converges
+ * on the highest-priority live member: a live slave that outranks the current
+ * master promotes itself. Only acts when the current master is alive and
+ * asserting itself (the dead-master path is failover_check's job); the
+ * ordering is a total order, so this cannot ping-pong. */
+static void preempt_check(hadc_ctx_t *ctx)
+{
+    const hadc_member_t *self = NULL, *cur;
+
+    if (ctx->role != HADC_ROLE_SLAVE)
+        return;
+    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
+        return;
+    if (!ctx->conf.designated_master[0] ||
+        !strcmp(ctx->conf.designated_master, ctx->conf.self))
+        return;
+    cur = member_by_id(ctx, ctx->conf.designated_master);
+    if (!cur)
+        return;
+    hadc_peer_t *p = peer_entry(ctx, ctx->conf.designated_master);
+    if (!p || !p->alive || strcmp(p->master_view, cur->id))
+        return; /* not alive-and-asserting: the election's job */
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
+            self = &ctx->conf.members[i];
+    if (!self || !beats(self, cur->id, cur->priority))
+        return;
+    hadc_info("cluster: preempt: promoting self (priority %d outranks live master %s (%d))",
+              self->priority, cur->id, cur->priority);
+    hadc_cluster_promote(ctx, ctx->conf.self);
+}
+
 /* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 {
@@ -814,6 +855,8 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 
     age_peers(ctx);
     failover_check(ctx);
+    if (ctx->conf.cluster.preempt)
+        preempt_check(ctx);
     hadc_cluster_elect_check(ctx);
 }
 
@@ -872,6 +915,17 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     if (strcmp(winner, ctx->conf.self) != 0)
         return;
 
+    /* Election only elects when no live peer already asserts master; a live
+     * claimant is followed instead (heartbeat path). */
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        hadc_peer_t *p;
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
+            continue;
+        p = peer_entry(ctx, ctx->conf.members[i].id);
+        if (p && p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+            return;
+    }
+
     hadc_info("cluster: default-role election: promoting self (priority %d, %s)", wprio,
               all_alive ? "all members alive" : "cluster timeout elapsed");
     hadc_cluster_promote(ctx, ctx->conf.self);
@@ -901,6 +955,28 @@ static void propagate_role(hadc_ctx_t *ctx)
         if (m && send_json(ctx, &to, m) != 0)
             hadc_warn("cluster: role_change send to %s failed", ctx->conf.members[i].id);
     }
+}
+
+int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
+{
+    char claim[HADC_NODE_ID_MAX];
+
+    if (ctx->role != HADC_ROLE_MASTER)
+        return 0;
+    if (!cluster_startup_claim(ctx, claim, sizeof(claim)))
+        return 0;
+    const hadc_member_t *c = member_by_id(ctx, claim);
+    const hadc_member_t *self = NULL;
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
+            self = &ctx->conf.members[i];
+    if (!c || !self || !beats(c, ctx->conf.self, ctx->conf.priority))
+        return 0;
+    snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master), "%s", c->id);
+    ctx->role = HADC_ROLE_SLAVE;
+    hadc_info("startup: live master %s outranks us (%d > %d); following it instead of "
+              "resuming master", c->id, c->priority, ctx->conf.priority);
+    return 1;
 }
 
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
@@ -979,7 +1055,29 @@ int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
  * collects each peer's wall clock from the timestamps its messages carry. The
  * current master's vote wins; otherwise the median of the observed offsets
  * decides. The clock is stepped only when the winning offset exceeds
- * HADC_TIMESYNC_STEP_MS; monotonic timers are unaffected. */
+ * HADC_TIMESYNC_STEP_MS; monotonic timers are unaffected.
+ *
+ * The window also records which live peers asserted themselves as master:
+ * cluster_startup_claim() reports the highest-ranked one, so a node never
+ * resumes the master role under a live, higher-ranked master. */
+static char g_startup_claim[HADC_NODE_ID_MAX];
+
+int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz)
+{
+    if (!g_startup_claim[0])
+        return 0;
+    const hadc_member_t *best = member_by_id(ctx, g_startup_claim);
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        if (!strcmp(m->id, g_startup_claim) && (!best || beats(m, best->id, best->priority)))
+            best = m;
+    }
+    if (!best)
+        return 0;
+    snprintf(out, outsz, "%s", best->id);
+    return 1;
+}
+
 int hadc_cluster_timesync(hadc_ctx_t *ctx)
 {
     struct {
@@ -1051,6 +1149,11 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
         seen[j].claims_master = !strcmp(msg.master_id, msg.origin);
         seen[j].seen_ms = (uint64_t)hadc_now_ms();
     }
+
+    /* Record live master claims seen during the window (startup gate). */
+    for (size_t j = 0; j < n_seen; j++)
+        if (seen[j].claims_master && !g_startup_claim[0])
+            snprintf(g_startup_claim, sizeof(g_startup_claim), "%s", seen[j].id);
 
     if (n_seen == 0) {
         hadc_info("timesync: no cluster clocks seen, keeping ours");
