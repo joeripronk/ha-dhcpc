@@ -6,17 +6,18 @@ DHCP protocol conversation and lease timers, **syncs lease state** to one or mor
 fails (server unreachable, lease expiry), the cluster **retains the last known good
 configuration** instead of tearing the address down.
 
-By default, **keepalived's VRRP handles the failover**: the VRRP master is the
-ha-dhcpc master, and its notify script promotes the node via `ha-dhcpc ctl promote`
-(backup/fault → `demote`). No built-in election is needed for now — selection is
-keepalived's priority; a manual cmdline override (`ha-dhcpc ctl promote <id>`)
-remains. A `default_role: master` bootstrap election covers deployments without
-a designated master: single-node nodes elect immediately; cluster nodes elect
-(by priority, ties by id) once all members are alive and all slaves, or after
-`cluster_timeout_ms`. The new master's duty is renew-only — it continues RENEW/REBIND on the
-synced lease with the same identity. Every node carries the same **shared `ha-dhcpc.conf`**
-with the designated master's MAC, which all members copy as their DHCP interface
-MAC — so a promoted node is byte-for-byte the same DHCP client identity.
+Failover is **built in** (no keepalived needed): the designated master owns the
+configured **cluster addresses (VIPs)**, the DHCP conversation and the lease
+timers; when its heartbeats stop, the highest-priority live member with quorum
+promotes itself, claims the VIPs and sends gratuitous ARP. A manual cmdline
+override (`ha-dhcpc ctl promote <id>`) remains. A `default_role: master`
+bootstrap election covers deployments without a designated master: single-node
+nodes elect immediately; cluster nodes elect (by priority, ties by id) once all
+members are alive and all slaves, or after `cluster_timeout_ms`. The new master's
+duty is renew-only — it continues RENEW/REBIND on the synced lease with the same
+identity. Every node carries the same **shared `ha-dhcpc.conf`** with the
+designated master's MAC, which all members copy as their DHCP interface MAC — so
+a promoted node is byte-for-byte the same DHCP client identity.
 
 ## 1. Goals
 
@@ -31,18 +32,18 @@ MAC — so a promoted node is byte-for-byte the same DHCP client identity.
   passive to DHCP.
 - On DHCP failure, keep the current configuration (retention mode); never
   spontaneously release the address or pull the IP while the cluster is healthy.
-- Failover is handled by keepalived VRRP by default: VRRP master = ha-dhcpc master
-  (notify scripts promote/demote). The promoted master's duty is renew-only on the
-  synced lease. Manual override via `ha-dhcpc ctl promote <id>`. Built-in election
-  is deferred (v2); dual-master partitions alarm in v1.
+- Failover is automatic: a dead master is replaced by the highest-priority live
+  member once quorum is satisfied. The promoted master claims the cluster
+  addresses, sends gratuitous ARP and continues renew-only on the synced lease.
+  Manual override via `ha-dhcpc ctl promote <id>`; `ctl demote` hands over or
+  withdraws the VIPs.
 - Idempotent, event-driven config application (no flapping, no service restarts).
 
 ### Non-goals (v1)
 
 - Multi-lease / multi-interface meshing (v1: one DHCP interface, one lease, N nodes).
-- Data-path failover ownership (who answers ARP/traffic) belongs to
-  keepalived/VRRP/routing; HA-DHCPC guarantees the *configuration*, not traffic
-  ownership.
+- IPv6 cluster addresses (IPv4 only for now; the gARP path is IPv4. ARP/NS
+  answering still follows address ownership).
 - DHCPv6.
 - Being a drop-in replacement for dhclient on non-clustered hosts (single-node
   mode is supported, but the cluster feature is the point).
@@ -64,28 +65,27 @@ MAC — so a promoted node is byte-for-byte the same DHCP client identity.
    time out the lease on their own. They only obey the master's state.
 4. **Retention beats expiry:** a lease that cannot be renewed is *kept* (degraded),
    not dropped — dropping the IP is the failure mode we are designing away.
-5. **Keepalived decides, ha-dhcpc obeys:** failover is handled by keepalived VRRP
-   by default — its `priority` selects the new master and its notify scripts drive
-   `ha-dhcpc ctl promote/demote`. No built-in election for now (v2 candidate),
-   except the `default_role` bootstrap election (single-node immediate; cluster
-   elects when all members are alive and all slaves, or after `cluster_timeout_ms`;
-   by priority, ties by id). Manual override via `ctl promote <id>`. A promoted
-   node's duty is renew-only
-   (continue RENEW/REBIND on the synced lease); the full DHCP lifecycle belongs to
-   the designated master on cold start or after total lease loss.
-6. **Silent standby + built-in ARP/NS responder:** because every member carries
-   the same address on the same network, only the master answers ARP/NS for it,
-   through ha-dhcpc's **built-in responder**; slaves keep the config applied but
-   advertise nothing (responder off). On promotion the responder flips on and
-   immediately announces the MAC to the switch with a gratuitous ARP / unsolicited
-   NA (refreshing switch CAM/fdb, as VRRP does), so traffic converges with the
-   role change.
+5. **Built-in election, keepalived-compatible behaviour:** each member's
+   `priority` selects the new master on a dead-master timeout, gated by
+   `quorum: majority|none` (use `none` for a two-node cluster). A manual
+   `ctl promote/demote` still overrides. The `default_role` bootstrap election is
+   for deployments with no designated master (single-node immediate; cluster
+   elects when all members are alive and all slaves, or after
+   `cluster_timeout_ms`; by priority, ties by id). A promoted node's duty is
+   renew-only (continue RENEW/REBIND on the synced lease); the full DHCP lifecycle
+   belongs to the designated master on cold start or after total lease loss.
+6. **Master owns the VIP, slaves stay silent:** the master adds the configured
+   `cluster.addresses` (per interface), so the kernel answers ARP/NS for them and
+   only the master is reachable. Slaves remove them; they keep the advertised
+   (primary) config applied but answer nothing. On promotion the node adds the
+   VIPs and immediately announces them with a gratuitous ARP (refreshing switch
+   CAM/fdb, as VRRP does), so traffic converges with the role change.
 
 ## 3. Architecture (per node)
 
 ```
-keepalived VRRP (failover) --notify_master/backup--> ha-dhcpc ctl (unix socket)
-   operator cmdline: ha-dhcpc ctl promote <id>  (manual override)
+automatic failover (heartbeat + quorum + priority)
+   operator cmdline: ha-dhcpc ctl promote/demote <id>  (manual override)
                                                    |
 +--------------------------------------------------v-------------------------+
 |                                ha-dhcpc                                   |
@@ -117,14 +117,16 @@ Components:
   sending from the interface with the designated master's MAC from the shared config.
   Vendor the fork and track FreeBSD patches.
 - **Cluster state machine** — role state (master/slave), heartbeats, lease-state
-  versioning, notify-driven promote/demote, dead-master detection.
-- **Control interface** — local unix socket + `ha-dhcpc ctl promote|demote|status|update`
-  for keepalived notify scripts and operators. Idempotent, logged, auditable; role
-  changes propagate cluster-wide over the UDP control path, so every member always
-  knows who the master is.
-- **ARP/NS responder** — built-in; answers ARP/NS for the shared address, active
-  only on the master; on promotion it also announces the MAC to the switch with a
-  gratuitous ARP / unsolicited NA. IPv6 NS handling mirrors the ARP behavior.
+  versioning, dead-master detection, quorum + priority election, dual-master
+  resolution.
+- **Control interface** — local unix socket + `ha-dhcpc ctl promote|demote|status|update|renew`
+  for operators (and optional external supervisors). Idempotent, logged,
+  auditable; role changes propagate cluster-wide over the UDP control path, so
+  every member always knows who the master is.
+- **Cluster addresses (VIPs)** — configured per interface; only the master adds
+  them, so the kernel answers ARP/NS for them. On promotion the master announces
+  them with a gratuitous ARP (refreshing switch CAM/fdb, as VRRP does), so traffic
+  converges with the role change. IPv4 only for now.
 - **Config executor** — declarative desired state from the current lease state;
   idempotent netlink reconcile (addr/route add only on delta; Linux target);
   **dhclient-script compatible dispatch** (calls existing `dhclient-script`-style
@@ -153,25 +155,23 @@ Components:
   (applied version + config hash) so cluster status is observable.
 - **Full-state transfer:** on slave join, on version gap > 1, or on master change —
   full lease state, slave applies before acking.
-- **Role assignment — keepalived VRRP (default):** VRRP handles failover; the
-  VRRP master is the ha-dhcpc master. `notify_master` → `ha-dhcpc ctl promote`,
-  `notify_backup`/`notify_fault` → `ha-dhcpc ctl demote`. Selection is by
-  keepalived `priority` (single source of truth; `ha-dhcpc-local.conf` mirrors it for
-  reference). No built-in election in v1 (except the `default_role` bootstrap
-  election above); manual override via
-  `ha-dhcpc ctl promote <id>`. Dead-master detection and quorum alarm in v1;
-  dual-master is settled by a demote issued anywhere and propagated cluster-wide
-  over the UDP control path.
+- **Role assignment — automatic:** a heartbeat older than
+  `election_deadline_ms` marks the designated master dead. If quorum is satisfied
+  (`majority` default; `none` allows a lone survivor), the highest-priority live
+  member (ties by node id) promotes itself. `default_role` still governs the
+  no-master bootstrap, and `ctl promote/demote` overrides everything. Dual-master
+  is settled by comparing `(priority, id)` on heartbeats and propagating the
+  winner; a demote issued anywhere also settles it cluster-wide.
 - **The new master's duty is renew-only:** it already has the master MAC and the
   applied config; it resumes at RENEW/REBIND timers against the pinned server-id on
-  the synced lease — no DISCOVER, no config churn — and its built-in responder flips
-  on, announcing the MAC to the switch with a gratuitous ARP/unsolicited NA.
+  the synced lease — no DISCOVER, no config churn — adds the cluster addresses and
+  announces them with a gratuitous ARP.
 - **Safety rules:** only the master sends DHCP packets; only the master may
   DECLINE/RELEASE; slaves never expire the lease; a node in the minority partition
-  keeps its config (retention) and does not self-promote; roles change only when
-  the VRRP role changes (notify scripts) or an operator runs `ctl promote/demote`;
-  every role change propagates cluster-wide over the UDP control path so all
-  members agree on the master (a demote issued anywhere settles a dual-master).
+  keeps its config (retention) and does not self-promote (`quorum: majority`);
+  roles change automatically, by `ctl promote/demote`, or by the bootstrap
+  election, and every role change propagates cluster-wide over the UDP control
+  path so all members agree on the master.
 
 ## 5. Lease & retention state machine (master)
 
@@ -187,7 +187,8 @@ INIT-SELECT --ACK--> BOUND --T1--> RENEW --ACK--> BOUND
 
 - A promoted master resumes directly at RENEW (renew-only duty) on the synced
   lease; INIT-SELECT/DISCOVER applies only to the designated master on cold start
-  or after total lease loss.
+  or after total lease loss. The remaining timers are aged from the last observed
+  lease timestamp before the DHCP core arms them.
 - **Restart always starts in retention**: a node that resumes on a persisted (or
   synced) lease applies its config and enters RETAINED first — nothing is sent —
   and only acts when a timer is due (the renewal goes unicast to the pinned
@@ -213,6 +214,9 @@ member, and the master is authoritative for it.
 - When a member joins (first traffic from it), the master pushes its copy.
 - `ha-dhcpc ctl update` (master-only) re-reads the file from disk, applies it
   here and publishes it to every member. On a slave it is refused.
+- `ha-dhcpc ctl renew` (master-only) forces a RENEW DHCPREQUEST on the configured
+  DHCP interface using the active lease and pinned server-id. On a slave it is
+  refused.
 - A receiver verifies the sha256 the master claims, writes the pushed copy to its
   own copy of this path (atomic, digest-verified) so the cluster converges across
   restarts, then reloads and acks. A member whose digest differs from the master's
@@ -230,9 +234,12 @@ interface: eth0              # DHCP/data interface (MAC comes from master_mac)
 cluster:
   port: 4227
   heartbeat_ms: 2000
-  election_deadline_ms: 6000  # dead-master detection (alarm-only in v1)
-  quorum: majority             # alarm-only in v1 (dual-master guard)
+  election_deadline_ms: 6000  # dead-master timeout before failover
+  quorum: majority             # majority | none (two-node clusters need none)
   cluster_timeout_ms: 0        # default-role bootstrap deadline (0=off)
+  addresses:                   # VIPs owned by the master, keyed by interface
+    br-lan: [192.168.10.1/24]  # CIDR or dotted netmask (192.168.10.1/255.255.255.0)
+    br-guest: [192.168.20.1/24]
 default_role: slave            # master = bootstrap election when no master is known
 dhcp:
   retention: forever          # forever | max_duration | until_carrier_loss | off
@@ -244,13 +251,19 @@ dhcp:
   request_options: [1, 3, 6, 15, 26, 28, 42, 121]
 apply:
   routes: true
+  backup_gateway: ""          # optional; slave-only backup default route (e.g.
+                              # 192.168.10.1 on the OpenWrt routers). Installed
+                              # with a higher metric while the node is a slave
+                              # and removed again on promotion; usually set per
+                              # node in ha-dhcpc-local.conf.
   dns_hook: /usr/lib/ha-dhcpc/hooks/resolvconf   # optional
   ddclient: /usr/bin/ddclient   # optional; run as a one-shot (ddclient -daemon=0
                                 # -syslog) when the applied address changes, on the
                                 # master only (the node that owns the public IP)
-  suppress_member_dad: true
-  arp_responder: true        # built-in ARP/NS for the shared address (master only)
-  announce_gratuitous: true  # gARP/unsolicited NA to the switch on promotion
+  suppress_member_dad: true  # compatibility no-op (only the master owns the VIP)
+  arp_responder: true        # compatibility no-op (the kernel answers on the owner)
+  announce_gratuitous: true  # gratuitous ARP to the switch on promotion
+  slave_link_down: false     # administratively bring the DHCP link down on slaves
 ctl_socket: /run/ha-dhcpc.ctl
 lease_file: dhclient.leases  # optional; relative names resolve against this
                              # file's directory (/etc/ha-dhcpc/); none/off opts
@@ -261,22 +274,25 @@ lease_file: dhclient.leases  # optional; relative names resolve against this
 ```
 
 `/etc/ha-dhcpc/ha-dhcpc-local.conf` — the **per-node overlay** (the old
-`slave.conf` role): this node's identity and priority (mirrors its keepalived
-VRRP priority — keepalived is the failover authority), plus any shared key this
-node must run differently. It is never overwritten by a sync.
+`slave.conf` role): this node's identity and failover priority, plus any shared
+key this node must run differently. It is never overwritten by a sync.
 
 ```yaml
 self: node-b
-priority: 90   # mirrors keepalived priority; informational for ha-dhcpc in v1
+priority: 90   # failover priority; highest live member wins
 interface: eth1        # per-node overrides: interface, default_role, ...
 default_role: slave
+apply:
+  backup_gateway: 192.168.10.1  # slave-only backup default route (OpenWrt
+                                # routers); dropped when this node is promoted
 ```
 
 **What a reload applies live:** the heartbeat timer, the cluster transport bind
 (port or this node's sync address), the ctl socket, the DHCP send knobs
-(retention, rate limit, renew retry), members, priority, `default_role` and the
-election timers, and an executor re-apply — an interface change moves the address
-on the new interface and the engine re-enters there (master-only). **What needs a
+(retention, rate limit, renew retry), members, priority, `default_role`, the
+election timers/quorum, the cluster addresses, and an executor re-apply — an
+interface change moves the address on the new interface and the engine re-enters
+there (master-only). **What needs a
 restart:** requested DHCP options and the hook script (read at engine start). A
 file that no longer parses is refused and the config in use is kept, so a bad edit
 never takes a live node down.
@@ -285,17 +301,10 @@ The node's state file (cluster view + full lease information, JSON, fsynced)
 defaults to **`state.json` next to the shared config** — `/etc/ha-dhcpc/state.json`
 in a normal install; `--persist PATH` overrides it.
 
-Keepalived notify hook (per node):
-
-```
-notify_master "/usr/lib/ha-dhcpc/notify.sh master"
-notify_backup "/usr/lib/ha-dhcpc/notify.sh backup"
-notify_fault  "/usr/lib/ha-dhcpc/notify.sh fault"
-```
-
-`notify.sh` maps master → `ha-dhcpc ctl promote` (this node won VRRP), backup/fault
-→ `ha-dhcpc ctl demote`; idempotent, logged, non-blocking.
-Manual path: `ha-dhcpc ctl promote <node-id>`.
+No keepalived integration is required. If an external supervisor already drives
+roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault →
+`ha-dhcpc ctl demote`; it is idempotent, logged and non-blocking. Manual path:
+`ha-dhcpc ctl promote <node-id>` / `ha-dhcpc ctl demote`.
 
 ## 7. Technology choices
 
@@ -303,8 +312,8 @@ Manual path: `ha-dhcpc ctl promote <node-id>`.
   the DHCP core (target OS is Linux, so the fork must build cleanly there; it
   derives from ISC DHCP 4.x which historically supported Linux), new C modules for
   cluster/sync/ctl. Config application via libnl/netlink. Minimal deps.
-- **Deployment:** systemd unit on all members (role is runtime state, not config);
-  keepalived (2.x) as the external failover authority via notify scripts.
+- **Deployment:** systemd unit on all members (role is runtime state, not
+  config); failover and the VIP are built in, so keepalived is optional.
 - **Observability:** `ha-dhcpc status` + JSON over the local control socket
   (role, versions, apply-acks, retention state, timers); structured logs.
 - **Compat mode:** single-node operation = cluster of one (no election needed),
@@ -319,12 +328,13 @@ Manual path: `ha-dhcpc ctl promote <node-id>`.
   values at save time; on restart they are recalculated from UTC
   (`saved_at_utc` in state.json minus the downtime, clamped at zero), so a node
   down through its renewal window acts at boot instead of waiting the stale
-  value. Sanity check: a `saved_at_utc` ahead of the clock, or downtime beyond
-  `min(2 × t3, 24 h)`, is not trusted and the stored remainders are kept as
-  they are.
-- Master restart: rejoin via persistence + full-state exchange; if keepalived
-  still considers it master, it resumes the role after cooldown; otherwise it
-  obeys the current master. A restart **reuses the persisted state**: the daemon
+  value. Adopted peer state and promotions age the same remainders from the last
+  observed lease time before arming timers. Sanity check: a `saved_at_utc` ahead
+  of the clock, or downtime beyond `min(2 × t3, 24 h)`, is not trusted and the
+  stored remainders are kept as they are.
+- Master restart: rejoin via persistence + full-state exchange; the persisted
+  `master_id` restores the agreed master, so a restarting master either resumes
+  its role or follows the current master. A restart **reuses the persisted state**: the daemon
   hands the engine the lease (address, server-id, timers as remaining time), the
   core enables the IP and enters BOUND quietly, and only acts when a timer is due
   (the renewal goes unicast to the pinned server-id) — no DISCOVER just because
@@ -333,41 +343,40 @@ Manual path: `ha-dhcpc ctl promote <node-id>`.
 - Duplicate transaction safety: server-id pinned per lease (RFC 2131) — only the
   master touches it; a promoted master continues using it with the copied MAC.
 - Sync/heartbeat uses the distinct per-node secondary addresses on the shared
-  link, never the shared identity address; only the master's built-in responder
-  answers ARP/NS for the shared address (and fires gARP/unsolicited NA on
-  promotion) — slaves are silent standbys with the config pre-applied.
+  link, never the shared identity address; only the master owns the cluster
+  addresses, so the kernel answers ARP/NS for them (and the master fires gARP on
+  promotion) — slaves are silent standbys with the advertised config pre-applied.
 - Carrier/interface loss, DHCP server reboots (NAK → reselect, master-only),
   BOOTP vs DHCP options sanity, clock skew between members (informational only).
 - Config executor must never fight other managers (networkd/NetworkManager must be
   disabled for the interface — documented prerequisite).
-- Notify scripts can be invoked repeatedly/spuriously (fault→master flapping);
-  `ctl promote/demote` must be idempotent and cooldown-guarded.
+- Role changes can race (flapping, split brain); `ctl promote/demote` and the
+  automatic election are idempotent, prio/id-tiebroken and cooldown-guarded.
 
 ## 9. Test plan
 
 - **Unit:** wire codec (dhclient codec), state machine transitions (incl. RETAINED
   paths), versioned sync, persistence round-trip, ctl idempotency.
-- **Integration (netns + one shared bridge, dnsmasq as server, 3 nodes,
-  keepalived; per-node secondary addresses for sync):**
+- **Integration (netns + one shared bridge, dnsmasq as server, 3 nodes;
+  per-node secondary addresses for sync):**
   1. Master acquires lease, slaves apply identical config (apply-acks), all
      members show the master MAC on the DHCP interface; only the master answers
      ARP/NS for the shared address (slaves silent).
-  2. keepalived failover (master killed) → VRRP promotes the highest-priority
-     slave, its notify script runs `ctl promote` → it continues RENEW at the
-     server with the same MAC, its responder sends gratuitous ARP/NA announcing the
-     MAC to the switch (assert via tcpdump), no IP flap on survivors (assert via
-     `ip addr` event stream), no DISCOVER storm (assert via tcpdump).
+  2. kill the master → after `election_deadline_ms` the highest-priority live
+     slave promotes itself, adds the VIP, sends gratuitous ARP, and continues
+     RENEW at the server with the same MAC (assert via tcpdump); no IP flap on
+     survivors (assert via `ip addr` event stream), no DISCOVER storm.
   3. Server down through T3 → all nodes in RETAINED, traffic config intact.
   4. Server returns → back to BOUND, lease updated cluster-wide.
-  5. Partition: dual-master detection alarms (VRRP may dual-master across a
-     partition); a `ctl demote` on one side propagates cluster-wide over the UDP
-     control path and all members agree on the master afterwards; exactly one node
+  5. Partition: with `quorum: majority` the minority does not self-promote; in a
+     two-node `quorum: none` split the prio/id tiebreak settles the dual master,
+     and a `ctl demote` on one side propagates cluster-wide; exactly one node
      sends DHCP packets (assert via tcpdump).
   6. Slave join/restart mid-lease; full-state transfer correctness.
   7. Manual cmdline override: `ctl promote <id>` from an operator shell moves the
-     role cleanly; the old master demotes (via notify or ctl).
-  8. Dead-master/quorum detection: alarms, no self-promotion (dual-brain guard);
-     demotes propagate to all members.
+     role cleanly; the old master demotes.
+  8. Dead-master/quorum detection: no self-promotion without quorum (dual-brain
+     guard); demotes propagate to all members.
 - **Fuzz/robustness:** malformed/misordered DHCP and sync packets.
 
 ## 10. Milestones
@@ -377,17 +386,17 @@ Manual path: `ha-dhcpc ctl promote <node-id>`.
   retention mode, idempotent executor (standalone value, no cluster yet).
 - **M2** — Heartbeat + versioned lease sync + slave pre-apply + apply-acks;
   ctl socket + `promote`/`demote`.
-- **M3** — keepalived VRRP integration (notify → promote/demote) + manual ctl
-  override + dual-master alarm; integration tests 1, 2, 5, 6, 7, 8. Built-in
-  election deferred to v2.
+- **M3** — built-in failover (quorum + priority), cluster addresses (VIP) +
+  gratuitous ARP, manual ctl override, dual-master resolution; integration tests
+  1, 2, 5, 6, 7, 8.
 - **M4** — Retention policy completion (backoff re-discover, hooks), observability
   (`status`, JSON socket), alerts.
 - **M5** — Hardening: fuzz, docs, systemd packaging, demo topology.
 
 ## 11. Resolved decisions
 
-1. keepalived: one VRRP instance shared with the data path (VIP); its notify
-   scripts drive ha-dhcpc roles.
+1. Built-in failover and VIP ownership replace keepalived; keepalived is
+   optional for deployments that already run it.
 2. Dual-master/partition: resolved by demotion propagated over the UDP control
    path — a local demote signals all members who the master is.
 3. Failover convergence target: ≤ 10 s end-to-end.

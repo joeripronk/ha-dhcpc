@@ -55,6 +55,12 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         hadc_err("reload(%s): %s; keeping the config in use", why, err);
         return -1;
     }
+    /* The file's designated_master is only the cold-start seed. Keep the
+     * runtime master (possibly elected) unless the operator changed the seed,
+     * so an unchanged reload compares equal and does nothing. */
+    if (!strcmp(next.seed_master, ctx->conf.seed_master))
+        memcpy(next.designated_master, ctx->conf.designated_master,
+               sizeof(next.designated_master));
     if (memcmp(&next, &ctx->conf, sizeof(next)) == 0) {
         hadc_dbg("reload(%s): no change", why);
         return 0;
@@ -79,9 +85,15 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.priority != ctx->conf.priority ||
         next.cluster.election_deadline_ms != ctx->conf.cluster.election_deadline_ms ||
         next.cluster.cluster_timeout_ms != ctx->conf.cluster.cluster_timeout_ms ||
-        strcmp(next.designated_master, ctx->conf.designated_master) != 0;
-    int apply = strcmp(next.interface, ctx->conf.interface) != 0 ||
-        next.apply.routes != ctx->conf.apply.routes;
+        next.cluster.quorum != ctx->conf.cluster.quorum ||
+        strcmp(next.seed_master, ctx->conf.seed_master) != 0;
+    int cluster_addrs = next.cluster.n_ifaces != ctx->conf.cluster.n_ifaces ||
+        memcmp(next.cluster.ifaces, ctx->conf.cluster.ifaces,
+               sizeof(next.cluster.ifaces)) != 0;
+    int apply = interface_changed || cluster_addrs ||
+        next.apply.routes != ctx->conf.apply.routes ||
+        next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||
+        next.apply.slave_link_down != ctx->conf.apply.slave_link_down;
 
     if (heartbeat)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%sheartbeat", n ? " " : "");
@@ -98,11 +110,19 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     if (role_timers)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%srole/priority/timers",
                               n ? " " : "");
+    if (cluster_addrs)
+        n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%scluster_addresses",
+                              n ? " " : "");
     if (restart_only)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%soptions/hook(needs restart)",
                               n ? " " : "");
     if (n == 0)
         snprintf(changes, sizeof(changes), "unspecified");
+
+    if (strcmp(next.seed_master, ctx->conf.seed_master) != 0)
+        hadc_info("reload: designated_master seed changed %s -> %s",
+                  ctx->conf.seed_master[0] ? ctx->conf.seed_master : "(none)",
+                  next.seed_master[0] ? next.seed_master : "(none)");
 
     ctx->conf = next;
     hadc_log_set_level(ctx->conf.loglevel);
@@ -129,6 +149,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         hadc_desired_t desired;
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired, "RELOAD");
+        if (ctx->role == HADC_ROLE_MASTER && cluster_addrs)
+            hadc_executor_announce_cluster(ctx);
     }
     if (dhcp_knobs)
         hadc_dhcpcore_reload(ctx);

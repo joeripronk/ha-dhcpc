@@ -44,4 +44,12 @@ int hadc_dhcpcore_reload(hadc_ctx_t *ctx);
  * the existing lease, INIT-SELECT when there is none). Master-only. */
 int hadc_dhcpcore_restart(hadc_ctx_t *ctx);
 
+/* Force a new DISCOVER-SELECT-REQUEST cycle on the configured interface.
+ * Master-only; retention does not suppress an explicit operator request. */
+int hadc_dhcpcore_force_discover(hadc_ctx_t *ctx);
+
+/* Force a RENEW DHCPREQUEST on the configured interface using the active
+ * lease and pinned server-id. Master-only. */
+int hadc_dhcpcore_force_renew(hadc_ctx_t *ctx);
+
 #endif /* HA_DHCPC_DHCPCORE_H */

@@ -101,6 +101,28 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
 
 static void cb_retention(void *arg, bool entered);
 
+/* Master-side gateway MAC cache (plan §4 sync unit): learn the gateway's
+ * lladdr from our own resolved neighbor entry so a promoted node does not
+ * have to re-discover it with ARP. 1 = newly cached. */
+static int cache_gw_mac(hadc_ctx_t *ctx)
+{
+    uint8_t mac[HADC_MAC_LEN];
+
+    if (ctx->role != HADC_ROLE_MASTER || ctx->lease.gateway.s_addr == 0)
+        return 0;
+    if (hadc_executor_observe_gw_mac(ctx, mac) != 0)
+        return 0;
+    if (ctx->lease.gw_mac_valid && hadc_mac_equal(ctx->lease.gw_mac, mac))
+        return 0;
+    memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
+    ctx->lease.gw_mac_valid = true;
+    hadc_info("lease: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached in "
+              "cluster state",
+              inet_ntoa(*(struct in_addr *)&ctx->lease.gateway), mac[0], mac[1],
+              mac[2], mac[3], mac[4], mac[5]);
+    return 1;
+}
+
 static void cb_lease_update(void *arg, const hadc_lease_t *lease)
 {
     hadc_ctx_t *ctx = arg;
@@ -134,6 +156,7 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         hadc_executor_apply(ctx, &desired, HADC_REASON_EXPIRE);
     }
     ctx->acked_version = ctx->lease.version;
+    cache_gw_mac(ctx);
     hadc_cluster_push_state(ctx, &ctx->lease); /* master-only (plan §4) */
     hadc_persist_save(ctx);
 }
@@ -166,8 +189,9 @@ static void cb_carrier_return(void *arg)
     hadc_executor_apply(ctx, &desired, "CARRIER-RETURN");
 }
 
-/* Role transitions (ctl/keepalived/cluster-driven, plan §4): the engine runs
- * only on the master; a promoted node resumes renew-only on the synced lease. */
+/* Role transitions (ctl/cluster-driven, plan §4): the engine runs only on the
+ * master; a promoted node resumes renew-only on the synced lease and claims the
+ * cluster addresses. */
 static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role)
 {
     hadc_ctx_t *ctx = arg;
@@ -177,11 +201,14 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         return;
     if (new_role == HADC_ROLE_MASTER) {
         hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
+        hadc_lease_prepare_for_promotion(&ctx->lease);
         hadc_dhcpcore_start(ctx);
     } else if (old_role == HADC_ROLE_MASTER)
         hadc_dhcpcore_stop(ctx);
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
+    if (new_role == HADC_ROLE_MASTER)
+        hadc_executor_announce_cluster(ctx);
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
 }
@@ -190,12 +217,12 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--conf PATH] [--local-conf PATH] [--persist PATH] [--oneshot]\n"
-            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update [id]\n"
+            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update|renew [id]\n"
             "       (--persist default: state.json next to --conf)\n",
             argv0, argv0);
 }
 
-/* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update [id] (plan §3). */
+/* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update|renew [id] (plan §3). */
 static int ctl_client(const char *conf_path, const char *local_path, const char *cmd_line)
 {
     hadc_conf_t conf;
@@ -307,6 +334,14 @@ int main(int argc, char **argv)
                                 : HADC_ROLE_SLAVE);
 
     if (pv.found) {
+        /* Runtime role changes are persisted; the shared config's
+         * designated_master is only the cold-start seed. */
+        if (ctx->role == HADC_ROLE_MASTER)
+            snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master),
+                     "%.*s", (int)sizeof(ctx->conf.designated_master) - 1, ctx->conf.self);
+        else if (pv.master_id[0])
+            snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master),
+                     "%.*s", (int)sizeof(ctx->conf.designated_master) - 1, pv.master_id);
         ctx->lease = pv.lease;
         ctx->lease.version = pv.lease_version;
         ctx->acked_version = pv.acked_version;
@@ -372,6 +407,8 @@ int main(int argc, char **argv)
             hadc_executor_apply(ctx, &desired, HADC_REASON_REBOOT);
         ctx->acked_version = ctx->lease.version;
     }
+    if (ctx->role == HADC_ROLE_MASTER)
+        hadc_executor_announce_cluster(ctx);
 
     static const hadc_dhcp_callbacks_t cb = { cb_lease_update, cb_retention,
                                               cb_carrier_return };
@@ -400,8 +437,10 @@ int main(int argc, char **argv)
     }
 
     ctx->running = true;
-    hadc_info("running (heartbeat %ums, cluster port %u; keepalived drives roles via ctl)",
-              ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port);
+    hadc_info("running (heartbeat %ums, cluster port %u; roles are automatic "
+              "(priority %d), ctl promote/demote still override)",
+              ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
+              ctx->conf.priority);
     struct epoll_event evs[MAX_FDS];
     while (ctx->running) {
         int n = epoll_wait(ctx->epfd, evs, MAX_FDS, 1000);

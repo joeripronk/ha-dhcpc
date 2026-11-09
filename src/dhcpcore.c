@@ -86,6 +86,7 @@ static void fill_lease(hadc_lease_t *out, const struct client_lease *l)
     out->t1_remaining_s = l->renewal > now ? (uint32_t)(l->renewal - now) : 0;
     out->t2_remaining_s = l->rebind > now ? (uint32_t)(l->rebind - now) : 0;
     out->t3_remaining_s = l->expiry > now ? (uint32_t)(l->expiry - now) : 0;
+    out->observed_at_utc = (long long)time(NULL);
 }
 
 static int is_lease_reason(const char *reason)
@@ -327,6 +328,30 @@ int hadc_dhcpcore_restart(hadc_ctx_t *ctx)
         return -1;
     }
     hadc_info("dhcpcore: re-entered on %s (%d fds)", ctx->conf.interface, n);
+    return 0;
+}
+
+int hadc_dhcpcore_force_discover(hadc_ctx_t *ctx)
+{
+    if (!g_running)
+        return -1;
+    if (dhcp_core_force_discover(ctx->conf.interface) != 0) {
+        hadc_warn("dhcpcore: forced discover on %s failed", ctx->conf.interface);
+        return -1;
+    }
+    core_arm_timer(ctx);
+    return 0;
+}
+
+int hadc_dhcpcore_force_renew(hadc_ctx_t *ctx)
+{
+    if (!g_running)
+        return -1;
+    if (dhcp_core_force_renew(ctx->conf.interface) != 0) {
+        hadc_warn("dhcpcore: forced renew on %s failed", ctx->conf.interface);
+        return -1;
+    }
+    core_arm_timer(ctx);
     return 0;
 }
 

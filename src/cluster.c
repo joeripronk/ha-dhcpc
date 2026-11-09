@@ -1,7 +1,8 @@
 /* Cluster module: heartbeat + versioned sync + role handling (plan §4).
- * M2: heartbeats are sent cluster-wide, master pushes lease state on change,
- * slaves pre-apply then ack; role changes propagate. Decisions stay
- * keepalived-driven (v1: dead-master/quorum are alarms only). */
+ * Heartbeats are sent cluster-wide, the master pushes lease state on change,
+ * slaves pre-apply then ack, and role changes propagate. Failover is built in:
+ * a dead master is replaced by the highest-priority live member once quorum is
+ * satisfied, and every master owns the configured cluster addresses. */
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
@@ -30,7 +31,11 @@ static hadc_ctx_t *g_ctx;
 static void (*g_role_hook)(void *arg, hadc_role_t old_role, hadc_role_t new_role);
 static void *g_role_hook_arg;
 static uint64_t g_cluster_start_ms;
+static uint64_t g_no_elect_until_ms; /* manual demote cooldown */
 static struct sockaddr_in g_bound; /* what udp_fd is bound to (rebind check) */
+
+static void propagate_role(hadc_ctx_t *ctx);
+static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
 
@@ -133,13 +138,14 @@ static json_t *lease_json(const hadc_lease_t *l)
         char buf[64];
         json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
     }
-    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:s}",
+    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
                            "state", hadc_lease_state_name(l->state), "retention_active",
                            (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
                            "server_id", "", "dns", dns, "t1_remaining_s",
                            (json_int_t)l->t1_remaining_s, "t2_remaining_s",
                            (json_int_t)l->t2_remaining_s, "t3_remaining_s",
-                           (json_int_t)l->t3_remaining_s, "config_hash", hex);
+                           (json_int_t)l->t3_remaining_s, "observed_at_utc",
+                           (json_int_t)l->observed_at_utc, "config_hash", hex);
     if (!o) {
         json_decref(dns);
         return NULL;
@@ -148,6 +154,12 @@ static json_t *lease_json(const hadc_lease_t *l)
     put_addr(o, "netmask", l->netmask);
     put_addr(o, "gateway", l->gateway);
     put_addr(o, "server_id", l->server_id);
+    if (l->gw_mac_valid) {
+        char mac[2 * HADC_MAC_LEN + 1];
+        for (size_t i = 0; i < HADC_MAC_LEN; i++)
+            sprintf(mac + 2 * i, "%02x", l->gw_mac[i]);
+        json_object_set_new(o, "gw_mac", json_string(mac));
+    }
     return o;
 }
 
@@ -192,6 +204,8 @@ static void parse_lease(json_t *lj, hadc_lease_t *out)
         out->t2_remaining_s = (uint32_t)json_integer_value(v);
     if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
         out->t3_remaining_s = (uint32_t)json_integer_value(v);
+    if ((v = json_object_get(lj, "observed_at_utc")) && json_is_integer(v))
+        out->observed_at_utc = (long long)json_integer_value(v);
     if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
         strlen(json_string_value(v)) == 64) {
         for (size_t i = 0; i < 32; i++) {
@@ -199,6 +213,21 @@ static void parse_lease(json_t *lj, hadc_lease_t *out)
             if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
                 break;
             out->config_hash[i] = (uint8_t)b;
+        }
+    }
+    if ((v = json_object_get(lj, "gw_mac")) && json_is_string(v) &&
+        strlen(json_string_value(v)) == 2 * HADC_MAC_LEN) {
+        uint8_t mac[HADC_MAC_LEN];
+        size_t i;
+        for (i = 0; i < HADC_MAC_LEN; i++) {
+            unsigned b;
+            if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
+                break;
+            mac[i] = (uint8_t)b;
+        }
+        if (i == HADC_MAC_LEN) {
+            memcpy(out->gw_mac, mac, sizeof(mac));
+            out->gw_mac_valid = true;
         }
     }
 }
@@ -410,6 +439,13 @@ static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_f
 
     ctx->lease = msg->lease;
     ctx->lease.version = msg->lease_version;
+    if (msg->ts_ms != 0) {
+        uint64_t now_ms = realtime_ms();
+        long long elapsed_s = now_ms > msg->ts_ms ? (long long)((now_ms - msg->ts_ms) / 1000) : 0;
+        if (elapsed_s > 0)
+            hadc_lease_adjust_elapsed(&ctx->lease, elapsed_s);
+    }
+    hadc_lease_mark_observed(&ctx->lease);
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, hadc_lease_state_name(ctx->lease.state));
     ctx->acked_version = ctx->lease.version;
@@ -460,6 +496,44 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         static uint64_t last_drift_alarm_ms;
         hadc_dbg("sync: heartbeat from %s (master=%s, version=%llu)", msg.origin, msg.master_id,
                  (unsigned long long)msg.lease_version);
+        if (p)
+            snprintf(p->master_view, sizeof(p->master_view), "%s", msg.master_id);
+
+        /* A peer that names itself master is asserting the role. If we are the
+         * master too, the higher priority (ties by id) wins; the loser demotes.
+         * If we are a slave, follow the asserted master when our current one is
+         * gone or has a lower priority. */
+        if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.master_id, msg.origin)) {
+            const hadc_member_t *om = member_by_id(ctx, msg.origin);
+            if (ctx->role == HADC_ROLE_MASTER) {
+                bool peer_wins = om && (om->priority > ctx->conf.priority ||
+                    (om->priority == ctx->conf.priority &&
+                     strcmp(om->id, ctx->conf.self) < 0));
+                if (peer_wins) {
+                    hadc_warn("cluster: %s also claims master; yielding (its priority %d, "
+                              "ours %d)", msg.origin, om->priority, ctx->conf.priority);
+                    hadc_cluster_promote(ctx, msg.origin);
+                } else {
+                    hadc_info("cluster: %s also claims master; keeping the role (our priority "
+                              "%d, its %d)", msg.origin, ctx->conf.priority,
+                              om ? om->priority : 0);
+                    propagate_role(ctx);
+                }
+            } else if (strcmp(msg.master_id, ctx->conf.designated_master)) {
+                const hadc_member_t *cur = member_by_id(ctx, ctx->conf.designated_master);
+                bool take = !master_is_alive(ctx, ctx->conf.designated_master) ||
+                    (om && (!cur || om->priority > cur->priority ||
+                            (om->priority == cur->priority &&
+                             strcmp(om->id, cur->id) < 0)));
+                if (om && take) {
+                    snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", om->id);
+                    set_role(ctx, HADC_ROLE_SLAVE);
+                    hadc_info("cluster: following master %s (was %s)", om->id,
+                              cur ? cur->id : "(none)");
+                    hadc_persist_save(ctx);
+                }
+            }
+        }
         if (p && p->clock_offset_ms != 0 &&
             llabs(p->clock_offset_ms) > HADC_TIMESYNC_STEP_MS &&
             (strcmp(msg.origin, ctx->conf.designated_master) == 0 ||
@@ -583,10 +657,152 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     return 0;
 }
 
+/* Age the per-member view from the heartbeat deadline. A peer that has never
+ * been seen is not alive; a peer whose last heartbeat is older than the
+ * deadline is not alive either. */
+static void age_peers(hadc_ctx_t *ctx)
+{
+    uint64_t now = (uint64_t)hadc_now_ms();
+    uint32_t deadline = ctx->conf.cluster.election_deadline_ms;
+
+    if (deadline == 0)
+        deadline = 6000;
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        hadc_peer_t *p = &ctx->peers[i];
+        if (p->last_seen_ms == 0) {
+            p->alive = false;
+            continue;
+        }
+        p->alive = now - p->last_seen_ms <= deadline;
+    }
+}
+
+static size_t alive_members(hadc_ctx_t *ctx)
+{
+    size_t n = 1; /* self */
+
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        if (!strcmp(m->id, ctx->conf.self))
+            continue;
+        if (ctx->peers[i].alive)
+            n++;
+    }
+    return n;
+}
+
+static bool master_is_alive(hadc_ctx_t *ctx, const char *id)
+{
+    if (!id || !*id)
+        return false;
+    if (!strcmp(id, ctx->conf.self))
+        return true;
+    hadc_peer_t *p = peer_entry(ctx, id);
+    return p && p->alive;
+}
+
+/* Highest-priority live member; ties by lowest node id. */
+static const hadc_member_t *best_alive(hadc_ctx_t *ctx, bool include_self)
+{
+    const hadc_member_t *best = NULL;
+
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        bool alive = !strcmp(m->id, ctx->conf.self) ? include_self : ctx->peers[i].alive;
+
+        if (!alive)
+            continue;
+        if (!best || m->priority > best->priority ||
+            (m->priority == best->priority && strcmp(m->id, best->id) < 0))
+            best = m;
+    }
+    return best;
+}
+
+/* Built-in failover: the designated master stopped heartbeating, we have
+ * quorum, and this node is the highest-priority live member. */
+static void failover_check(hadc_ctx_t *ctx)
+{
+    static uint64_t last_alarm_ms;
+    uint64_t now = (uint64_t)hadc_now_ms();
+    uint32_t deadline = ctx->conf.cluster.election_deadline_ms;
+    const hadc_member_t *winner;
+
+    if (ctx->role != HADC_ROLE_SLAVE)
+        return;
+    if (ctx->conf.n_members <= 1)
+        return; /* single-node bootstrap is elect_check's job */
+    if (!ctx->conf.designated_master[0])
+        return;
+    if (!strcmp(ctx->conf.designated_master, ctx->conf.self))
+        return;
+    if (deadline == 0)
+        deadline = 6000;
+    if (now < g_no_elect_until_ms)
+        return;
+
+    hadc_peer_t *mp = peer_entry(ctx, ctx->conf.designated_master);
+    bool master_dead;
+    if (mp && mp->last_seen_ms != 0)
+        master_dead = now - mp->last_seen_ms > deadline;
+    else
+        master_dead = now - g_cluster_start_ms > deadline;
+    if (!master_dead)
+        return;
+
+    if (ctx->conf.cluster.quorum == HADC_QUORUM_MAJORITY &&
+        alive_members(ctx) * 2 <= ctx->conf.n_members) {
+        if (now - last_alarm_ms >= deadline) {
+            last_alarm_ms = now;
+            hadc_warn("ALARM: master %s is down but only %zu/%zu members are alive; "
+                      "no quorum, not promoting",
+                      ctx->conf.designated_master, alive_members(ctx),
+                      ctx->conf.n_members);
+        }
+        return;
+    }
+
+    winner = best_alive(ctx, true);
+    if (!winner || strcmp(winner->id, ctx->conf.self) != 0)
+        return;
+
+    /* Never promote into a live peer that is already asserting itself as
+     * master; the dual-master reconciliation below settles that case. */
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        hadc_peer_t *p = &ctx->peers[i];
+        if (strcmp(ctx->conf.members[i].id, ctx->conf.self) &&
+            p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+            return;
+    }
+
+    hadc_info("cluster: failover: master %s missed the %ums deadline; promoting self "
+              "(priority %d, %zu/%zu alive)",
+              ctx->conf.designated_master, deadline, ctx->conf.priority,
+              alive_members(ctx), ctx->conf.n_members);
+    hadc_cluster_promote(ctx, ctx->conf.self);
+}
+
 /* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 {
-    static uint64_t last_alarm_ms;
+    /* Master-side gateway MAC cache: pick up the gateway lladdr from our own
+     * resolved neighbor entry (the first ARP after binding may not have
+     * answered yet when the lease event fired) and push it so every member
+     * holds it before a failover. */
+    if (ctx->role == HADC_ROLE_MASTER && ctx->lease.gateway.s_addr != 0) {
+        uint8_t mac[HADC_MAC_LEN];
+        if (hadc_executor_observe_gw_mac(ctx, mac) == 0 &&
+            (!ctx->lease.gw_mac_valid || !hadc_mac_equal(ctx->lease.gw_mac, mac))) {
+            memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
+            ctx->lease.gw_mac_valid = true;
+            hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached; "
+                      "pushing state",
+                      inet_ntoa(ctx->lease.gateway), mac[0], mac[1], mac[2], mac[3],
+                      mac[4], mac[5]);
+            hadc_persist_save(ctx);
+            hadc_cluster_push_state(ctx, &ctx->lease);
+        }
+    }
 
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
@@ -596,22 +812,8 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
         send_to_member(ctx, m, hb);
     }
 
-    /* Dead-master detection: alarm-only in v1 (no self-promotion). */
-    if (ctx->role != HADC_ROLE_MASTER && ctx->conf.designated_master[0] &&
-        strcmp(ctx->conf.designated_master, ctx->conf.self)) {
-        hadc_peer_t *p = peer_entry(ctx, ctx->conf.designated_master);
-        uint64_t now = (uint64_t)hadc_now_ms();
-        if (p && p->last_seen_ms != 0 &&
-            now - p->last_seen_ms > ctx->conf.cluster.election_deadline_ms &&
-            now - last_alarm_ms >= ctx->conf.cluster.election_deadline_ms) {
-            last_alarm_ms = now;
-            hadc_warn("ALARM: no heartbeat from master %s for %llums (deadline %ums); "
-                      "v1 alarms only, no self-promotion",
-                      p->id, (unsigned long long)(now - p->last_seen_ms),
-                      (unsigned)ctx->conf.cluster.election_deadline_ms);
-        }
-    }
-
+    age_peers(ctx);
+    failover_check(ctx);
     hadc_cluster_elect_check(ctx);
 }
 
@@ -628,6 +830,8 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     int wprio;
 
     if (!ctx->conf.default_role_master)
+        return;
+    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
         return;
     if (ctx->conf.designated_master[0] != '\0')
         return; /* a master is known: configured or elected */
@@ -717,15 +921,35 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
 int hadc_cluster_demote(hadc_ctx_t *ctx)
 {
     /* A demote issued anywhere settles dual-master cluster-wide (plan §11.2).
-     * v1: keepalived decides who the master is; we obey. */
-    const char *target = ctx->conf.designated_master;
-    if (!strcmp(target, ctx->conf.self)) {
-        hadc_dbg("cluster: demote requested on this node; v1 defers role choice to keepalived");
+     * When this node is the master we hand over to the best live peer; with no
+     * live peer the VIP is withdrawn and election is suppressed for one
+     * deadline so the operator's demote is not immediately undone. */
+    if (ctx->role != HADC_ROLE_MASTER) {
+        set_role(ctx, HADC_ROLE_SLAVE);
+        hadc_info("cluster: demoted; master remains %s",
+                  ctx->conf.designated_master[0] ? ctx->conf.designated_master : "(none)");
+        propagate_role(ctx);
         return 0;
     }
-    set_role(ctx, HADC_ROLE_SLAVE);
-    hadc_info("cluster: demoted; master remains %s", target);
+
+    age_peers(ctx);
+    const hadc_member_t *best = best_alive(ctx, false);
+    if (best) {
+        snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
+        set_role(ctx, HADC_ROLE_SLAVE);
+        hadc_info("cluster: demoted; handing the master role to %s", best->id);
+    } else {
+        ctx->conf.designated_master[0] = '\0';
+        set_role(ctx, HADC_ROLE_SLAVE);
+        g_no_elect_until_ms = (uint64_t)hadc_now_ms() +
+            (ctx->conf.cluster.election_deadline_ms ? ctx->conf.cluster.election_deadline_ms
+                                                    : 6000);
+        hadc_info("cluster: demoted; no live peer to take over (election suppressed for "
+                  "%ums)", ctx->conf.cluster.election_deadline_ms ? ctx->conf.cluster.election_deadline_ms
+                                                                  : 6000);
+    }
     propagate_role(ctx);
+    hadc_persist_save(ctx);
     return 0;
 }
 

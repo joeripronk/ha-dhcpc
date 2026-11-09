@@ -52,13 +52,14 @@ static json_t *lease_json(const hadc_lease_t *l)
         char buf[64];
         json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
     }
-    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:s}",
+    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
                            "state", hadc_lease_state_name(l->state), "retention_active",
                            (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
                            "server_id", "", "dns", dns, "t1_remaining_s",
                            (json_int_t)l->t1_remaining_s, "t2_remaining_s",
                            (json_int_t)l->t2_remaining_s, "t3_remaining_s",
-                           (json_int_t)l->t3_remaining_s, "config_hash", hex);
+                           (json_int_t)l->t3_remaining_s, "observed_at_utc",
+                           (json_int_t)l->observed_at_utc, "config_hash", hex);
     if (!o) {
         json_decref(dns);
         return NULL;
@@ -67,6 +68,12 @@ static json_t *lease_json(const hadc_lease_t *l)
     put_addr(o, "netmask", l->netmask);
     put_addr(o, "gateway", l->gateway);
     put_addr(o, "server_id", l->server_id);
+    if (l->gw_mac_valid) {
+        char mac[2 * HADC_MAC_LEN + 1];
+        for (size_t i = 0; i < HADC_MAC_LEN; i++)
+            sprintf(mac + 2 * i, "%02x", l->gw_mac[i]);
+        json_object_set_new(o, "gw_mac", json_string(mac));
+    }
     return o;
 }
 
@@ -100,6 +107,9 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         out->role = !strcmp(json_string_value(v), "master")      ? HADC_ROLE_MASTER
                    : !strcmp(json_string_value(v), "slave")      ? HADC_ROLE_SLAVE
                                                                   : HADC_ROLE_UNKNOWN;
+    if ((v = json_object_get(root, "master_id")) && json_is_string(v))
+        snprintf(out->master_id, sizeof(out->master_id), "%s",
+                 json_string_value(v));
     if ((v = json_object_get(root, "lease_version")) && json_is_integer(v))
         out->lease_version = (uint64_t)json_integer_value(v);
     if ((v = json_object_get(root, "acked_version")) && json_is_integer(v))
@@ -132,6 +142,8 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
             l->t2_remaining_s = (uint32_t)json_integer_value(v);
         if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
             l->t3_remaining_s = (uint32_t)json_integer_value(v);
+        if ((v = json_object_get(lj, "observed_at_utc")) && json_is_integer(v))
+            l->observed_at_utc = (long long)json_integer_value(v);
         if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
             strlen(json_string_value(v)) == 64) {
             for (size_t i = 0; i < 32; i++) {
@@ -139,6 +151,21 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
                 if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
                     break;
                 l->config_hash[i] = (uint8_t)b;
+            }
+        }
+        if ((v = json_object_get(lj, "gw_mac")) && json_is_string(v) &&
+            strlen(json_string_value(v)) == 2 * HADC_MAC_LEN) {
+            uint8_t mac[HADC_MAC_LEN];
+            size_t i;
+            for (i = 0; i < HADC_MAC_LEN; i++) {
+                unsigned b;
+                if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
+                    break;
+                mac[i] = (uint8_t)b;
+            }
+            if (i == HADC_MAC_LEN) {
+                memcpy(l->gw_mac, mac, sizeof(mac));
+                l->gw_mac_valid = true;
             }
         }
     }
@@ -168,6 +195,9 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         }
     }
 
+    if (out->found)
+        hadc_lease_mark_observed(&out->lease);
+
     json_decref(root);
     return 0;
 }
@@ -177,10 +207,11 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     json_t *lj = lease_json(&ctx->lease);
     if (!lj)
         return -1;
-    json_t *o = json_pack("{s:s, s:I, s:I, s:s, s:s, s:I, s:O}", "role",
+    json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:O}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
                                                          : "unknown",
+                          "master_id", ctx->conf.designated_master,
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
                           (json_int_t)ctx->acked_version, "interface", ctx->conf.interface,
                           "conf_sha256", ctx->conf.sha256, "saved_at_utc",

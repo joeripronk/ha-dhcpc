@@ -28,9 +28,19 @@ typedef struct {
     struct in_addr address;
     unsigned prefixlen;
     struct in_addr gateway;    /* 0 = no default route */
+    uint8_t gw_mac[HADC_MAC_LEN]; /* cached gateway lladdr from the lease */
+    bool gw_mac_valid;         /* program the gateway neighbor entry */
+    struct in_addr backup_gateway; /* apply.backup_gateway; 0 = off */
+    bool backup_route;         /* install the backup default route (slave only) */
     struct in_addr dns[HADC_DNS_MAX];
     size_t n_dns;
     bool add_routes;           /* apply.routes */
+    /* Virtual/shared cluster addresses, copied from the effective config.
+     * Present only while this node is the master; removed again on demotion. */
+    bool cluster_addrs_present;
+    hadc_cluster_if_t cluster_ifaces[HADC_CLUSTER_IF_MAX];
+    size_t n_cluster_ifaces;
+    uint8_t link_state;        /* 0 = leave as-is, 1 = ensure up, 2 = ensure down */
     hadc_hash_t config_hash;   /* canonical desired-state digest */
 } hadc_desired_t;
 
@@ -52,5 +62,14 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired,
  * when already up). Called on promotion: the new master must be able to
  * speak DHCP. */
 int hadc_executor_link_up(const char *ifname);
+
+/* Send gratuitous ARP for every configured cluster IPv4 address (called on
+ * promotion when apply.announce_gratuitous is true). IPv4 only for now. */
+int hadc_executor_announce_cluster(hadc_ctx_t *ctx);
+
+/* Observe the gateway's hardware address from this node's neighbor table
+ * (master-side cache population: only states the kernel would actually use
+ * for forwarding count). 0 = learned, -1 = nothing resolved. */
+int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN]);
 
 #endif /* HA_DHCPC_EXECUTOR_H */

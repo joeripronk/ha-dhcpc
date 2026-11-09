@@ -14,6 +14,8 @@
 #define HADC_MEMBERS_MAX   16
 #define HADC_DNS_MAX       8
 #define HADC_OPTS_MAX      32
+#define HADC_CLUSTER_IF_MAX   8
+#define HADC_CLUSTER_ADDR_MAX 16
 
 typedef enum {
     HADC_ROLE_UNKNOWN = 0,
@@ -41,6 +43,19 @@ typedef struct {
     struct in_addr sync_address; /* distinct per-node secondary addr, plan §2.2 */
     int priority;                /* mirrors that node's local overlay; default-role election */
 } hadc_member_t;
+
+/* Cluster (virtual/shared) address: configured per interface, owned only by
+ * the master. prefixlen is the CIDR prefix (e.g. 24 for 192.168.10.1/24). */
+typedef struct {
+    struct in_addr address;
+    unsigned prefixlen;
+} hadc_cluster_addr_t;
+
+typedef struct {
+    char interface[HADC_IFNAME_MAX];
+    hadc_cluster_addr_t addrs[HADC_CLUSTER_ADDR_MAX];
+    size_t n_addrs;
+} hadc_cluster_if_t;
 
 static inline bool hadc_mac_equal(const uint8_t a[HADC_MAC_LEN], const uint8_t b[HADC_MAC_LEN])
 {

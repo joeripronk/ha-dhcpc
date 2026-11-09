@@ -53,6 +53,7 @@ typedef struct {
     hadc_hash_t acked_config_hash;
     char conf_sha256[HADC_CONF_SHA_HEX]; /* last conf-ack digest from this member */
     int64_t clock_offset_ms;      /* peer CLOCK_REALTIME - ours, last heartbeat; 0 = unobserved */
+    char master_view[HADC_NODE_ID_MAX]; /* peer's master_id from its last heartbeat */
     bool alive;
 } hadc_peer_t;
 

@@ -16,6 +16,7 @@ typedef struct hadc_ctx hadc_ctx_t;
 typedef struct {
     bool found;                  /* false => fresh start */
     hadc_role_t role;
+    char master_id[HADC_NODE_ID_MAX]; /* cluster-wide master at save time */
     uint64_t lease_version;
     uint64_t acked_version;
     hadc_lease_t lease;          /* last known good (monotonic remainders) */

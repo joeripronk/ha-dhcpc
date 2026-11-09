@@ -31,10 +31,11 @@
 typedef struct {
     /* identity: per-node fields come from the local overlay */
     char self[HADC_NODE_ID_MAX];
-    int priority; /* mirrors this node's keepalived priority */
+    int priority; /* failover priority (higher wins) */
 
     /* shared cluster membership */
-    char designated_master[HADC_NODE_ID_MAX];
+    char designated_master[HADC_NODE_ID_MAX]; /* runtime master (may be elected) */
+    char seed_master[HADC_NODE_ID_MAX];       /* file-provided cold-start seed */
     uint8_t master_mac[HADC_MAC_LEN];
     hadc_member_t members[HADC_MEMBERS_MAX];
     size_t n_members;
@@ -45,9 +46,13 @@ typedef struct {
     struct {
         uint16_t port;                 /* UDP cluster transport, shared link */
         uint32_t heartbeat_ms;
-        uint32_t election_deadline_ms; /* dead-master detection, alarm-only v1 */
-        hadc_quorum_mode_t quorum;     /* alarm-only v1 */
+        uint32_t election_deadline_ms; /* dead-master detection before failover */
+        hadc_quorum_mode_t quorum;     /* majority (default) or none */
         uint32_t cluster_timeout_ms;   /* default-role bootstrap deadline, 0=off */
+        /* Virtual/shared addresses owned by the master, keyed by interface.
+         * Order and contents are part of the shared document. */
+        hadc_cluster_if_t ifaces[HADC_CLUSTER_IF_MAX];
+        size_t n_ifaces;
     } cluster;
     bool default_role_master;          /* adopt when no master is known (plan §4) */
     struct {
@@ -63,12 +68,17 @@ typedef struct {
     } dhcp;
     struct {
         bool routes;
+        struct in_addr backup_gateway; /* 0 = off; higher-metric default route
+                                        * installed while this node is a slave
+                                        * and removed again on promotion */
         char dns_hook[HADC_PATH_MAX];  /* empty = no hook */
         char ddclient[HADC_PATH_MAX];  /* empty = off; run as a one-shot when the
                                         * applied address changes (master-only) */
-        bool suppress_member_dad;
-        bool arp_responder;            /* built-in, master-only */
-        bool announce_gratuitous;      /* gARP/unsolicited NA on promotion */
+        bool suppress_member_dad;      /* compatibility no-op */
+        bool arp_responder;            /* compatibility no-op (VIP owner answers) */
+        bool announce_gratuitous;      /* gratuitous ARP on promotion */
+        bool slave_link_down;          /* administratively bring the DHCP link
+                                        * down while this node is a slave */
     } apply;
     char ctl_socket[HADC_PATH_MAX];
     /* Engine lease DB (the dhclient-compatible lease file the core reads at

@@ -1,9 +1,10 @@
 #!/bin/sh
-# keepalived notify script for ha-dhcpc (plan §4):
+# Optional external-supervisor notify script for ha-dhcpc.
+# ha-dhcpc has built-in failover and VIP ownership; this is only for setups
+# that still want an external supervisor (e.g. keepalived) to drive roles:
 #   notify_master -> ha-dhcpc ctl promote
 #   notify_backup / notify_fault -> ha-dhcpc ctl demote
-# keepalived calls this as: notify.sh <type> <instance> <state> [old_state]
-# v1: only MASTER triggers a promote; anything else demotes.
+# Called as: notify.sh <type> <instance> <state> [old_state]
 set -eu
 
 DHCPC=ha-dhcpc

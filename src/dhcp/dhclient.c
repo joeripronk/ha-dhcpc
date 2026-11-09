@@ -651,6 +651,48 @@ dhcp_core_restart(const char *interface, const char *lease_db)
 	return (0);
 }
 
+int
+dhcp_core_force_discover(const char *interface)
+{
+	struct interface_info *ip;
+
+	if (interface == NULL)
+		return (-1);
+	for (ip = ifi; ip != NULL; ip = ip->next) {
+		if (strcmp(ip->name, interface) != 0 || ip->client == NULL)
+			continue;
+		cancel_timeouts_for(ip);
+		ip->client->state = S_INIT;
+		note("forcing a new DISCOVER on %s", ip->name);
+		state_init(ip);
+		return (0);
+	}
+	return (-1);
+}
+
+int
+dhcp_core_force_renew(const char *interface)
+{
+	struct interface_info *ip;
+
+	if (interface == NULL)
+		return (-1);
+	for (ip = ifi; ip != NULL; ip = ip->next) {
+		if (strcmp(ip->name, interface) != 0 || ip->client == NULL)
+			continue;
+		if (ip->client->active == NULL || ip->client->active->is_bootp)
+			return (-1);
+		clock_gettime(CLOCK_MONOTONIC, &time_now);
+		cur_time = time_now.tv_sec;
+		cancel_timeouts_for(ip);
+		ip->client->state = S_BOUND;
+		note("forcing a RENEW on %s", ip->name);
+		state_bound(ip);
+		return (0);
+	}
+	return (-1);
+}
+
 void
 usage(void)
 {

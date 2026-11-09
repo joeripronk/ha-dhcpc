@@ -325,6 +325,41 @@ static int parse_mac(const char *s, uint8_t out[HADC_MAC_LEN])
     return 0;
 }
 
+/* IPv4 address plus either a prefix length (192.168.10.1/24) or a dotted
+ * netmask (192.168.10.1/255.255.255.0). */
+static int parse_cidr4(const char *s, struct in_addr *out, unsigned *prefixlen)
+{
+    char buf[64];
+    if (!s || strlen(s) >= sizeof(buf))
+        return -1;
+    snprintf(buf, sizeof(buf), "%s", s);
+    char *slash = strchr(buf, '/');
+    if (!slash)
+        return -1;
+    *slash = '\0';
+    if (inet_pton(AF_INET, buf, out) != 1)
+        return -1;
+
+    const char *p = slash + 1;
+    if (strchr(p, '.')) {
+        struct in_addr mask;
+        if (inet_pton(AF_INET, p, &mask) != 1)
+            return -1;
+        uint32_t m = ntohl(mask.s_addr);
+        uint32_t inv = ~m;
+        if (inv & (inv + 1))
+            return -1; /* non-contiguous netmask */
+        *prefixlen = (unsigned)__builtin_popcount(m);
+    } else {
+        char *end;
+        unsigned long v = strtoul(p, &end, 10);
+        if (!*p || *end != '\0' || v > 32)
+            return -1;
+        *prefixlen = (unsigned)v;
+    }
+    return 0;
+}
+
 /* ---- merged loader (base + local overlay, overlay wins) ---- */
 
 int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t *out,
@@ -408,6 +443,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         snprintf(err, errlen, "%s", g_errbuf);
         goto derr;
     }
+    snprintf(out->seed_master, sizeof(out->seed_master), "%s", out->designated_master);
     if (parse_mac(mac, out->master_mac) != 0) {
         snprintf(err, errlen, "config: bad master_mac %s", mac);
         goto derr;
@@ -470,9 +506,83 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->cluster.heartbeat_ms = (uint32_t)v;
     if (get_int(c ? c : root, "election_deadline_ms", &v, 6000, false, "cluster")) goto derr;
     out->cluster.election_deadline_ms = (uint32_t)v;
-    out->cluster.quorum = HADC_QUORUM_MAJORITY;
+    const char *q = "majority";
+    json_t *qv = c ? json_object_get(c, "quorum") : NULL;
+    if (qv && !json_is_string(qv)) {
+        snprintf(err, errlen, "config: cluster.quorum must be a string");
+        goto derr;
+    }
+    if (qv)
+        q = json_string_value(qv);
+    if (!strcmp(q, "majority"))
+        out->cluster.quorum = HADC_QUORUM_MAJORITY;
+    else if (!strcmp(q, "none"))
+        out->cluster.quorum = HADC_QUORUM_NONE;
+    else {
+        snprintf(err, errlen, "config: unknown cluster.quorum %s", q);
+        goto derr;
+    }
     if (get_int(c ? c : root, "cluster_timeout_ms", &v, 0, false, "cluster")) goto derr;
     out->cluster.cluster_timeout_ms = (uint32_t)v;
+
+    /* cluster.addresses: interface name -> list of address/prefix entries.
+     * Every member loads the same list; only the master puts them on the
+     * interface. */
+    json_t *ca = c ? json_object_get(c, "addresses") : NULL;
+    if (ca) {
+        if (!json_is_object(ca)) {
+            snprintf(err, errlen, "config: cluster.addresses must be a mapping");
+            goto derr;
+        }
+        const char *ifname;
+        json_t *list;
+        json_object_foreach(ca, ifname, list) {
+            if (!*ifname || strlen(ifname) >= HADC_IFNAME_MAX) {
+                snprintf(err, errlen, "config: bad cluster.address interface '%s'", ifname);
+                goto derr;
+            }
+            if (!json_is_array(list)) {
+                snprintf(err, errlen, "config: cluster.addresses.%s must be a list", ifname);
+                goto derr;
+            }
+            /* The per-node overlay may replace an interface's list wholesale. */
+            hadc_cluster_if_t *ci = NULL;
+            for (size_t i = 0; i < out->cluster.n_ifaces; i++)
+                if (!strcmp(out->cluster.ifaces[i].interface, ifname)) {
+                    ci = &out->cluster.ifaces[i];
+                    ci->n_addrs = 0;
+                    break;
+                }
+            if (!ci) {
+                if (out->cluster.n_ifaces >= HADC_CLUSTER_IF_MAX) {
+                    snprintf(err, errlen, "config: too many cluster.address interfaces");
+                    goto derr;
+                }
+                ci = &out->cluster.ifaces[out->cluster.n_ifaces++];
+                snprintf(ci->interface, sizeof(ci->interface), "%s", ifname);
+            }
+            json_t *e;
+            size_t idx;
+            json_array_foreach(list, idx, e) {
+                if (ci->n_addrs >= HADC_CLUSTER_ADDR_MAX) {
+                    snprintf(err, errlen, "config: too many cluster addresses on %s", ifname);
+                    goto derr;
+                }
+                if (!json_is_string(e)) {
+                    snprintf(err, errlen, "config: cluster.addresses.%s entries must be strings",
+                             ifname);
+                    goto derr;
+                }
+                hadc_cluster_addr_t *a = &ci->addrs[ci->n_addrs];
+                if (parse_cidr4(json_string_value(e), &a->address, &a->prefixlen) != 0) {
+                    snprintf(err, errlen, "config: bad cluster address '%s' on %s (want "
+                             "address/prefix)", json_string_value(e), ifname);
+                    goto derr;
+                }
+                ci->n_addrs++;
+            }
+        }
+    }
 
     const char *dr = "slave";
     json_t *drv = json_object_get(root, "default_role");
@@ -541,6 +651,21 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     } else {
         out->apply.routes = true;
     }
+    out->apply.backup_gateway.s_addr = 0;
+    json_t *bg = a ? json_object_get(a, "backup_gateway") : NULL;
+    /* null and bare false count as "off" (YAML resolves off/~ that way). */
+    if (bg && !json_is_null(bg) && !(json_is_boolean(bg) && !json_is_true(bg))) {
+        if (!json_is_string(bg)) {
+            snprintf(err, errlen, "config: apply.backup_gateway must be an IPv4 address");
+            goto derr;
+        }
+        const char *bgs = json_string_value(bg);
+        if (*bgs && strcmp(bgs, "none") && strcmp(bgs, "off") && strcmp(bgs, "no") &&
+            inet_pton(AF_INET, bgs, &out->apply.backup_gateway) != 1) {
+            snprintf(err, errlen, "config: bad apply.backup_gateway %s", bgs);
+            goto derr;
+        }
+    }
     snprintf(out->apply.dns_hook, HADC_PATH_MAX, "%s",
              (a && json_object_get(a, "dns_hook") && json_is_string(json_object_get(a, "dns_hook")))
                  ? json_string_value(json_object_get(a, "dns_hook"))
@@ -552,10 +677,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.suppress_member_dad = true;
     out->apply.arp_responder = true;
     out->apply.announce_gratuitous = true;
+    out->apply.slave_link_down = false;
     if (a) {
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
+        if (get_bool(a, "slave_link_down", &out->apply.slave_link_down, false)) goto derr;
     }
 
     if (get_str(root, "ctl_socket", out->ctl_socket, HADC_PATH_MAX, false, "config")) goto derr;

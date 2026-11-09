@@ -14,8 +14,9 @@ if ! grep -q '^CONFIG_PACKAGE_ha-dhcpc=' "$SDK/.config"; then
 fi
 
 # Force re-prepare so the current source tree is always what gets built.
-rm -rf "$SDK"/build_dir/target-*/ha-dhcpc-* \
-       "$SDK"/staging_dir/target-*/stamp/.ha-dhcpc_installed
+# is this really needed?
+#rm -rf "$SDK"/build_dir/target-*/ha-dhcpc-* \
+#       "$SDK"/staging_dir/target-*/stamp/.ha-dhcpc_installed
 
 ( cd "$SDK" && umask 022 && make -j"$(nproc)" package/ha-dhcpc/compile V=${V:-s} )
 

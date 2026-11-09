@@ -41,6 +41,11 @@ int main(void)
     inet_pton(AF_INET, "8.8.8.8", &a->lease.dns[0]);
     inet_pton(AF_INET, "1.1.1.1", &a->lease.dns[1]);
     a->lease.n_dns = 2;
+    {
+        static const uint8_t want_mac[HADC_MAC_LEN] = { 0x02, 0x00, 0x11, 0x22, 0x33, 0x44 };
+        memcpy(a->lease.gw_mac, want_mac, HADC_MAC_LEN);
+    }
+    a->lease.gw_mac_valid = true;
     a->lease.t1_remaining_s = 8000;
     a->lease.t2_remaining_s = 10000;
     a->lease.t3_remaining_s = 12000;
@@ -84,6 +89,8 @@ int main(void)
         rc |= fail("timers");
     if (memcmp(pv.lease.config_hash, a->lease.config_hash, 32) != 0)
         rc |= fail("config_hash");
+    if (!pv.lease.gw_mac_valid || memcmp(pv.lease.gw_mac, a->lease.gw_mac, HADC_MAC_LEN) != 0)
+        rc |= fail("gw_mac");
 
     /* Restart recalculates remaining time from UTC (plan §8), with a sanity cap
      * min(2*t3, 24 h) on crazy jumps. */

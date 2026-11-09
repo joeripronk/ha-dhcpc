@@ -2,6 +2,7 @@
  * wins (plan §6), and the digest we sync on is the shared file's bytes only. */
 #define _GNU_SOURCE
 
+#include <arpa/inet.h>
 #include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -279,6 +280,147 @@ int main(void)
             fail("unset ddclient is off");
         else
             ok("unset ddclient is off");
+    }
+
+    /* backup_gateway: parsed from apply, overlay wins, unset is off, bad
+     * values are refused */
+    {
+        struct in_addr want_gw;
+        char with_bg[2048];
+        inet_pton(AF_INET, "192.168.10.1", &want_gw);
+
+        snprintf(with_bg, sizeof(with_bg),
+                 "%sapply:\n  backup_gateway: 192.168.10.1\n", BASE_NOMAC);
+        write_file(base, with_bg);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("backup_gateway parse");
+        else if (conf.apply.backup_gateway.s_addr != want_gw.s_addr)
+            fail("backup_gateway parsed from the shared document");
+        else
+            ok("backup_gateway parsed from the shared document");
+
+        write_file(base, BASE_NOMAC);
+        write_file(local,
+                   "self: node-b\npriority: 90\napply:\n  backup_gateway: 192.168.10.1\n");
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("backup_gateway overlay load");
+        else if (conf.apply.backup_gateway.s_addr != want_gw.s_addr)
+            fail("backup_gateway overlay wins");
+        else
+            ok("backup_gateway overlay wins");
+        write_file(local, "self: node-b\npriority: 90\n");
+
+        write_file(base, BASE_NOMAC);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("unset backup_gateway load");
+        else if (conf.apply.backup_gateway.s_addr != 0)
+            fail("unset backup_gateway is off");
+        else
+            ok("unset backup_gateway is off");
+
+        const char *off_forms[] = {"none", "off", "~"};
+        for (int i = 0; i < 3; i++) {
+            snprintf(with_bg, sizeof(with_bg),
+                     "%sapply:\n  backup_gateway: %s\n", BASE_NOMAC, off_forms[i]);
+            write_file(base, with_bg);
+            if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+                fail("backup_gateway off form load");
+            else if (conf.apply.backup_gateway.s_addr != 0)
+                fail("backup_gateway none/off/~ should be off");
+            else
+                ok("backup_gateway none/off/~ is off");
+        }
+
+        snprintf(with_bg, sizeof(with_bg),
+                 "%sapply:\n  backup_gateway: not-an-address\n", BASE_NOMAC);
+        write_file(base, with_bg);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("bad backup_gateway should be an error");
+        else
+            ok("bad backup_gateway rejected");
+    }
+
+    /* slave_link_down: defaults off, parses from the shared document */
+    {
+        char with_sld[2048];
+
+        write_file(base, BASE_NOMAC);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("slave_link_down default load");
+        else if (conf.apply.slave_link_down)
+            fail("slave_link_down default is off");
+        else
+            ok("slave_link_down default is off");
+
+        snprintf(with_sld, sizeof(with_sld), "%sapply:\n  slave_link_down: true\n", BASE_NOMAC);
+        write_file(base, with_sld);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("slave_link_down parse");
+        else if (!conf.apply.slave_link_down)
+            fail("slave_link_down parsed from the shared document");
+        else
+            ok("slave_link_down parsed from the shared document");
+    }
+
+    /* cluster: quorum defaults to majority; failover priority is explicit */
+    write_file(base, BASE_NOMAC);
+    unlink(local);
+    if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+        fail("cluster defaults load");
+    else if (conf.cluster.quorum != HADC_QUORUM_MAJORITY || conf.cluster.n_ifaces != 0)
+        fail("cluster defaults (majority, no addresses)");
+    else
+        ok("cluster defaults: majority, no addresses");
+
+    {
+        char cbuf[4096];
+        snprintf(cbuf, sizeof(cbuf),
+                 "%s"
+                 "cluster:\n"
+                 "  quorum: none\n"
+                 "  addresses:\n"
+                 "    br-lan:\n"
+                 "      - 192.168.10.1/24\n"
+                 "    br-guest:\n"
+                 "      - 192.168.20.1/255.255.255.0\n",
+                 BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("cluster addresses load");
+        } else if (conf.cluster.quorum != HADC_QUORUM_NONE || conf.cluster.n_ifaces != 2) {
+            fail("cluster quorum=none and two interfaces");
+        } else if (strcmp(conf.cluster.ifaces[0].interface, "br-lan") != 0 ||
+                   conf.cluster.ifaces[0].n_addrs != 1 ||
+                   conf.cluster.ifaces[0].addrs[0].prefixlen != 24 ||
+                   ntohl(conf.cluster.ifaces[0].addrs[0].address.s_addr) != 0xc0a80a01) {
+            fail("cluster br-lan prefix form");
+        } else if (strcmp(conf.cluster.ifaces[1].interface, "br-guest") != 0 ||
+                   conf.cluster.ifaces[1].n_addrs != 1 ||
+                   conf.cluster.ifaces[1].addrs[0].prefixlen != 24 ||
+                   ntohl(conf.cluster.ifaces[1].addrs[0].address.s_addr) != 0xc0a81401) {
+            fail("cluster br-guest dotted-netmask form");
+        } else {
+            ok("cluster addresses: two interfaces, prefix + netmask forms");
+        }
+    }
+
+    const char *bad_cluster[] = {
+        "  addresses:\n    br-lan:\n      - not-an-address/24\n",
+        "  addresses:\n    br-lan:\n      - 192.168.10.1/33\n",
+        "  addresses:\n    br-lan:\n      - 192.168.10.1/255.0.255.0\n",
+        "  addresses:\n    br-lan:\n      - 192.168.10.1\n",
+        "  quorum: sometimes\n",
+    };
+    for (size_t i = 0; i < sizeof(bad_cluster) / sizeof(bad_cluster[0]); i++) {
+        char cbuf[2048];
+        snprintf(cbuf, sizeof(cbuf), "%scluster:\n%s", BASE_NOMAC, bad_cluster[i]);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("bad cluster config should be an error");
+        else
+            ok("bad cluster config rejected");
     }
 
     unlink(base);

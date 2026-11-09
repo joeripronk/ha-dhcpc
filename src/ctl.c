@@ -16,6 +16,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/ctl.h"
+#include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/reload.h"
@@ -51,6 +52,21 @@ static json_t *status_object(hadc_ctx_t *ctx)
                       ctx->peers[i].conf_sha256));
     }
     json_object_set_new(o, "members", members);
+    json_t *cluster = json_array();
+    for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+        const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+        json_t *addrs = json_array();
+        for (size_t j = 0; j < ci->n_addrs; j++) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s/%u", inet_ntoa(ci->addrs[j].address),
+                     ci->addrs[j].prefixlen);
+            json_array_append_new(addrs, json_string(buf));
+        }
+        json_array_append_new(cluster,
+            json_pack("{s:s, s:b, s:o}", "interface", ci->interface, "owned",
+                      ctx->role == HADC_ROLE_MASTER, "addresses", addrs));
+    }
+    json_object_set_new(o, "cluster_addresses", cluster);
     return o;
 }
 
@@ -99,6 +115,16 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             (void)!write(reply_fd, &nl, 1);
             reply = NULL;
             hadc_cluster_push_conf(ctx, NULL);
+        }
+    } else if (!strcmp(cmd, "renew")) {
+        if (ctx->role != HADC_ROLE_MASTER) {
+            hadc_warn("ctl: renew refused here (role %s); only the master speaks DHCP",
+                      role_name(ctx->role));
+            reply = "{\"ok\":false,\"error\":\"not master\"}";
+        } else if (hadc_dhcpcore_force_renew(ctx) != 0) {
+            reply = "{\"ok\":false,\"error\":\"renew failed\"}";
+        } else {
+            hadc_info("ctl: renew forced a DHCPREQUEST");
         }
     } else {
         hadc_warn("ctl: unknown command '%s'", cmd);

@@ -35,6 +35,8 @@ struct hadc_ctx {
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */
 void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 
+bool executor_action_is_fatal(int action_rc, bool action_is_fatal);
+
 /* event loop registration */
 /* Owner cleanup cannot re-establish this fd, so drop its registration when the
  * fd reports EPOLLERR/EPOLLHUP instead of letting it spin the loop. */

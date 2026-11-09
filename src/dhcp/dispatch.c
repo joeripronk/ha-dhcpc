@@ -490,6 +490,29 @@ cancel_timeout(void (*where)(void *), void *what)
 	}
 }
 
+void
+cancel_timeouts_for(void *what)
+{
+	struct timeout *t, *q;
+
+	t = NULL;
+	q = timeouts;
+	while (q) {
+		struct timeout *next = q->next;
+		if (q->what == what) {
+			if (t)
+				t->next = next;
+			else
+				timeouts = next;
+			q->next = free_timeouts;
+			free_timeouts = q;
+		} else {
+			t = q;
+		}
+		q = next;
+	}
+}
+
 /* Add a protocol to the list of protocols... */
 void
 add_protocol(const char *name, int fd, void (*handler)(struct protocol *),
