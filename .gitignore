@@ -4,5 +4,6 @@ build/
 /tests_config
 *.d
 !etc/init.d/
+!production/routers/sysctl.d/
 /ha-dhcpc
 /vendor/
