@@ -1310,9 +1310,12 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
 /* Before this node becomes master, verify every other cluster member is
  * demoted (slave) and not asserting itself as master. A peer that is not
  * currently alive cannot be asserting master; alive peers must report the
- * slave role and must not claim master in their heartbeat view. */
+ * slave role and must not claim master in their heartbeat view. During a
+ * graceful restart promotion need not wait for demotion confirmation. */
 static bool cluster_all_others_demoted(hadc_ctx_t *ctx)
 {
+    if (hadc_cluster_graceful_active(ctx))
+        return true;
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
         hadc_peer_t *p;
