@@ -10,8 +10,15 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
 #include "internal.h"
+
+bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
+{
+    (void)ctx;
+    return false;
+}
 
 /* The event loop lives in main.c; executor.c only links against these. */
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)

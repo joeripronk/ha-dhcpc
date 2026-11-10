@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
 #include "internal.h"
@@ -238,9 +239,9 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
     const char *reason)
 {
     bool present = d->cluster_addrs_present;
+    bool graceful = hadc_cluster_graceful_active(ctx);
     int rc;
 
-    (void)ctx;
     for (size_t i = 0; i < d->n_cluster_ifaces; i++) {
         const hadc_cluster_if_t *ci = &d->cluster_ifaces[i];
         struct rtnl_link *link = rtnl_link_get_by_name(lcache, ci->interface);
@@ -279,8 +280,12 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
                             inet_ntoa(a->address), a->prefixlen, ci->interface, reason);
                 }
             } else if (cur) {
-                /* Any prefix left behind by a previous master is stale. */
-                {
+                /* Graceful restart: keep VIPs in place across shutdown/restart. */
+                if (graceful) {
+                    hadc_dbg("executor: graceful restart active; keeping cluster address %s/%u on %s",
+                        inet_ntoa(a->address), a->prefixlen, ci->interface);
+                } else {
+                    /* Any prefix left behind by a previous master is stale. */
                     if ((rc = rtnl_addr_delete(g_sk, cur, 0)) < 0)
                         hadc_warn("executor: removing cluster address %s/%u from %s failed: %s",
                             inet_ntoa(a->address), a->prefixlen, ci->interface,
@@ -294,7 +299,7 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
     }
 
     /* An address dropped from the shared config must not linger. */
-    if (prev) {
+    if (prev && !graceful) {
         for (size_t i = 0; i < prev->n_cluster_ifaces; i++) {
             const hadc_cluster_if_t *ci = &prev->cluster_ifaces[i];
             struct rtnl_link *link = rtnl_link_get_by_name(lcache, ci->interface);
