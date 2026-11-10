@@ -101,6 +101,11 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
 {
     struct signalfd_siginfo si;
     (void)!read(fd, &si, sizeof(si));
+    if (ctx->role == HADC_ROLE_MASTER)
+        hadc_info("shutdown: role=master lease state=%s t1=%us t2=%us t3=%us",
+                  hadc_lease_state_name(ctx->lease.state),
+                  ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
+                  ctx->lease.t3_remaining_s);
     /* Graceful exit: a master hands the role to the best live peer so the
      * cluster elects a new master immediately. With no live peer (or not the
      * master) it just shuts down and leaves service intact — a lone/partitioned
