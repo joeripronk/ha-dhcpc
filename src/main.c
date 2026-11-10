@@ -222,6 +222,10 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
     if (new_role == HADC_ROLE_MASTER) {
         hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
         hadc_lease_prepare_for_promotion(&ctx->lease);
+        hadc_info("promotion: lease state=%s t1=%us t2=%us t3=%us",
+                  hadc_lease_state_name(ctx->lease.state),
+                  ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
+                  ctx->lease.t3_remaining_s);
         hadc_dhcpcore_start(ctx);
     } else if (old_role == HADC_ROLE_MASTER)
         hadc_dhcpcore_stop(ctx);
@@ -476,6 +480,11 @@ int main(int argc, char **argv)
     }
 
     ctx->running = true;
+    hadc_info("startup: role=%s lease state=%s t1=%us t2=%us t3=%us",
+              ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
+              hadc_lease_state_name(ctx->lease.state),
+              ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
+              ctx->lease.t3_remaining_s);
     hadc_info("running (heartbeat %ums, cluster port %u; roles are automatic "
               "(priority %d), ctl promote/demote still override)",
               ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
