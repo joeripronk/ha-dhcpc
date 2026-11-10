@@ -227,8 +227,15 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                   ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
                   ctx->lease.t3_remaining_s);
         hadc_dhcpcore_start(ctx);
-    } else if (old_role == HADC_ROLE_MASTER)
-        hadc_dhcpcore_stop(ctx);
+    } else {
+        if (old_role == HADC_ROLE_MASTER)
+            hadc_dhcpcore_stop(ctx);
+        if (new_role == HADC_ROLE_SLAVE)
+            hadc_info("demotion: lease state=%s t1=%us t2=%us t3=%us",
+                      hadc_lease_state_name(ctx->lease.state),
+                      ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
+                      ctx->lease.t3_remaining_s);
+    }
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
     if (new_role == HADC_ROLE_MASTER) {
