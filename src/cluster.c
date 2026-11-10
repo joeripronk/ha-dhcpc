@@ -1063,12 +1063,20 @@ static void failover_check(hadc_ctx_t *ctx)
         return;
 
     /* Never promote into a live peer that is already asserting itself as
-     * master; the dual-master reconciliation below settles that case. */
+     * master, and only promote once every other live peer is confirmed
+     * demoted (slave) so no non-slave node is left in the cluster. */
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         hadc_peer_t *p = &ctx->peers[i];
-        if (strcmp(ctx->conf.members[i].id, ctx->conf.self) &&
-            p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
+            continue;
+        if (p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
             return;
+        if (p->alive && strcmp(p->role_view, "slave") != 0) {
+            hadc_info("cluster: failover deferred: %s not confirmed demoted (role=%s)",
+                      ctx->conf.members[i].id,
+                      p->role_view[0] ? p->role_view : "unknown");
+            return;
+        }
     }
 
     hadc_info("cluster: failover: master %s missed the %ums deadline; promoting self "
@@ -1107,6 +1115,16 @@ static void preempt_check(hadc_ctx_t *ctx)
             self = &ctx->conf.members[i];
     if (!self || !beats(self, cur->id, cur->priority))
         return;
+    /* Preemption demotes the current master via role propagation, but only
+     * attempt it once every other live peer is already a confirmed slave. */
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        hadc_peer_t *pp = &ctx->peers[i];
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.self) ||
+            !strcmp(ctx->conf.members[i].id, cur->id))
+            continue;
+        if (pp->alive && strcmp(pp->role_view, "slave") != 0)
+            return;
+    }
     hadc_info("cluster: preempt: promoting self (priority %d outranks live master %s (%d))",
               self->priority, cur->id, cur->priority);
     hadc_cluster_promote(ctx, ctx->conf.self);
@@ -1219,14 +1237,17 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     if (strcmp(winner, ctx->conf.self) != 0)
         return;
 
-    /* Election only elects when no live peer already asserts master; a live
-     * claimant is followed instead (heartbeat path). */
+    /* Election only elects when no live peer already asserts master and every
+     * live peer is confirmed demoted (slave); a live claimant is followed
+     * instead and unknown/non-slave roles mean demotion is not yet confirmed. */
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         hadc_peer_t *p;
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
             continue;
         p = peer_entry(ctx, ctx->conf.members[i].id);
         if (p && p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+            return;
+        if (p && p->alive && strcmp(p->role_view, "slave") != 0)
             return;
     }
 
@@ -1286,6 +1307,36 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
     return 1;
 }
 
+/* Before this node becomes master, verify every other cluster member is
+ * demoted (slave) and not asserting itself as master. A peer that is not
+ * currently alive cannot be asserting master; alive peers must report the
+ * slave role and must not claim master in their heartbeat view. */
+static bool cluster_all_others_demoted(hadc_ctx_t *ctx)
+{
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        hadc_peer_t *p;
+
+        if (!strcmp(m->id, ctx->conf.self))
+            continue;
+        p = peer_entry(ctx, m->id);
+        if (!p || !p->alive)
+            continue;
+        if (!strcmp(p->role_view, "master") || !strcmp(p->master_view, m->id)) {
+            hadc_info("cluster: cannot promote: %s is not demoted (role=%s master_view=%s)",
+                      m->id, p->role_view[0] ? p->role_view : "unknown",
+                      p->master_view[0] ? p->master_view : "(none)");
+            return false;
+        }
+        if (strcmp(p->role_view, "slave") != 0) {
+            hadc_info("cluster: cannot promote: %s role not confirmed slave yet (role=%s)",
+                      m->id, p->role_view[0] ? p->role_view : "unknown");
+            return false;
+        }
+    }
+    return true;
+}
+
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
 {
     const char *target = (new_master_id && *new_master_id) ? new_master_id : ctx->conf.self;
@@ -1297,6 +1348,14 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
     }
     if (hadc_cluster_graceful_active(ctx)) {
         hadc_info("cluster: promote(%s) refused (graceful restart active)", target);
+        return -1;
+    }
+    /* Becoming master requires a unanimous demoted view of all other members:
+     * only promote once every alive peer is confirmed slave and no peer asserts
+     * master. Handoffs make this node a slave and are not a self-promotion. */
+    if (!handoff && !cluster_all_others_demoted(ctx)) {
+        hadc_warn("cluster: promote(%s) refused: not all cluster members are demoted slaves",
+                  target);
         return -1;
     }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
