@@ -101,11 +101,14 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
 {
     struct signalfd_siginfo si;
     (void)!read(fd, &si, sizeof(si));
-    if (ctx->role == HADC_ROLE_MASTER)
-        hadc_info("shutdown: role=master lease state=%s t1=%us t2=%us t3=%us",
-                  hadc_lease_state_name(ctx->lease.state),
-                  ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
-                  ctx->lease.t3_remaining_s);
+    if (ctx->role == HADC_ROLE_MASTER) {
+        hadc_lease_t rl = ctx->lease;
+        if (rl.observed_at_utc != 0)
+            hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+        hadc_info("shutdown: role=master lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                  hadc_lease_state_name(rl.state),
+                  rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+    }
     /* Graceful exit: a master hands the role to the best live peer so the
      * cluster elects a new master immediately. With no live peer (or not the
      * master) it just shuts down and leaves service intact — a lone/partitioned
@@ -227,19 +230,26 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
     if (new_role == HADC_ROLE_MASTER) {
         hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
         hadc_lease_prepare_for_promotion(&ctx->lease);
-        hadc_info("promotion: lease state=%s t1=%us t2=%us t3=%us",
-                  hadc_lease_state_name(ctx->lease.state),
-                  ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
-                  ctx->lease.t3_remaining_s);
+        {
+            hadc_lease_t rl = ctx->lease;
+            if (rl.observed_at_utc != 0)
+                hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+            hadc_info("promotion: lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                      hadc_lease_state_name(rl.state),
+                      rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+        }
         hadc_dhcpcore_start(ctx);
     } else {
         if (old_role == HADC_ROLE_MASTER)
             hadc_dhcpcore_stop(ctx);
-        if (new_role == HADC_ROLE_SLAVE)
-            hadc_info("demotion: lease state=%s t1=%us t2=%us t3=%us",
-                      hadc_lease_state_name(ctx->lease.state),
-                      ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
-                      ctx->lease.t3_remaining_s);
+        if (new_role == HADC_ROLE_SLAVE) {
+            hadc_lease_t rl = ctx->lease;
+            if (rl.observed_at_utc != 0)
+                hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+            hadc_info("demotion: lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                      hadc_lease_state_name(rl.state),
+                      rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+        }
     }
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
@@ -492,11 +502,15 @@ int main(int argc, char **argv)
     }
 
     ctx->running = true;
-    hadc_info("startup: role=%s lease state=%s t1=%us t2=%us t3=%us",
-              ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
-              hadc_lease_state_name(ctx->lease.state),
-              ctx->lease.t1_remaining_s, ctx->lease.t2_remaining_s,
-              ctx->lease.t3_remaining_s);
+    {
+        hadc_lease_t rl = ctx->lease;
+        if (rl.observed_at_utc != 0)
+            hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+        hadc_info("startup: role=%s lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                  ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
+                  hadc_lease_state_name(rl.state),
+                  rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+    }
     hadc_info("running (heartbeat %ums, cluster port %u; roles are automatic "
               "(priority %d), ctl promote/demote still override)",
               ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
