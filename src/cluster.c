@@ -713,7 +713,9 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     if (p && msg.ts_ms != 0 && strcmp(msg.origin, ctx->conf.self))
         p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
 
-    if (msg.graceful_restart_until_ms != ctx->graceful_restart_until_ms &&
+    /* Binary heartbeats have no room for graceful_restart_until_ms; only adopt
+     * from JSON messages that carry the field explicitly. */
+    if (m && msg.graceful_restart_until_ms != ctx->graceful_restart_until_ms &&
         strcmp(msg.origin, ctx->conf.self)) {
         bool from_master = msg.master_id[0] && !strcmp(msg.origin, msg.master_id);
         bool from_designated = ctx->conf.designated_master[0] &&

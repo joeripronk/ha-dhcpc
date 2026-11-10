@@ -206,7 +206,14 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
 
 int hadc_persist_save(hadc_ctx_t *ctx)
 {
-    json_t *lj = lease_json(&ctx->lease);
+    /* t1/t2/t3 are remaining seconds at observed_at_utc and can be stale between
+     * lease events; persist a snapshot aged to now so restarts resume correctly. */
+    hadc_lease_t snap = ctx->lease;
+    if (snap.observed_at_utc != 0)
+        hadc_lease_adjust_elapsed(&snap, (long long)time(NULL) - snap.observed_at_utc);
+    snap.observed_at_utc = (long long)time(NULL);
+
+    json_t *lj = lease_json(&snap);
     if (!lj)
         return -1;
     json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:O}", "role",

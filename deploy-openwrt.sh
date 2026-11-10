@@ -149,11 +149,26 @@ done
 
 # Disable on the master (identity preserved during graceful window); rediscover after restarts.
 if [ "$GRACEFUL" -eq 1 ]; then
-	sleep 3
-	MASTER2=$(find_master || true)
-	if [ -n "$MASTER2" ]; then
-		graceful_ctl "$MASTER2" disable || graceful_disable_any || true
-	else
-		graceful_disable_any || true
-	fi
+	MASTER2=""
+	tries=0
+	max_tries=60
+	while [ -z "${MASTER2:-}" ]; do
+		if [ "$tries" -ge "$max_tries" ]; then
+			echo
+			echo "graceful-restart: timed out waiting for a single master after deploy; attempting disable on any host (window will expire automatically if that fails)" >&2
+			graceful_disable_any || true
+			exit 1
+		fi
+		sleep 3
+		tries=$((tries + 1))
+		MASTER2=$(find_master 2>&1 | tail -n 1 || true)
+		case "$MASTER2" in
+		""|*" "*|*"graceful-restart:"*|*"status:"*)
+			MASTER2=""
+			echo -n "."
+			;;
+		esac
+	done
+	echo
+	graceful_ctl "$MASTER2" disable || graceful_disable_any || true
 fi
