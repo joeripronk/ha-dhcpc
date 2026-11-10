@@ -47,6 +47,7 @@ typedef struct {
     hadc_cluster_if_t cluster_ifaces[HADC_CLUSTER_IF_MAX];
     size_t n_cluster_ifaces;
     uint8_t link_state;        /* 0 = leave as-is, 1 = ensure up, 2 = ensure down */
+    bool slave_nft_block;      /* block all egress via nft while slave (link up) */
     hadc_hash_t config_hash;   /* canonical desired-state digest */
 } hadc_desired_t;
 
@@ -88,6 +89,9 @@ json_t *hadc_executor_status(void);
  * when already up). Called on promotion: the new master must be able to
  * speak DHCP. */
 int hadc_executor_link_up(const char *ifname);
+
+/* Remove any nft egress block installed for slave isolation on ifname. */
+void hadc_executor_clear_slave_isolation(const char *ifname);
 
 /* Send gratuitous ARP for every configured cluster IPv4 address (called on
  * promotion when apply.announce_gratuitous is true). IPv4 only for now. */

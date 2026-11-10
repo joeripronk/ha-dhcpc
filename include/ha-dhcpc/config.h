@@ -86,8 +86,9 @@ typedef struct {
         bool suppress_member_dad;      /* compatibility no-op */
         bool arp_responder;            /* compatibility no-op (VIP owner answers) */
         bool announce_gratuitous;      /* gratuitous ARP on promotion */
-        bool slave_link_down;          /* administratively bring the DHCP link
-                                        * down while this node is a slave */
+        bool slave_link_down;          /* legacy alias for slave_isolation=down */
+        hadc_slave_isolation_t slave_isolation; /* how a slave isolates the DHCP
+                                                 * interface (none/down/nft) */
         bool gateway_probe;            /* master: ping lease gateway for liveness */
         uint32_t gateway_probe_interval_ms; /* probe interval, ms */
         uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */

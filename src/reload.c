@@ -94,7 +94,7 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.apply.routes != ctx->conf.apply.routes ||
         next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||
         next.apply.master_backup_gateway.s_addr != ctx->conf.apply.master_backup_gateway.s_addr ||
-        next.apply.slave_link_down != ctx->conf.apply.slave_link_down ||
+        next.apply.slave_isolation != ctx->conf.apply.slave_isolation ||
         next.apply.gateway_probe != ctx->conf.apply.gateway_probe ||
         next.apply.gateway_probe_interval_ms != ctx->conf.apply.gateway_probe_interval_ms ||
         next.apply.gateway_probe_timeout_ms != ctx->conf.apply.gateway_probe_timeout_ms ||

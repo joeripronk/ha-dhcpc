@@ -557,6 +557,8 @@ int main(int argc, char **argv)
     hadc_gwping_stop(ctx);
     if (hadc_cluster_graceful_active(ctx))
         hadc_info("graceful restart active: leaving cluster/VIP state applied on exit");
+    else
+        hadc_executor_clear_slave_isolation(ctx->conf.interface);
     hadc_persist_save(ctx);
     return 0;
 }

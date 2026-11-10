@@ -398,7 +398,7 @@ int main(void)
             ok("bad master_backup_gateway rejected");
     }
 
-    /* slave_link_down: defaults off, parses from the shared document */
+    /* slave_link_down/slave_isolation: defaults off, parses and aliases */
     {
         char with_sld[2048];
 
@@ -406,7 +406,7 @@ int main(void)
         unlink(local);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("slave_link_down default load");
-        else if (conf.apply.slave_link_down)
+        else if (conf.apply.slave_link_down || conf.apply.slave_isolation != HADC_SLAVE_ISO_NONE)
             fail("slave_link_down default is off");
         else
             ok("slave_link_down default is off");
@@ -415,10 +415,19 @@ int main(void)
         write_file(base, with_sld);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("slave_link_down parse");
-        else if (!conf.apply.slave_link_down)
+        else if (!conf.apply.slave_link_down || conf.apply.slave_isolation != HADC_SLAVE_ISO_DOWN)
             fail("slave_link_down parsed from the shared document");
         else
             ok("slave_link_down parsed from the shared document");
+
+        snprintf(with_sld, sizeof(with_sld), "%sapply:\n  slave_isolation: nft\n", BASE_NOMAC);
+        write_file(base, with_sld);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("slave_isolation nft parse");
+        else if (conf.apply.slave_isolation != HADC_SLAVE_ISO_NFT_EGRESS || conf.apply.slave_link_down)
+            fail("slave_isolation nft parsed");
+        else
+            ok("slave_isolation nft parsed");
     }
 
     /* cluster: quorum defaults to majority; failover priority is explicit */

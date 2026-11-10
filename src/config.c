@@ -709,6 +709,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.arp_responder = true;
     out->apply.announce_gratuitous = true;
     out->apply.slave_link_down = false;
+    out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
     out->apply.gateway_probe = true;
     out->apply.gateway_probe_interval_ms = 10000;
     out->apply.gateway_probe_timeout_ms = 2000;
@@ -720,6 +721,29 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
         if (get_bool(a, "slave_link_down", &out->apply.slave_link_down, false)) goto derr;
+        {
+            json_t *iso = json_object_get(a, "slave_isolation");
+            if (iso) {
+                if (!json_is_string(iso)) {
+                    snprintf(err, errlen, "config: slave_isolation must be a string");
+                    goto derr;
+                }
+                const char *s = json_string_value(iso);
+                if (!strcmp(s, "none") || !strcmp(s, "off"))
+                    out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
+                else if (!strcmp(s, "down") || !strcmp(s, "link_down"))
+                    out->apply.slave_isolation = HADC_SLAVE_ISO_DOWN;
+                else if (!strcmp(s, "nft") || !strcmp(s, "nft_egress"))
+                    out->apply.slave_isolation = HADC_SLAVE_ISO_NFT_EGRESS;
+                else {
+                    snprintf(err, errlen, "config: unknown slave_isolation %s", s);
+                    goto derr;
+                }
+            } else if (out->apply.slave_link_down) {
+                out->apply.slave_isolation = HADC_SLAVE_ISO_DOWN;
+            }
+        }
+        out->apply.slave_link_down = (out->apply.slave_isolation == HADC_SLAVE_ISO_DOWN);
         if (get_bool(a, "gateway_probe", &out->apply.gateway_probe, true)) goto derr;
         if (get_int(a, "gateway_probe_interval_ms", &v, 10000, false, "apply")) goto derr;
         if (v < 100 || v > 3600000) {

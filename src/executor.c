@@ -39,6 +39,7 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d);
 static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
                                  const char *reason, bool from_drift);
 static void monitor_ready(hadc_ctx_t *ctx, int fd);
+static void apply_slave_nft_block(const char *ifname, bool block, const char *reason);
 
 static struct nl_sock *g_sk;
 
@@ -139,11 +140,11 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
     inet_ntop(AF_INET, &d->backup_gateway, backup, sizeof(backup));
     inet_ntop(AF_INET, &d->default_via, via, sizeof(via));
     json_t *o = json_pack(
-        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s}", "interface", d->interface,
+        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b}", "interface", d->interface,
         "present", d->present, "address", addr, "prefixlen", (json_int_t)d->prefixlen,
         "gateway", gw, "backup_gateway", backup, "backup_route", d->backup_route, "dns", "",
         "routes", d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state,
-        "default_via", via);
+        "default_via", via, "slave_nft_block", d->slave_nft_block);
     json_t *dns = json_array();
     for (size_t i = 0; i < d->n_dns; i++)
         json_array_append_new(dns, json_string(inet_ntoa(d->dns[i])));
@@ -211,12 +212,18 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
     if (ctx->role == HADC_ROLE_SLAVE)
         out->gateway.s_addr = 0;
     out->link_state = 0;
+    out->slave_nft_block = false;
     if (ctx->role == HADC_ROLE_MASTER) {
         out->link_state = 1;
-    } else if (ctx->role == HADC_ROLE_SLAVE && ctx->conf.apply.slave_link_down &&
-               !ctx->shutting_down) {
-        out->link_state = 2;
-        out->present = false;
+    } else if (ctx->role == HADC_ROLE_SLAVE && !ctx->shutting_down) {
+        if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_DOWN) {
+            out->link_state = 2;
+            out->present = false;
+        } else if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_NFT_EGRESS) {
+            out->link_state = 1; /* keep interface up, block egress via nft */
+            out->slave_nft_block = true;
+            out->present = false;
+        }
     }
     /* Master-only failover: while the gateway probe is failing or we have no
      * lease IP yet, the default route goes to the configured backup router and
@@ -1138,6 +1145,8 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 			    desired->interface, reason);
 	}
 
+	apply_slave_nft_block(desired->interface, desired->slave_nft_block, reason);
+
 	if (ctx->conf.apply.dns_hook[0]) {
 		char *argv[2] = { ctx->conf.apply.dns_hook, NULL };
 		run_hook(argv, prev, desired, reason);
@@ -1262,6 +1271,61 @@ int hadc_executor_announce_cluster(hadc_ctx_t *ctx)
     if (announced)
         hadc_info("executor: announced %d cluster address(es) with gratuitous ARP", announced);
     return 0;
+}
+
+/* Block/unblock all egress on an interface via nft netdev hook while keeping
+ * the link up (slave isolation alternative to bringing the link down). */
+static void nft_chain_name(const char *ifname, char *out, size_t outsz)
+{
+	size_t j = 0;
+	for (size_t i = 0; ifname[i] && j + 1 < outsz; i++) {
+		unsigned char c = (unsigned char)ifname[i];
+		out[j++] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		           (c >= '0' && c <= '9') || c == '_'
+		               ? (char)c
+		               : '_';
+	}
+	out[j] = '\0';
+}
+
+static void apply_slave_nft_block(const char *ifname, bool block, const char *reason)
+{
+	char chain[HADC_IFNAME_MAX * 2 + 16];
+	char cmd[512];
+	int rc;
+
+	if (!ifname[0])
+		return;
+	nft_chain_name(ifname, chain, sizeof(chain));
+
+	if (block) {
+		snprintf(cmd, sizeof(cmd),
+		    "nft 'add table netdev ha_dhcpc' 2>/dev/null; "
+		    "nft 'delete chain netdev ha_dhcpc %s' 2>/dev/null; "
+		    "nft 'add chain netdev ha_dhcpc %s { type filter hook egress device \"%s\" priority 0; policy drop; }'",
+		    chain, chain, ifname);
+		rc = system(cmd);
+		if (rc == 0)
+			hadc_info("executor: nft egress block enabled on %s (reason=%s)", ifname, reason);
+		else
+			hadc_warn("executor: enabling nft egress block on %s failed (rc=%d, reason=%s)",
+			    ifname, rc, reason);
+	} else {
+		snprintf(cmd, sizeof(cmd),
+		    "nft 'delete chain netdev ha_dhcpc %s' 2>/dev/null; "
+		    "nft 'delete table netdev ha_dhcpc' 2>/dev/null", chain);
+		rc = system(cmd);
+		if (rc == 0)
+			hadc_dbg("executor: nft egress block cleared for %s (reason=%s)", ifname, reason);
+		else
+			hadc_dbg("executor: nft egress block clear for %s returned rc=%d (reason=%s)",
+			    ifname, rc, reason);
+	}
+}
+
+void hadc_executor_clear_slave_isolation(const char *ifname)
+{
+	apply_slave_nft_block(ifname, false, "SHUTDOWN");
 }
 
 /* Hand-built RTM_SETLINK, matching the addr/route helpers above. */

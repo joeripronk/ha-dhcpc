@@ -35,6 +35,12 @@ typedef enum {
     HADC_QUORUM_NONE,
 } hadc_quorum_mode_t;
 
+typedef enum {
+    HADC_SLAVE_ISO_NONE = 0,      /* slave leaves the DHCP link as-is */
+    HADC_SLAVE_ISO_DOWN = 1,      /* slave administratively brings link down */
+    HADC_SLAVE_ISO_NFT_EGRESS = 2,/* slave blocks all egress via nft (link up) */
+} hadc_slave_isolation_t;
+
 /* sha256 of the canonical desired state; computed by the executor. */
 typedef uint8_t hadc_hash_t[32];
 

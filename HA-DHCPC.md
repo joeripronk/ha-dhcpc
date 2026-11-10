@@ -295,7 +295,10 @@ apply:
   suppress_member_dad: true  # compatibility no-op (only the master owns the VIP)
   arp_responder: true        # compatibility no-op (the kernel answers on the owner)
   announce_gratuitous: true  # gratuitous ARP to the switch on promotion
-  slave_link_down: false     # administratively bring the DHCP link down on slaves
+  # slave_isolation: down    # slave behavior: none|down|nft (nft blocks all
+                             # egress via netdev hook while link stays up;
+                             # tcpdump still sees outbound). slave_link_down: true
+                             # remains a legacy alias for down.
 ctl_socket: /run/ha-dhcpc.ctl
 lease_file: dhclient.leases  # optional; relative names resolve against this
                              # file's directory (/etc/ha-dhcpc/); none/off opts
