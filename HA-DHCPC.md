@@ -177,14 +177,16 @@ Components:
   applied config; it resumes at RENEW/REBIND timers against the pinned server-id on
   the synced lease — no DISCOVER, no config churn — adds the cluster addresses and
   announces them with a gratuitous ARP.
-- **Gateway probes:** after a promote the master pings the lease gateway at once
-  and then every 10 s (2 s reply timeout) to surface a silent uplink outage in
-  the log — warn on first failure only (repeats at debug), info when it answers
-  again. While a probe is unanswered, or while there is no lease IP yet, the
-  default route moves to `apply.master_backup_gateway` if it is set, and hands
-  back to the lease gateway as soon as the gateway answers again. Gateways that
-  filter ICMP echo therefore also trigger the failover (routing/ARP is
-  otherwise unaffected).
+- **Gateway probes:** after a promote (or master startup) the master pings the
+  lease gateway when `apply.gateway_probe` is enabled (default true), using
+  `apply.gateway_probe_interval_ms` (default 10000), `apply.gateway_probe_timeout_ms`
+  (default 2000), and `apply.gateway_probe_fail_threshold` (default 3). It
+  surfaces silent uplink outages in the log — warn on first failover-threshold
+  failure (repeats at debug), info when it answers again. While a probe verdict
+  is unreachable, or while there is no lease IP yet, the default route moves to
+  `apply.master_backup_gateway` if it is set, and hands back to the lease
+  gateway as soon as the gateway answers again. Gateways that filter ICMP echo
+  therefore also trigger the failover (routing/ARP is otherwise unaffected).
 - **Safety rules:** only the master sends DHCP packets; only the master may
   DECLINE/RELEASE; slaves never expire the lease; a node in the minority partition
   keeps its config (retention) and does not self-promote (`quorum: majority`);

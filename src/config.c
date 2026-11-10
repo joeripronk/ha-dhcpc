@@ -688,11 +688,34 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.arp_responder = true;
     out->apply.announce_gratuitous = true;
     out->apply.slave_link_down = false;
+    out->apply.gateway_probe = true;
+    out->apply.gateway_probe_interval_ms = 10000;
+    out->apply.gateway_probe_timeout_ms = 2000;
+    out->apply.gateway_probe_fail_threshold = 3;
     if (a) {
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
         if (get_bool(a, "slave_link_down", &out->apply.slave_link_down, false)) goto derr;
+        if (get_bool(a, "gateway_probe", &out->apply.gateway_probe, true)) goto derr;
+        if (get_int(a, "gateway_probe_interval_ms", &v, 10000, false, "apply")) goto derr;
+        if (v < 100 || v > 3600000) {
+            snprintf(err, errlen, "config: gateway_probe_interval_ms out of range 100..3600000");
+            goto derr;
+        }
+        out->apply.gateway_probe_interval_ms = (uint32_t)v;
+        if (get_int(a, "gateway_probe_timeout_ms", &v, 2000, false, "apply")) goto derr;
+        if (v < 100 || v > 3600000) {
+            snprintf(err, errlen, "config: gateway_probe_timeout_ms out of range 100..3600000");
+            goto derr;
+        }
+        out->apply.gateway_probe_timeout_ms = (uint32_t)v;
+        if (get_int(a, "gateway_probe_fail_threshold", &v, 3, false, "apply")) goto derr;
+        if (v < 1 || v > 100) {
+            snprintf(err, errlen, "config: gateway_probe_fail_threshold out of range 1..100");
+            goto derr;
+        }
+        out->apply.gateway_probe_fail_threshold = (uint32_t)v;
     }
 
     if (get_str(root, "ctl_socket", out->ctl_socket, HADC_PATH_MAX, false, "config")) goto derr;

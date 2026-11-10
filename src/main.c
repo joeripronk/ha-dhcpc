@@ -436,8 +436,10 @@ int main(int argc, char **argv)
             hadc_executor_apply(ctx, &desired, HADC_REASON_REBOOT);
         ctx->acked_version = ctx->lease.version;
     }
-    if (ctx->role == HADC_ROLE_MASTER)
+    if (ctx->role == HADC_ROLE_MASTER) {
         hadc_executor_announce_cluster(ctx);
+        hadc_gwping_start(ctx);
+    }
 
     static const hadc_dhcp_callbacks_t cb = { cb_lease_update, cb_retention,
                                               cb_carrier_return };

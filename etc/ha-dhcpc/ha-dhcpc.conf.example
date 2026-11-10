@@ -40,6 +40,10 @@ apply:
   # master_backup_gateway: 192.168.10.3  # master-only: takes over the default
                                   # route while the gateway probe is unanswered
                                   # or there is no lease IP yet
+  gateway_probe: true            # ping lease gateway for liveness (master-only)
+  gateway_probe_interval_ms: 10000  # probe interval (ms)
+  gateway_probe_timeout_ms: 2000    # reply timeout (ms)
+  gateway_probe_fail_threshold: 3   # consecutive misses -> unreachable/failover
   suppress_member_dad: true    # compatibility no-op
   arp_responder: true          # compatibility no-op (the VIP owner answers)
   announce_gratuitous: true    # gratuitous ARP on promotion

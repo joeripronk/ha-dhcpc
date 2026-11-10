@@ -1,9 +1,9 @@
 /* Gateway-reachability probe (layer-3 liveness): after a promote the master
- * pings the lease's gateway immediately and then every second, so a silent
+ * pings the lease's gateway on a configured interval/timeout, so a silent
  * uplink failure is visible in the log and can move the default route to
- * apply.master_backup_gateway while the gateway stays silent (failover after 3
- * consecutive missed replies). Kernel ping sockets (SOCK_DGRAM/ICMP) are tried
- * first, falling back to a raw ICMP socket when unavailable. */
+ * apply.master_backup_gateway while the gateway stays silent. Kernel ping
+ * sockets (SOCK_DGRAM/ICMP) are tried first, falling back to a raw ICMP socket
+ * when unavailable. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/ip.h>
@@ -19,9 +19,6 @@
 #include "ha-dhcpc/log.h"
 #include "internal.h"
 
-#define GWPING_INTERVAL_MS 1000
-#define GWPING_TIMEOUT_MS 1000
-#define GWPING_FAIL_THRESHOLD 3
 /* magic + pid + per-probe seq + padding, so stray echo replies cannot be
  * mistaken for ours (raw sockets also see other processes' ICMP traffic).
  * The total echo packet is the standard 64 bytes: some CPE/DSLAM gear simply
@@ -35,11 +32,13 @@ static bool g_awaiting;     /* probe in flight */
 static bool g_unreachable;  /* failover verdict: threshold misses reached */
 static bool g_unreachable_logged; /* the failover warn went out; repeats are debug */
 
-
 static bool g_probe_logged; /* first success reported at info level */
 static unsigned g_failures; /* consecutive unanswered probes */
 static uint32_t g_seq;
 static uint64_t g_last_send_ms;
+static uint32_t g_interval_ms = 10000;
+static uint32_t g_timeout_ms = 2000;
+static unsigned g_fail_threshold = 3;
 
 static uint16_t icmp_checksum(const void *data, size_t len)
 {
@@ -153,6 +152,13 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
 {
     if (g_fd >= 0)
         return;
+    if (!ctx->conf.apply.gateway_probe)
+        return;
+    g_interval_ms = ctx->conf.apply.gateway_probe_interval_ms;
+    g_timeout_ms = ctx->conf.apply.gateway_probe_timeout_ms;
+    g_fail_threshold = ctx->conf.apply.gateway_probe_fail_threshold;
+    if (g_interval_ms == 0 || g_timeout_ms == 0 || g_fail_threshold == 0)
+        return;
     g_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
     if (g_fd >= 0) {
         /* The kernel demuxes echo replies by the socket's bound ident, so a
@@ -195,8 +201,8 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
     g_probe_logged = false;
     g_failures = 0;
     g_last_send_ms = 0; /* the next tick sends the first probe at once */
-    hadc_info("gwping: gateway probe active (every %dms, failover after %d failures)",
-              GWPING_INTERVAL_MS, GWPING_FAIL_THRESHOLD);
+    hadc_info("gwping: gateway probe active (every %ums, timeout %ums, failover after %u failures)",
+              g_interval_ms, g_timeout_ms, g_fail_threshold);
 }
 
 void hadc_gwping_stop(hadc_ctx_t *ctx)
@@ -219,16 +225,16 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
     if (g_fd < 0)
         return;
     uint64_t now = (uint64_t)hadc_now_ms();
-    if (g_awaiting && now - g_last_send_ms >= GWPING_TIMEOUT_MS) {
+    if (g_awaiting && now - g_last_send_ms >= g_timeout_ms) {
         g_awaiting = false;
         g_failures++;
-        if (g_failures >= GWPING_FAIL_THRESHOLD) {
+        if (g_failures >= g_fail_threshold) {
             if (!g_unreachable_logged) {
                 g_unreachable = true;
                 g_unreachable_logged = true;
-                hadc_warn("gwping: gateway %s unreachable (%u consecutive probes without reply); forcing DHCP renew",
+                hadc_warn("gwping: gateway %s unreachable (%u consecutive probes without reply, timeout %ums); forcing DHCP renew",
                           inet_ntoa((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }),
-                          g_failures);
+                          g_failures, g_timeout_ms);
                 reroute(ctx, "GWPING-FAIL");
                 hadc_dhcpcore_force_renew(ctx);
             } else {
@@ -238,7 +244,7 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
         }
     }
     if (ctx->lease.gateway.s_addr && !g_awaiting &&
-        now - g_last_send_ms >= GWPING_INTERVAL_MS)
+        now - g_last_send_ms >= g_interval_ms)
         send_probe(ctx, now);
 }
 

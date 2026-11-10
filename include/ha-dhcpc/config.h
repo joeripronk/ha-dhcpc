@@ -88,6 +88,10 @@ typedef struct {
         bool announce_gratuitous;      /* gratuitous ARP on promotion */
         bool slave_link_down;          /* administratively bring the DHCP link
                                         * down while this node is a slave */
+        bool gateway_probe;            /* master: ping lease gateway for liveness */
+        uint32_t gateway_probe_interval_ms; /* probe interval, ms */
+        uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */
+        uint32_t gateway_probe_fail_threshold; /* consecutive misses -> unreachable */
     } apply;
     char ctl_socket[HADC_PATH_MAX];
     /* Engine lease DB (the dhclient-compatible lease file the core reads at

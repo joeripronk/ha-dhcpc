@@ -93,7 +93,12 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     int apply = interface_changed || cluster_addrs ||
         next.apply.routes != ctx->conf.apply.routes ||
         next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||
-        next.apply.slave_link_down != ctx->conf.apply.slave_link_down;
+        next.apply.master_backup_gateway.s_addr != ctx->conf.apply.master_backup_gateway.s_addr ||
+        next.apply.slave_link_down != ctx->conf.apply.slave_link_down ||
+        next.apply.gateway_probe != ctx->conf.apply.gateway_probe ||
+        next.apply.gateway_probe_interval_ms != ctx->conf.apply.gateway_probe_interval_ms ||
+        next.apply.gateway_probe_timeout_ms != ctx->conf.apply.gateway_probe_timeout_ms ||
+        next.apply.gateway_probe_fail_threshold != ctx->conf.apply.gateway_probe_fail_threshold;
 
     if (heartbeat)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%sheartbeat", n ? " " : "");
@@ -151,6 +156,9 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         hadc_executor_apply(ctx, &desired, "RELOAD");
         if (ctx->role == HADC_ROLE_MASTER && cluster_addrs)
             hadc_executor_announce_cluster(ctx);
+        hadc_gwping_stop(ctx);
+        if (ctx->role == HADC_ROLE_MASTER)
+            hadc_gwping_start(ctx);
     }
     if (dhcp_knobs)
         hadc_dhcpcore_reload(ctx);
