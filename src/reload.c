@@ -98,7 +98,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.apply.gateway_probe != ctx->conf.apply.gateway_probe ||
         next.apply.gateway_probe_interval_ms != ctx->conf.apply.gateway_probe_interval_ms ||
         next.apply.gateway_probe_timeout_ms != ctx->conf.apply.gateway_probe_timeout_ms ||
-        next.apply.gateway_probe_fail_threshold != ctx->conf.apply.gateway_probe_fail_threshold;
+        next.apply.gateway_probe_fail_threshold != ctx->conf.apply.gateway_probe_fail_threshold ||
+        next.apply.disable_ipv6 != ctx->conf.apply.disable_ipv6 ||
+        next.apply.dhcp_disable_ipv6_set != ctx->conf.apply.dhcp_disable_ipv6_set ||
+        next.apply.dhcp_disable_ipv6 != ctx->conf.apply.dhcp_disable_ipv6;
 
     if (heartbeat)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%sheartbeat", n ? " " : "");

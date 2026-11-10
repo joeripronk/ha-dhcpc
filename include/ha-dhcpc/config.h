@@ -92,6 +92,9 @@ typedef struct {
         uint32_t gateway_probe_interval_ms; /* probe interval, ms */
         uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */
         uint32_t gateway_probe_fail_threshold; /* consecutive misses -> unreachable */
+        bool disable_ipv6;             /* global: disable IPv6 on managed ifaces (default on) */
+        bool dhcp_disable_ipv6_set;    /* override for the DHCP interface */
+        bool dhcp_disable_ipv6;
     } apply;
     char ctl_socket[HADC_PATH_MAX];
     /* Engine lease DB (the dhclient-compatible lease file the core reads at

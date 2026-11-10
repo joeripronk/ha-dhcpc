@@ -55,6 +55,8 @@ typedef struct {
     char interface[HADC_IFNAME_MAX];
     hadc_cluster_addr_t addrs[HADC_CLUSTER_ADDR_MAX];
     size_t n_addrs;
+    bool ipv6_disable_set; /* interface override present */
+    bool ipv6_disable;
 } hadc_cluster_if_t;
 
 static inline bool hadc_mac_equal(const uint8_t a[HADC_MAC_LEN], const uint8_t b[HADC_MAC_LEN])

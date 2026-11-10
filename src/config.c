@@ -568,12 +568,25 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 snprintf(err, errlen, "config: cluster.addresses.%s must be a list", ifname);
                 goto derr;
             }
+            json_t *addr_list = list;
+            json_t *if6 = NULL;
+            if (json_is_object(list)) {
+                addr_list = json_object_get(list, "addresses");
+                if (!addr_list)
+                    addr_list = json_object_get(list, "addrs");
+                if6 = json_object_get(list, "disable_ipv6");
+            }
+            if (!json_is_array(addr_list)) {
+                snprintf(err, errlen, "config: cluster.addresses.%s must be a list or {addresses:[...], disable_ipv6:bool}", ifname);
+                goto derr;
+            }
             /* The per-node overlay may replace an interface's list wholesale. */
             hadc_cluster_if_t *ci = NULL;
             for (size_t i = 0; i < out->cluster.n_ifaces; i++)
                 if (!strcmp(out->cluster.ifaces[i].interface, ifname)) {
                     ci = &out->cluster.ifaces[i];
                     ci->n_addrs = 0;
+                    ci->ipv6_disable_set = false;
                     break;
                 }
             if (!ci) {
@@ -584,9 +597,17 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 ci = &out->cluster.ifaces[out->cluster.n_ifaces++];
                 snprintf(ci->interface, sizeof(ci->interface), "%s", ifname);
             }
+            if (if6) {
+                if (!json_is_boolean(if6)) {
+                    snprintf(err, errlen, "config: cluster.addresses.%s.disable_ipv6 must be a boolean", ifname);
+                    goto derr;
+                }
+                ci->ipv6_disable = json_is_true(if6);
+                ci->ipv6_disable_set = true;
+            }
             json_t *e;
             size_t idx;
-            json_array_foreach(list, idx, e) {
+            json_array_foreach(addr_list, idx, e) {
                 if (ci->n_addrs >= HADC_CLUSTER_ADDR_MAX) {
                     snprintf(err, errlen, "config: too many cluster addresses on %s", ifname);
                     goto derr;
@@ -692,6 +713,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.gateway_probe_interval_ms = 10000;
     out->apply.gateway_probe_timeout_ms = 2000;
     out->apply.gateway_probe_fail_threshold = 3;
+    out->apply.disable_ipv6 = true;
+    out->apply.dhcp_disable_ipv6_set = false;
     if (a) {
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
@@ -716,6 +739,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             goto derr;
         }
         out->apply.gateway_probe_fail_threshold = (uint32_t)v;
+        if (get_bool(a, "disable_ipv6", &out->apply.disable_ipv6, true)) goto derr;
+        if (json_object_get(a, "disable_ipv6_dhcp")) {
+            if (get_bool(a, "disable_ipv6_dhcp", &out->apply.dhcp_disable_ipv6, out->apply.disable_ipv6))
+                goto derr;
+            out->apply.dhcp_disable_ipv6_set = true;
+        }
     }
 
     if (get_str(root, "ctl_socket", out->ctl_socket, HADC_PATH_MAX, false, "config")) goto derr;

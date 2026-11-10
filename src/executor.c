@@ -60,6 +60,56 @@ bool executor_action_is_fatal(int action_rc, bool action_is_fatal)
  * primary (metric 0), so it is used only when that primary is gone. */
 #define HADC_BACKUP_ROUTE_METRIC 100
 
+static void set_ipv6_disabled(const char *ifname, bool disable)
+{
+    char path[128], cur[8];
+    FILE *f;
+    const char want = disable ? '1' : '0';
+
+    if (!ifname[0] || strpbrk(ifname, "./"))
+        return;
+    snprintf(path, sizeof(path), "/proc/sys/net/ipv6/conf/%s/disable_ipv6", ifname);
+    f = fopen(path, "r");
+    if (f) {
+        size_t n = fread(cur, 1, sizeof(cur) - 1, f);
+        cur[n] = '\0';
+        fclose(f);
+        if (cur[0] == want && (cur[1] == '\n' || cur[1] == '\0'))
+            return;
+    }
+    f = fopen(path, "w");
+    if (!f) {
+        hadc_dbg("executor: set disable_ipv6=%c on %s: %s", want, ifname, strerror(errno));
+        return;
+    }
+    if (fwrite(&want, 1, 1, f) == 1)
+        hadc_info("executor: IPv6 %s on %s", disable ? "disabled" : "enabled", ifname);
+    else
+        hadc_dbg("executor: set disable_ipv6=%c on %s: %s", want, ifname, strerror(errno));
+    fclose(f);
+}
+
+static bool cluster_if_disable_ipv6(const hadc_ctx_t *ctx, const char *ifname)
+{
+    for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+        const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+        if (!strcmp(ci->interface, ifname))
+            return ci->ipv6_disable_set ? ci->ipv6_disable : ctx->conf.apply.disable_ipv6;
+    }
+    return ctx->conf.apply.disable_ipv6;
+}
+
+static void apply_disable_ipv6(hadc_ctx_t *ctx)
+{
+    bool dhcp = ctx->conf.apply.dhcp_disable_ipv6_set ?
+        ctx->conf.apply.dhcp_disable_ipv6 : ctx->conf.apply.disable_ipv6;
+    set_ipv6_disabled(ctx->conf.interface, dhcp);
+    for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+        const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+        set_ipv6_disabled(ci->interface, cluster_if_disable_ipv6(ctx, ci->interface));
+    }
+}
+
 int hadc_executor_init(hadc_ctx_t *ctx)
 {
     g_sk = nl_socket_alloc();
@@ -74,7 +124,7 @@ int hadc_executor_init(hadc_ctx_t *ctx)
 		return -1;
 	}
 	hadc_info("executor: netlink ready");
-	(void)ctx;
+	apply_disable_ipv6(ctx);
 	return 0;
 }
 
@@ -1106,6 +1156,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 
 out:
 	if (!fatal) {
+		apply_disable_ipv6(ctx);
 		g_applied = *desired;
 		g_applied_valid = true;
 	}
