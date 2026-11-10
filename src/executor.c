@@ -163,7 +163,8 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
     out->link_state = 0;
     if (ctx->role == HADC_ROLE_MASTER) {
         out->link_state = 1;
-    } else if (ctx->role == HADC_ROLE_SLAVE && ctx->conf.apply.slave_link_down) {
+    } else if (ctx->role == HADC_ROLE_SLAVE && ctx->conf.apply.slave_link_down &&
+               !ctx->shutting_down) {
         out->link_state = 2;
         out->present = false;
     }

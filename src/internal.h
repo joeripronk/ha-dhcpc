@@ -31,6 +31,7 @@ struct hadc_ctx {
     int ctl_fd;    /* unix control socket */
     int udp_fd;    /* cluster transport, bound to local sync_address */
     bool running;
+    bool shutting_down;
 
     /* graceful cluster restart: wall-clock ms deadline (0 = inactive). */
     uint64_t graceful_restart_until_ms;

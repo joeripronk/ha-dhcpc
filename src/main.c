@@ -122,6 +122,7 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
     } else {
         hadc_info("signal %u received; shutting down", si.ssi_signo);
     }
+    ctx->shutting_down = true;
     ctx->running = false;
 }
 
