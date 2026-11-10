@@ -1515,12 +1515,11 @@ dhcpnak(struct packet *packet)
 	    answers_persisted ? " (answers the lease we resumed on)" : "");
 
 	if (!ip->client->active) {
-		note("DHCPNAK with no active lease.\n");
-		return;
+		note("DHCPNAK with no active lease.");
+	} else {
+		free_client_lease(ip->client->active);
+		ip->client->active = NULL;
 	}
-
-	free_client_lease(ip->client->active);
-	ip->client->active = NULL;
 
 	/* Stop sending DHCPREQUEST packets... */
 	cancel_timeout(send_request, ip);

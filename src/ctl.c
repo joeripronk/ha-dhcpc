@@ -32,6 +32,7 @@ static char g_ctl_path[HADC_PATH_MAX]; /* where ctl_fd is bound (rebind check) *
 
 static json_t *status_object(hadc_ctx_t *ctx)
 {
+    bool gr_active = hadc_cluster_graceful_active(ctx);
     json_t *o = json_pack(
         "{s:s, s:s, s:s, s:I, s:b, s:s, s:o}", "role", role_name(ctx->role), "self",
         ctx->conf.self, "master", ctx->conf.designated_master, "lease_version",
@@ -54,6 +55,9 @@ static json_t *status_object(hadc_ctx_t *ctx)
                       ctx->peers[i].role_view[0] ? ctx->peers[i].role_view : "unknown",
                       "master_view", ctx->peers[i].master_view));
     }
+    json_object_set_new(o, "graceful_restart",
+        json_pack("{s:b, s:I}", "active", gr_active, "until_ms",
+                  (json_int_t)ctx->graceful_restart_until_ms));
     json_object_set_new(o, "members", members);
     json_t *cluster = json_array();
     for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
@@ -135,6 +139,18 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
                     "DISCOVER");
         } else {
             hadc_info("ctl: renew forced a DHCPREQUEST");
+        }
+    } else if (!strcmp(cmd, "graceful-restart")) {
+        if (ctx->role != HADC_ROLE_MASTER) {
+            hadc_warn("ctl: graceful-restart refused here (role %s); only the master sets it",
+                      role_name(ctx->role));
+            reply = "{\"ok\":false,\"error\":\"not master\"}";
+        } else if (!strcmp(arg, "enable") || !strcmp(arg, "on")) {
+            hadc_cluster_set_graceful_restart(ctx, true);
+        } else if (!strcmp(arg, "disable") || !strcmp(arg, "off") || !strcmp(arg, "cancel")) {
+            hadc_cluster_set_graceful_restart(ctx, false);
+        } else {
+            reply = "{\"ok\":false,\"error\":\"usage: graceful-restart enable|disable\"}";
         }
     } else {
         hadc_warn("ctl: unknown command '%s'", cmd);

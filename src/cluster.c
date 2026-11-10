@@ -40,7 +40,9 @@ static bool beats(const hadc_member_t *a, const char *b_id, int b_prio);
 static const hadc_member_t *election_winner(hadc_ctx_t *ctx);
 int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz);
 static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
+static void age_peers(hadc_ctx_t *ctx);
 static uint64_t realtime_ms(void);
+static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
 
@@ -67,6 +69,88 @@ static const char *role_name(hadc_role_t r)
 #define HADC_WIRE_HB_LEN       16
 #define HADC_WIRE_IDX_UNKNOWN  255
 #define HADC_WIRE_IDX_NONE     254
+
+
+#define HADC_MSG_GRACEFUL "graceful_restart"
+
+#define HADC_GRACEFUL_WINDOW_MS 180000ULL
+
+bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
+{
+    if (!ctx || ctx->graceful_restart_until_ms == 0)
+        return false;
+    uint64_t now = realtime_ms();
+    if (now >= ctx->graceful_restart_until_ms) {
+        /* expired: clear lazily */
+        ctx->graceful_restart_until_ms = 0;
+        return false;
+    }
+    return true;
+}
+
+void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx)
+{
+    if (ctx->udp_fd < 0)
+        return;
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        if (!strcmp(m->id, ctx->conf.self))
+            continue;
+        json_t *msg = json_pack("{s:s, s:s, s:s, s:I, s:I}", "type", HADC_MSG_GRACEFUL,
+                                "origin", ctx->conf.self, "master_id",
+                                ctx->conf.designated_master, "lease_version",
+                                (json_int_t)ctx->lease.version, "graceful_restart_until_ms",
+                                (json_int_t)ctx->graceful_restart_until_ms);
+        if (!msg)
+            continue;
+        json_object_set_new(msg, "conf_sha256", json_string(ctx->conf.sha256));
+        json_object_set_new(msg, "ts_ms", json_integer((json_int_t)realtime_ms()));
+        json_object_set_new(msg, "role", json_string(role_name(ctx->role)));
+        struct sockaddr_in to = { .sin_family = AF_INET,
+                                  .sin_port = htons(ctx->conf.cluster.port),
+                                  .sin_addr = m->sync_address };
+        if (send_json(ctx, &to, msg) != 0)
+            hadc_warn("cluster: graceful_restart send to %s failed", m->id);
+    }
+}
+
+static void graceful_adopt(hadc_ctx_t *ctx, uint64_t until_ms, const char *from)
+{
+    if (until_ms == ctx->graceful_restart_until_ms)
+        return;
+    /* adopt announced state (enable or cancel/expiry) */
+    ctx->graceful_restart_until_ms = until_ms;
+    if (until_ms == 0)
+        hadc_info("cluster: graceful restart cancelled (from %s)", from ? from : "?");
+    else
+        hadc_info("cluster: graceful restart active until %llu ms realtime (from %s)",
+                  (unsigned long long)until_ms, from ? from : "?");
+    hadc_persist_save(ctx);
+}
+
+int hadc_cluster_set_graceful_restart(hadc_ctx_t *ctx, bool enable)
+{
+    uint64_t until = 0;
+    if (enable)
+        until = realtime_ms() + HADC_GRACEFUL_WINDOW_MS;
+    if (until == ctx->graceful_restart_until_ms && enable == hadc_cluster_graceful_active(ctx))
+        return 0;
+    ctx->graceful_restart_until_ms = until;
+    if (enable)
+        hadc_info("cluster: graceful restart enabled for %llu ms (no master switches)",
+                  (unsigned long long)HADC_GRACEFUL_WINDOW_MS);
+    else
+        hadc_info("cluster: graceful restart disabled");
+    hadc_persist_save(ctx);
+    /* burst so peers persist before restarts; heartbeats/JSON carry it too */
+    for (int i = 0; i < 5; i++) {
+        hadc_cluster_broadcast_graceful(ctx);
+        if (i < 4)
+            usleep(50000);
+    }
+    return 0;
+}
+
 
 static size_t put_be(uint8_t *p, uint64_t v, size_t n)
 {
@@ -370,6 +454,8 @@ static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
      * stale copy (plan §6) */
     json_object_set_new(m, "conf_sha256", json_string(ctx->conf.sha256));
     json_object_set_new(m, "ts_ms", json_integer((json_int_t)realtime_ms()));
+    json_object_set_new(m, "graceful_restart_until_ms",
+                        json_integer((json_int_t)ctx->graceful_restart_until_ms));
     return m;
 }
 
@@ -400,6 +486,9 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
         out->ts_ms = (uint64_t)json_integer_value(v);
     if ((s = json_string_value(json_object_get(m, "role"))))
         snprintf(out->role, sizeof(out->role), "%s", s);
+    v = json_object_get(m, "graceful_restart_until_ms");
+    if (v && json_is_integer(v))
+        out->graceful_restart_until_ms = (uint64_t)json_integer_value(v);
     parse_lease(json_object_get(m, "lease"), &out->lease);
 }
 
@@ -624,6 +713,15 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     if (p && msg.ts_ms != 0 && strcmp(msg.origin, ctx->conf.self))
         p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
 
+    if (msg.graceful_restart_until_ms != ctx->graceful_restart_until_ms &&
+        strcmp(msg.origin, ctx->conf.self)) {
+        bool from_master = msg.master_id[0] && !strcmp(msg.origin, msg.master_id);
+        bool from_designated = ctx->conf.designated_master[0] &&
+            !strcmp(msg.origin, ctx->conf.designated_master);
+        if (from_master || from_designated)
+            graceful_adopt(ctx, msg.graceful_restart_until_ms, msg.origin);
+    }
+
     if (!strcmp(msg.type, HADC_MSG_HEARTBEAT)) {
         static uint64_t last_drift_alarm_ms;
         hadc_dbg("sync: heartbeat from %s (master=%s, role=%s, version=%llu)", msg.origin,
@@ -727,9 +825,14 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             send_to_member(ctx, member_by_id(ctx, msg.origin), rep);
             hadc_info("sync: full_state sent to %s", msg.origin);
         }
+    } else if (!strcmp(msg.type, HADC_MSG_GRACEFUL)) {
+        /* state adopted above */
     } else if (!strcmp(msg.type, HADC_MSG_ROLE_CHANGE)) {
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
-        if (msg.new_master[0]) {
+        if (hadc_cluster_graceful_active(ctx)) {
+            hadc_info("cluster: role_change from %s ignored (graceful restart active)", msg.origin);
+        } else if (msg.new_master[0]) {
+            age_peers(ctx);
             const hadc_member_t *claim = member_by_id(ctx, msg.new_master);
             bool ours = !strcmp(msg.new_master, ctx->conf.self);
             bool authority = !strcmp(msg.origin, ctx->conf.designated_master);
@@ -743,11 +846,11 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
 
             if (!accept && claim && winner && !strcmp(winner->id, claim->id))
                 accept = ctx->conf.cluster.preempt || !master_is_alive(ctx, ctx->conf.designated_master);
-            if (!accept && claim)
-                /* The master we follow (or a peer during the brief post-handoff
-                   election cooldown) may push a lower-ranked member as the new
-                   master; accept that authority to honour an operator handoff. */
-                accept = !authority && (ctx->role == HADC_ROLE_SLAVE) &&
+            if (!accept && claim && winner && !strcmp(winner->id, claim->id))
+                /* During the brief post-handoff election cooldown, accept the
+                   election winner (aged) even when preempt is off, so the
+                   handoff converges. Any other claim is still rejected. */
+                accept = (ctx->role == HADC_ROLE_SLAVE) &&
                     (uint64_t)hadc_now_ms() < g_no_elect_until_ms;
 
             if (!accept) {
@@ -919,6 +1022,8 @@ static void failover_check(hadc_ctx_t *ctx)
     uint32_t deadline = ctx->conf.cluster.election_deadline_ms;
     const hadc_member_t *winner;
 
+    if (hadc_cluster_graceful_active(ctx))
+        return;
     if (ctx->role != HADC_ROLE_SLAVE)
         return;
     if (ctx->conf.n_members <= 1)
@@ -982,6 +1087,8 @@ static void preempt_check(hadc_ctx_t *ctx)
 {
     const hadc_member_t *self = NULL, *cur;
 
+    if (hadc_cluster_graceful_active(ctx))
+        return;
     if (ctx->role != HADC_ROLE_SLAVE)
         return;
     if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
@@ -1008,6 +1115,14 @@ static void preempt_check(hadc_ctx_t *ctx)
 /* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 {
+    if (ctx->graceful_restart_until_ms && !hadc_cluster_graceful_active(ctx)) {
+        /* expired: persist cleared state once */
+        hadc_info("cluster: graceful restart window expired");
+        hadc_persist_save(ctx);
+    }
+    if (hadc_cluster_graceful_active(ctx))
+        hadc_cluster_broadcast_graceful(ctx);
+
     /* Master-side gateway MAC cache: pick up the gateway lladdr from our own
      * resolved neighbor entry (the first ARP after binding may not have
      * answered yet when the lease event fired) and push it so every member
@@ -1059,6 +1174,8 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     const char *winner;
     int wprio;
 
+    if (hadc_cluster_graceful_active(ctx))
+        return;
     if (!ctx->conf.default_role_master)
         return;
     if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
@@ -1132,10 +1249,11 @@ static void propagate_role(hadc_ctx_t *ctx)
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
             continue;
-        json_t *m = json_pack("{s:s, s:s, s:s, s:I, s:s}", "type", HADC_MSG_ROLE_CHANGE, "origin",
+        json_t *m = json_pack("{s:s, s:s, s:s, s:I, s:s, s:I}", "type", HADC_MSG_ROLE_CHANGE, "origin",
                               ctx->conf.self, "master_id", ctx->conf.designated_master,
                               "lease_version", (json_int_t)ctx->lease.version, "new_master",
-                              ctx->conf.designated_master);
+                              ctx->conf.designated_master, "graceful_restart_until_ms",
+                              (json_int_t)ctx->graceful_restart_until_ms);
         struct sockaddr_in to = { .sin_family = AF_INET,
                                   .sin_port = htons(ctx->conf.cluster.port),
                                   .sin_addr = ctx->conf.members[i].sync_address };
@@ -1148,6 +1266,8 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
 {
     char claim[HADC_NODE_ID_MAX];
 
+    if (hadc_cluster_graceful_active(ctx))
+        return 0;
     if (ctx->role != HADC_ROLE_MASTER)
         return 0;
     if (!cluster_startup_claim(ctx, claim, sizeof(claim)))
@@ -1175,6 +1295,10 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         hadc_dbg("cluster: promote(%s) is idempotent (already master)", target);
         return 0;
     }
+    if (hadc_cluster_graceful_active(ctx)) {
+        hadc_info("cluster: promote(%s) refused (graceful restart active)", target);
+        return -1;
+    }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
     set_role(ctx, handoff ? HADC_ROLE_SLAVE : HADC_ROLE_MASTER);
     if (handoff)
@@ -1195,6 +1319,10 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
      * When this node is the master we hand over to the best live peer; with no
      * live peer the VIP is withdrawn and election is suppressed for one
      * deadline so the operator's demote is not immediately undone. */
+    if (hadc_cluster_graceful_active(ctx)) {
+        hadc_info("cluster: demote refused (graceful restart active)");
+        return -1;
+    }
     if (ctx->role != HADC_ROLE_MASTER) {
         set_role(ctx, HADC_ROLE_SLAVE);
         hadc_info("cluster: demoted; master remains %s",
@@ -1230,6 +1358,8 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
      * exists. With no live peer the serving master must not withdraw service
      * (VIP/routes) — it just shuts down and stays master in state, so a
      * restart or partition heal can resume. Returns 1 if a handoff was made. */
+    if (hadc_cluster_graceful_active(ctx))
+        return 0;
     if (ctx->role != HADC_ROLE_MASTER)
         return 0;
     age_peers(ctx);

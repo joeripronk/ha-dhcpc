@@ -10,6 +10,83 @@ APK=${1:-$(ls -t "$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
 echo "deploying $(basename "$APK")"
 
+json_field() {
+	python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin); print(d.get(sys.argv[1],""))
+except Exception:
+ print("")' "$1"
+}
+
+find_master() {
+	for h in $HOSTS; do
+		status=$(ssh -q "root@$h" 'ha-dhcpc ctl status 2>/dev/null' 2>/dev/null || true)
+		[ -n "$status" ] || continue
+		role=$(printf '%s' "$status" | json_field role)
+		if [ "$role" = "master" ]; then
+			echo "$h"
+			return 0
+		fi
+	done
+	return 1
+}
+
+graceful_ctl() {
+	host=$1 action=$2
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		out=$(ssh -q "root@$host" "ha-dhcpc ctl graceful-restart $action" 2>/dev/null || true)
+		case "$out" in
+		*'"ok":true'*|*'"ok": true'*)
+			echo "graceful-restart: $action on $host"
+			return 0
+			;;
+		*not\ master*)
+			echo "graceful-restart: $host is not master; refusing to retry $action" >&2
+			return 1
+			;;
+		*"unknown command"*|*'"ok":false'*|*"error"*)
+			echo "graceful-restart: $action rejected on $host ($out) - daemon may lack support" >&2
+			return 1
+			;;
+		"")
+			;;
+		esac
+		sleep 1
+	done
+	echo "graceful-restart: failed to $action on $host (no response/timeout); daemon may lack graceful-restart support" >&2
+	return 1
+}
+
+graceful_disable_any() {
+	for h in $HOSTS; do
+		out=$(ssh -q "root@$h" "ha-dhcpc ctl graceful-restart disable" 2>/dev/null || true)
+		case "$out" in
+		*'"ok":true'*|*'"ok": true'*)
+			echo "graceful-restart: disable on $h"
+			return 0
+			;;
+		esac
+	done
+	echo "graceful-restart: disable failed on all hosts; window will expire automatically" >&2
+	return 1
+}
+
+MASTER=$(find_master || true)
+GRACEFUL=0
+if [ -n "$MASTER" ]; then
+	if graceful_ctl "$MASTER" enable; then
+		GRACEFUL=1
+		# allow broadcasts/heartbeats to reach and persist on all peers before restarts
+		sleep 3
+	else
+		echo "graceful-restart: enable failed; aborting to avoid downtime. Upgrade master daemon to a version with graceful-restart support, or deploy nodes manually." >&2
+		exit 1
+	fi
+else
+	echo "graceful-restart: master not found; aborting deploy (cannot guarantee no VIP loss). Set a master or deploy manually." >&2
+	exit 1
+fi
+
 for h in $HOSTS; do
 	scp -q "$APK" "root@$h:/tmp/" || { echo "$h: scp failed" >&2; continue; }
 	# --force is required: apk skips same-version installs, so a rebuild of
@@ -18,3 +95,14 @@ for h in $HOSTS; do
 	ssh -q "root@$h" "apk add --allow-untrusted --force '/tmp/$(basename "$APK")' && /etc/init.d/ha-dhcpc restart" \
 		&& echo "$h: ok" || echo "$h: FAILED" >&2
 done
+
+# Disable on the master (identity preserved during graceful window); rediscover after restarts.
+if [ "$GRACEFUL" -eq 1 ]; then
+	sleep 3
+	MASTER2=$(find_master || true)
+	if [ -n "$MASTER2" ]; then
+		graceful_ctl "$MASTER2" disable || graceful_disable_any || true
+	else
+		graceful_disable_any || true
+	fi
+fi

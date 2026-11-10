@@ -26,10 +26,14 @@ struct hadc_ctx {
 
     int epfd;
     int timerfd;   /* heartbeat */
+    int periodicfd; /* 1 s maintenance ticks */
     int core_timerfd; /* DHCP core timers (dhcpcore adapter) */
     int ctl_fd;    /* unix control socket */
     int udp_fd;    /* cluster transport, bound to local sync_address */
     bool running;
+
+    /* graceful cluster restart: wall-clock ms deadline (0 = inactive). */
+    uint64_t graceful_restart_until_ms;
 };
 
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */
@@ -38,13 +42,14 @@ void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 bool executor_action_is_fatal(int action_rc, bool action_is_fatal);
 
 /* gateway-reachability probe (ping.c): master pings the lease gateway every
- * 10 s after a promote; start sends the first probe at once, tick drives the
- * 10 s cadence and reply timeout, results are logged and feed the executor's
- * master default-route failover (apply.master_backup_gateway). */
+ * second after a promote and fails over after 3 consecutive misses; start sends
+ * the first probe at once, tick drives the cadence and reply timeout, results
+ * are logged and feed the executor's master default-route failover
+ * (apply.master_backup_gateway). */
 void hadc_gwping_start(hadc_ctx_t *ctx);
 void hadc_gwping_stop(hadc_ctx_t *ctx);
 void hadc_gwping_tick(hadc_ctx_t *ctx);
-/* last reported verdict: a probe timeout that has not been answered yet */
+/* last reported verdict: failover threshold reached and not yet recovered */
 bool hadc_gwping_unreachable(void);
 
 /* event loop registration */

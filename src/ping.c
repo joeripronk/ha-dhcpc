@@ -1,9 +1,9 @@
 /* Gateway-reachability probe (layer-3 liveness): after a promote the master
- * pings the lease's gateway immediately and then every 10 s, so a silent
+ * pings the lease's gateway immediately and then every second, so a silent
  * uplink failure is visible in the log and can move the default route to
- * apply.master_backup_gateway while the gateway stays silent. Kernel ping
- * sockets (SOCK_DGRAM/ICMP) are tried first, falling back to a raw ICMP socket
- * when unavailable. */
+ * apply.master_backup_gateway while the gateway stays silent (failover after 3
+ * consecutive missed replies). Kernel ping sockets (SOCK_DGRAM/ICMP) are tried
+ * first, falling back to a raw ICMP socket when unavailable. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/ip.h>
@@ -14,12 +14,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
 #include "internal.h"
 
-#define GWPING_INTERVAL_MS 10000
-#define GWPING_TIMEOUT_MS 2000
+#define GWPING_INTERVAL_MS 1000
+#define GWPING_TIMEOUT_MS 1000
+#define GWPING_FAIL_THRESHOLD 3
 /* magic + pid + per-probe seq + padding, so stray echo replies cannot be
  * mistaken for ours (raw sockets also see other processes' ICMP traffic).
  * The total echo packet is the standard 64 bytes: some CPE/DSLAM gear simply
@@ -30,11 +32,12 @@ static const char g_token[16] = "ha-dhcpc-gwping";
 static int g_fd = -1;
 static bool g_raw;          /* kernel ping socket unavailable; raw ICMP */
 static bool g_awaiting;     /* probe in flight */
-static bool g_unreachable;  /* last reported verdict was a timeout */
-static bool g_unreachable_logged; /* the warn went out; repeats are debug */
+static bool g_unreachable;  /* failover verdict: threshold misses reached */
+static bool g_unreachable_logged; /* the failover warn went out; repeats are debug */
 
 
 static bool g_probe_logged; /* first success reported at info level */
+static unsigned g_failures; /* consecutive unanswered probes */
 static uint32_t g_seq;
 static uint64_t g_last_send_ms;
 
@@ -101,10 +104,11 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
         if (pid_net != (uint32_t)getpid() || seq != g_seq || !g_awaiting)
             continue; /* stale or foreign reply */
         g_awaiting = false;
+        g_failures = 0;
         uint64_t rtt = (uint64_t)hadc_now_ms() - g_last_send_ms;
         if (g_unreachable) {
             g_unreachable = false;
-            g_unreachable_logged = false; /* next timeout warns again */
+            g_unreachable_logged = false; /* next failover warns again */
             hadc_info("gwping: gateway reachable again (rtt %llums)",
                       (long long)rtt);
             reroute(ctx, "GWPING-OK");
@@ -189,9 +193,10 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
     g_unreachable = false;
     g_unreachable_logged = false;
     g_probe_logged = false;
+    g_failures = 0;
     g_last_send_ms = 0; /* the next tick sends the first probe at once */
-    hadc_info("gwping: gateway probe active (every %ds after promote)",
-              GWPING_INTERVAL_MS / 1000);
+    hadc_info("gwping: gateway probe active (every %dms, failover after %d failures)",
+              GWPING_INTERVAL_MS, GWPING_FAIL_THRESHOLD);
 }
 
 void hadc_gwping_stop(hadc_ctx_t *ctx)
@@ -206,6 +211,7 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
     g_unreachable = false;      /* no probe running, so no verdict */
     g_unreachable_logged = false;
     g_probe_logged = false;
+    g_failures = 0;
 }
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
@@ -215,16 +221,20 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
     uint64_t now = (uint64_t)hadc_now_ms();
     if (g_awaiting && now - g_last_send_ms >= GWPING_TIMEOUT_MS) {
         g_awaiting = false;
-        if (!g_unreachable_logged) {
-            g_unreachable = true;
-            g_unreachable_logged = true;
-            hadc_warn("gwping: gateway %s unreachable (no echo reply in %dms)",
-                      inet_ntoa((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }),
-                      GWPING_TIMEOUT_MS);
-            reroute(ctx, "GWPING-FAIL");
-        } else {
-            g_unreachable = true;
-            hadc_dbg("gwping: gateway unreachable (repeated; probes continue)");
+        g_failures++;
+        if (g_failures >= GWPING_FAIL_THRESHOLD) {
+            if (!g_unreachable_logged) {
+                g_unreachable = true;
+                g_unreachable_logged = true;
+                hadc_warn("gwping: gateway %s unreachable (%u consecutive probes without reply); forcing DHCP renew",
+                          inet_ntoa((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }),
+                          g_failures);
+                reroute(ctx, "GWPING-FAIL");
+                hadc_dhcpcore_force_renew(ctx);
+            } else {
+                g_unreachable = true;
+                hadc_dbg("gwping: gateway unreachable (repeated; probes continue)");
+            }
         }
     }
     if (ctx->lease.gateway.s_addr && !g_awaiting &&

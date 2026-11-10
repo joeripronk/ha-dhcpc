@@ -82,13 +82,19 @@ static void heartbeat_fire(hadc_ctx_t *ctx)
     hadc_cluster_heartbeat(ctx); /* bidirectional, with lease summary (plan §4) */
 }
 
-static void timer_ready(hadc_ctx_t *ctx, int fd)
+static void heartbeat_ready(hadc_ctx_t *ctx, int fd)
 {
     uint64_t exp;
     (void)!read(fd, &exp, sizeof(exp));
     heartbeat_fire(ctx);
+}
+
+static void periodic_ready(hadc_ctx_t *ctx, int fd)
+{
+    uint64_t exp;
+    (void)!read(fd, &exp, sizeof(exp));
     hadc_executor_audit_tick(ctx); /* rate-limited live-state audit (plan §3) */
-    hadc_gwping_tick(ctx); /* 10 s gateway probes + reply timeouts */
+    hadc_gwping_tick(ctx); /* 1 s gateway probes + reply timeouts/failover */
 }
 
 static void signal_ready(hadc_ctx_t *ctx, int fd)
@@ -98,11 +104,16 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
     /* Graceful exit: a master hands the role to the best live peer so the
      * cluster elects a new master immediately. With no live peer (or not the
      * master) it just shuts down and leaves service intact — a lone/partitioned
-     * master must not withdraw the VIP. */
-    if (ctx->role == HADC_ROLE_MASTER && hadc_cluster_handoff(ctx))
+     * master must not withdraw the VIP. During graceful cluster restart the
+     * master must not hand off and service (VIP/lease config) is left applied. */
+    if (hadc_cluster_graceful_active(ctx)) {
+        hadc_info("signal %u received; graceful restart active, shutting down "
+                  "without handoff/teardown", si.ssi_signo);
+    } else if (ctx->role == HADC_ROLE_MASTER && hadc_cluster_handoff(ctx)) {
         hadc_info("signal %u received; handed off before shutdown", si.ssi_signo);
-    else
+    } else {
         hadc_info("signal %u received; shutting down", si.ssi_signo);
+    }
     ctx->running = false;
 }
 
@@ -230,8 +241,9 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--conf PATH] [--local-conf PATH] [--persist PATH] [--oneshot]\n"
             "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update|renew [id]\n"
+            "       %s [--conf PATH] [--local-conf PATH] ctl graceful-restart enable|disable\n"
             "       (--persist default: state.json next to --conf)\n",
-            argv0, argv0);
+            argv0, argv0, argv0);
 }
 
 /* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update|renew [id] (plan §3). */
@@ -357,6 +369,7 @@ int main(int argc, char **argv)
         ctx->lease = pv.lease;
         ctx->lease.version = pv.lease_version;
         ctx->acked_version = pv.acked_version;
+        ctx->graceful_restart_until_ms = pv.graceful_restart_until_ms;
         char a[64], nm[64], gw[64];
         inet_ntop(AF_INET, &ctx->lease.address, a, sizeof(a));
         inet_ntop(AF_INET, &ctx->lease.netmask, nm, sizeof(nm));
@@ -440,7 +453,15 @@ int main(int argc, char **argv)
                       .tv_nsec = (long)(ctx->conf.cluster.heartbeat_ms % 1000) * 1000000 },
     };
     timerfd_settime(ctx->timerfd, 0, &its, NULL);
-    hadc_loop_add(ctx, ctx->timerfd, timer_ready, 0);
+    hadc_loop_add(ctx, ctx->timerfd, heartbeat_ready, 0);
+
+    ctx->periodicfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    struct itimerspec pits = {
+        .it_interval = { .tv_sec = 1, .tv_nsec = 0 },
+        .it_value = { .tv_sec = 1, .tv_nsec = 0 },
+    };
+    timerfd_settime(ctx->periodicfd, 0, &pits, NULL);
+    hadc_loop_add(ctx, ctx->periodicfd, periodic_ready, 0);
 
     if (oneshot) {
         char *status = hadc_ctl_status_json(ctx);
@@ -496,6 +517,8 @@ int main(int argc, char **argv)
     }
     hadc_dhcpcore_stop(ctx);
     hadc_gwping_stop(ctx);
+    if (hadc_cluster_graceful_active(ctx))
+        hadc_info("graceful restart active: leaving cluster/VIP state applied on exit");
     hadc_persist_save(ctx);
     return 0;
 }

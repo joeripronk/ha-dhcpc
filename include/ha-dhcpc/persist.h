@@ -20,6 +20,7 @@ typedef struct {
     uint64_t lease_version;
     uint64_t acked_version;
     hadc_lease_t lease;          /* last known good (monotonic remainders) */
+    uint64_t graceful_restart_until_ms;
 } hadc_persist_view_t;
 
 int hadc_persist_init(hadc_ctx_t *ctx, const char *path);

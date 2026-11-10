@@ -54,6 +54,7 @@ typedef struct {
     const char *conf_text;               /* conf_sync only; borrowed, not owned */
     uint64_t ts_ms;                      /* sender's CLOCK_REALTIME ms at send time */
     char role[16];                       /* sender's own role: master|slave|unknown */
+    uint64_t graceful_restart_until_ms;  /* global no-master-switch deadline (realtime ms) */
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -133,5 +134,11 @@ int hadc_cluster_push_conf(hadc_ctx_t *ctx, const char *member_id);
 /* Rebind the UDP transport to the current conf (port / this node's
  * sync_address) after a reload; 0 when nothing changed. */
 int hadc_cluster_rebind(hadc_ctx_t *ctx);
+
+/* Graceful cluster restart: suppress master switches for ~60s or until
+ * cancelled, cluster-wide. */
+bool hadc_cluster_graceful_active(hadc_ctx_t *ctx);
+int hadc_cluster_set_graceful_restart(hadc_ctx_t *ctx, bool enable);
+void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx);
 
 #endif /* HA_DHCPC_CLUSTER_H */

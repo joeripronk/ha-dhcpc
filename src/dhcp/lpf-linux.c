@@ -226,7 +226,24 @@ receive_packet(struct interface_info *interface, unsigned char *buf,
 	/* The filter above guarantees the destination port; from->sin_port
 	   is the sender's port (the server's 67). */
 
-	memcpy(buf, frame + off + dlen, (size_t)n - (size_t)off - (size_t)dlen);
+	{
+		size_t plen = (size_t)n - (size_t)off - (size_t)dlen;
+		const struct dhcp_packet *p = (const struct dhcp_packet *)(frame + off + dlen);
+
+		/* Drop BOOTP/DHCP replies not addressed to our hardware
+		 * address. This filters misdirected traffic (e.g. repeated
+		 * NAKs for another client) before it reaches the state
+		 * machine and logs. */
+		if (plen >= offsetof(struct dhcp_packet, chaddr) + 16 &&
+		    interface->hw_address.hlen > 0 &&
+		    interface->hw_address.hlen <= 16 &&
+		    p->hlen == interface->hw_address.hlen &&
+		    memcmp(p->chaddr, interface->hw_address.haddr, p->hlen) != 0)
+			return (0);
+
+		memcpy(buf, p, plen);
+	}
+
 	*from = sfrom;
 	return ((ssize_t)n - off - dlen);
 }

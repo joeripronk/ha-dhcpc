@@ -114,6 +114,8 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         out->lease_version = (uint64_t)json_integer_value(v);
     if ((v = json_object_get(root, "acked_version")) && json_is_integer(v))
         out->acked_version = (uint64_t)json_integer_value(v);
+    if ((v = json_object_get(root, "graceful_restart_until_ms")) && json_is_integer(v))
+        out->graceful_restart_until_ms = (uint64_t)json_integer_value(v);
 
     json_t *lj = json_object_get(root, "lease");
     if (lj && json_is_object(lj)) {
@@ -207,7 +209,7 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     json_t *lj = lease_json(&ctx->lease);
     if (!lj)
         return -1;
-    json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:O}", "role",
+    json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:O}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
                                                          : "unknown",
@@ -215,7 +217,8 @@ int hadc_persist_save(hadc_ctx_t *ctx)
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
                           (json_int_t)ctx->acked_version, "interface", ctx->conf.interface,
                           "conf_sha256", ctx->conf.sha256, "saved_at_utc",
-                          (json_int_t)time(NULL), "lease", lj);
+                          (json_int_t)time(NULL), "graceful_restart_until_ms",
+                          (json_int_t)ctx->graceful_restart_until_ms, "lease", lj);
     if (!o) {
         json_decref(lj);
         return -1;
