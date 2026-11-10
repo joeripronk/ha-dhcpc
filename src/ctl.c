@@ -140,6 +140,20 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
         } else {
             hadc_info("ctl: renew forced a DHCPREQUEST");
         }
+    } else if (!strcmp(cmd, "newip")) {
+        if (ctx->role != HADC_ROLE_MASTER) {
+            hadc_warn("ctl: newip refused here (role %s); only the master speaks DHCP",
+                      role_name(ctx->role));
+            reply = "{\"ok\":false,\"error\":\"not master\"}";
+        } else if (hadc_dhcpcore_force_discover(ctx) != 0) {
+            reply = "{\"ok\":false,\"error\":\"newip failed\"}";
+        } else {
+            ctx->newip_old_addr = ctx->lease.address;
+            ctx->newip_pending = true;
+            hadc_info("ctl: newip forced a fresh DISCOVER (old=%s, abort_tcp=%s)",
+                      ctx->newip_old_addr.s_addr ? inet_ntoa(ctx->newip_old_addr) : "none",
+                      ctx->conf.apply.abort_tcp_on_newip ? "on" : "off");
+        }
     } else if (!strcmp(cmd, "graceful-restart")) {
         if (ctx->role != HADC_ROLE_MASTER) {
             hadc_warn("ctl: graceful-restart refused here (role %s); only the master sets it",

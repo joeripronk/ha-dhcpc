@@ -8,12 +8,18 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
+#include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -152,13 +158,156 @@ static int cache_gw_mac(hadc_ctx_t *ctx)
     return 1;
 }
 
+static void abort_tcp_on_newip(hadc_ctx_t *ctx, const struct in_addr *old_addr)
+{
+    int fd;
+    int destroyed = 0, failed = 0, truncated = 0;
+    struct {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 r;
+    } req;
+    char buf[8192];
+    struct inet_diag_sockid matches[256];
+    size_t nmatch = 0;
+
+    if (!ctx->conf.apply.abort_tcp_on_newip || !old_addr || old_addr->s_addr == 0)
+        return;
+
+    fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+    if (fd < 0) {
+        hadc_warn("newip: cannot open sock_diag socket: %s", strerror(errno));
+        return;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(req.r));
+    req.nlh.nlmsg_type = SOCK_DIAG_BY_FAMILY;
+    req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.r.sdiag_family = AF_INET;
+    req.r.sdiag_protocol = IPPROTO_TCP;
+    req.r.idiag_states = (1u << TCP_ESTABLISHED) | (1u << TCP_SYN_SENT) |
+                         (1u << TCP_SYN_RECV) | (1u << TCP_FIN_WAIT1) |
+                         (1u << TCP_FIN_WAIT2) | (1u << TCP_TIME_WAIT) |
+                         (1u << TCP_CLOSE) | (1u << TCP_CLOSE_WAIT) |
+                         (1u << TCP_LAST_ACK) | (1u << TCP_LISTEN) |
+                         (1u << TCP_CLOSING);
+
+    if (send(fd, &req, req.nlh.nlmsg_len, 0) < 0) {
+        hadc_warn("newip: sock_diag dump request failed: %s", strerror(errno));
+        close(fd);
+        return;
+    }
+
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            hadc_warn("newip: sock_diag dump failed: %s", strerror(errno));
+            close(fd);
+            return;
+        }
+        if (n == 0)
+            break;
+        for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, (unsigned)n);
+             nlh = NLMSG_NEXT(nlh, n)) {
+            struct inet_diag_msg *d;
+
+            if (nlh->nlmsg_type == NLMSG_DONE)
+                goto dump_done;
+            if (nlh->nlmsg_type == NLMSG_ERROR) {
+                struct nlmsgerr *e = NLMSG_DATA(nlh);
+                hadc_warn("newip: sock_diag dump error: %s", strerror(-e->error));
+                close(fd);
+                return;
+            }
+            d = NLMSG_DATA(nlh);
+            if (d->idiag_family != AF_INET)
+                continue;
+            if (memcmp(d->id.idiag_src, old_addr, 4) != 0)
+                continue;
+            if (nmatch < sizeof(matches) / sizeof(matches[0]))
+                matches[nmatch++] = d->id;
+            else
+                truncated++;
+        }
+    }
+
+dump_done:
+    if (nmatch == 0 && !truncated) {
+        close(fd);
+        hadc_info("newip: no TCP sockets bound to %s", inet_ntoa(*old_addr));
+        return;
+    }
+
+    for (size_t i = 0; i < nmatch; i++) {
+        struct {
+            struct nlmsghdr nlh;
+            struct inet_diag_req_v2 r;
+        } del;
+        ssize_t n;
+
+        memset(&del, 0, sizeof(del));
+        del.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(del.r));
+        del.nlh.nlmsg_type = SOCK_DESTROY;
+        del.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        del.r.sdiag_family = AF_INET;
+        del.r.sdiag_protocol = IPPROTO_TCP;
+        del.r.id = matches[i];
+        if (send(fd, &del, del.nlh.nlmsg_len, 0) < 0) {
+            failed++;
+            continue;
+        }
+        for (;;) {
+            n = recv(fd, buf, sizeof(buf), 0);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                failed++;
+                goto destroy_done;
+            }
+            if (n == 0) {
+                failed++;
+                goto destroy_done;
+            }
+            {
+                bool got_ack = false;
+                for (struct nlmsghdr *nlh = (struct nlmsghdr *)buf; NLMSG_OK(nlh, (unsigned)n);
+                     nlh = NLMSG_NEXT(nlh, n)) {
+                    if (nlh->nlmsg_type == NLMSG_ERROR) {
+                        struct nlmsgerr *e = NLMSG_DATA(nlh);
+                        if (e->error == 0)
+                            destroyed++;
+                        else
+                            failed++;
+                        got_ack = true;
+                    }
+                }
+                if (got_ack)
+                    break;
+            }
+        }
+    }
+destroy_done:
+    close(fd);
+    if (truncated)
+        hadc_warn("newip: too many TCP sockets bound to %s; aborted %d, failed %d, skipped %d",
+                  inet_ntoa(*old_addr), destroyed, failed, truncated);
+    else
+        hadc_info("newip: aborted TCP sockets bound to %s (destroyed=%d failed=%d)",
+                  inet_ntoa(*old_addr), destroyed, failed);
+}
+
 static void cb_lease_update(void *arg, const hadc_lease_t *lease)
 {
     hadc_ctx_t *ctx = arg;
     hadc_desired_t desired;
 
     if (lease != NULL) {
+        struct in_addr old = ctx->newip_old_addr;
+        bool pending = ctx->newip_pending;
         bool retention = ctx->lease.retention_active;
+
         ctx->lease = *lease;
         ctx->lease.retention_active = retention;
         hadc_info("lease update v%llu state=%s addr=%s t1=%us t3=%us",
@@ -172,6 +321,16 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
                             : lease->state == HADC_LEASE_REBIND ? HADC_REASON_REBIND
                                                                 : HADC_REASON_BOUND);
         ctx->acked_version = ctx->lease.version;
+
+        if (pending) {
+            if (old.s_addr != 0 && old.s_addr != ctx->lease.address.s_addr)
+                abort_tcp_on_newip(ctx, &old);
+            else if (old.s_addr != 0)
+                hadc_info("newip: new lease kept address %s; no TCP abort needed",
+                          inet_ntoa(ctx->lease.address));
+            ctx->newip_pending = false;
+            ctx->newip_old_addr.s_addr = 0;
+        }
     } else if (ctx->conf.dhcp.retention != HADC_RETENTION_OFF &&
                ctx->lease.address.s_addr != 0) {
         /* Retention beats expiry (plan §5): the engine gave up (FAIL/EXPIRE)
@@ -181,6 +340,10 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
     } else {
         hadc_warn("lease gone (EXPIRE/FAIL); no desired state");
         memset(&ctx->lease, 0, sizeof(ctx->lease));
+        if (ctx->newip_pending) {
+            ctx->newip_pending = false;
+            ctx->newip_old_addr.s_addr = 0;
+        }
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired, HADC_REASON_EXPIRE);
     }
@@ -267,13 +430,13 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--conf PATH] [--local-conf PATH] [--persist PATH] [--oneshot]\n"
-            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update|renew [id]\n"
+            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update|renew|newip [id]\n"
             "       %s [--conf PATH] [--local-conf PATH] ctl graceful-restart enable|disable\n"
             "       (--persist default: state.json next to --conf)\n",
             argv0, argv0, argv0);
 }
 
-/* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update|renew [id] (plan §3). */
+/* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update|renew|newip [id] (plan §3). */
 static int ctl_client(const char *conf_path, const char *local_path, const char *cmd_line)
 {
     hadc_conf_t conf;

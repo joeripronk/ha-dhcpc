@@ -430,6 +430,39 @@ int main(void)
             ok("slave_isolation nft parsed");
     }
 
+    /* abort_tcp_on_newip: defaults off, parses, overlay wins */
+    {
+        char with_ab[2048];
+
+        write_file(base, BASE_NOMAC);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("abort_tcp_on_newip default load");
+        else if (conf.apply.abort_tcp_on_newip)
+            fail("abort_tcp_on_newip default is off");
+        else
+            ok("abort_tcp_on_newip default is off");
+
+        snprintf(with_ab, sizeof(with_ab), "%sapply:\n  abort_tcp_on_newip: true\n", BASE_NOMAC);
+        write_file(base, with_ab);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("abort_tcp_on_newip parse");
+        else if (!conf.apply.abort_tcp_on_newip)
+            fail("abort_tcp_on_newip parsed from the shared document");
+        else
+            ok("abort_tcp_on_newip parsed from the shared document");
+
+        write_file(base, BASE_NOMAC);
+        write_file(local, "self: node-b\npriority: 90\napply:\n  abort_tcp_on_newip: true\n");
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("abort_tcp_on_newip overlay load");
+        else if (!conf.apply.abort_tcp_on_newip)
+            fail("abort_tcp_on_newip overlay wins");
+        else
+            ok("abort_tcp_on_newip overlay wins");
+        write_file(local, "self: node-b\npriority: 90\n");
+    }
+
     /* cluster: quorum defaults to majority; failover priority is explicit */
     write_file(base, BASE_NOMAC);
     unlink(local);

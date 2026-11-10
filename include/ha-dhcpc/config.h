@@ -93,6 +93,8 @@ typedef struct {
         uint32_t gateway_probe_interval_ms; /* probe interval, ms */
         uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */
         uint32_t gateway_probe_fail_threshold; /* consecutive misses -> unreachable */
+        bool abort_tcp_on_newip;       /* after ctl newip obtains a lease, reset
+                                        * TCP connections bound to the old address */
         bool disable_ipv6;             /* global: disable IPv6 on managed ifaces (default on) */
         bool dhcp_disable_ipv6_set;    /* override for the DHCP interface */
         bool dhcp_disable_ipv6;

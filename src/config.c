@@ -714,6 +714,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.gateway_probe_interval_ms = 10000;
     out->apply.gateway_probe_timeout_ms = 2000;
     out->apply.gateway_probe_fail_threshold = 3;
+    out->apply.abort_tcp_on_newip = false;
     out->apply.disable_ipv6 = true;
     out->apply.dhcp_disable_ipv6_set = false;
     if (a) {
@@ -763,6 +764,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             goto derr;
         }
         out->apply.gateway_probe_fail_threshold = (uint32_t)v;
+        if (get_bool(a, "abort_tcp_on_newip", &out->apply.abort_tcp_on_newip, false)) goto derr;
         if (get_bool(a, "disable_ipv6", &out->apply.disable_ipv6, true)) goto derr;
         if (json_object_get(a, "disable_ipv6_dhcp")) {
             if (get_bool(a, "disable_ipv6_dhcp", &out->apply.dhcp_disable_ipv6, out->apply.disable_ipv6))

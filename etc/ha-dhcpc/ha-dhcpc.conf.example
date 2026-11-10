@@ -47,6 +47,8 @@ apply:
   suppress_member_dad: true    # compatibility no-op
   arp_responder: true          # compatibility no-op (the VIP owner answers)
   announce_gratuitous: true    # gratuitous ARP on promotion
+  abort_tcp_on_newip: false    # ctl newip: when a new IP is obtained, abort
+                               # established TCP connections using the old one
   # slave_isolation: down      # none|down|nft (nft: block all egress via
                                # netdev hook, link stays up; tcpdump sees it).
                                # slave_link_down: true = legacy alias for down.

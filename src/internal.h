@@ -35,6 +35,11 @@ struct hadc_ctx {
 
     /* graceful cluster restart: wall-clock ms deadline (0 = inactive). */
     uint64_t graceful_restart_until_ms;
+
+    /* ctl newip: force a fresh DISCOVER and, on success, optionally abort TCP
+     * connections that were using the previous lease address. */
+    bool newip_pending;
+    struct in_addr newip_old_addr;
 };
 
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */
