@@ -1,14 +1,22 @@
 #!/bin/sh
 # Deploy the ha-dhcpc OpenWrt package to the cluster nodes.
-# Usage: ./deploy-openwrt.sh [apk-path]   (default: newest apk from the SDK)
+# Usage: ./deploy-openwrt.sh [--dry-run] [apk-path]   (default: newest apk from the SDK)
 set -eu
 
 HOSTS="studeerkamer woonkamer meterkast"   # slaves first, master last
+DRY_RUN=0
+
+case "${1:-}" in
+--dry-run)
+	DRY_RUN=1
+	shift
+	;;
+esac
 
 APK=${1:-$(ls -t "$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/bin/packages/aarch64_cortex-a53/base"/ha-dhcpc-*.apk 2>/dev/null | head -1)}
 
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
-echo "deploying $(basename "$APK")"
+echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}"
 
 json_field() {
 	python3 -c 'import json,sys
@@ -18,21 +26,52 @@ except Exception:
  print("")' "$1"
 }
 
+host_status() {
+	ssh -q "root@$1" 'ha-dhcpc ctl status 2>/dev/null' 2>/dev/null || true
+}
+
 find_master() {
+	masters=
+	unreachable=
 	for h in $HOSTS; do
-		status=$(ssh -q "root@$h" 'ha-dhcpc ctl status 2>/dev/null' 2>/dev/null || true)
-		[ -n "$status" ] || continue
+		status=$(host_status "$h")
+		if [ -z "$status" ]; then
+			unreachable="${unreachable}${unreachable:+ }$h"
+			continue
+		fi
 		role=$(printf '%s' "$status" | json_field role)
+		self=$(printf '%s' "$status" | json_field self)
+		master_view=$(printf '%s' "$status" | json_field master)
+		echo "status: host=$h self=${self:-?} role=${role:-?} master_view=${master_view:-?}" >&2
 		if [ "$role" = "master" ]; then
-			echo "$h"
-			return 0
+			masters="${masters}${masters:+ }$h"
 		fi
 	done
-	return 1
+	if [ -n "$unreachable" ]; then
+		echo "status: unreachable/no-status: $unreachable" >&2
+	fi
+	case "$masters" in
+	"")
+		echo "graceful-restart: master not found" >&2
+		return 1
+		;;
+	*" "*)
+		echo "graceful-restart: multiple masters found: $masters" >&2
+		return 1
+		;;
+	*)
+		echo "$masters"
+		return 0
+		;;
+	esac
 }
 
 graceful_ctl() {
 	host=$1 action=$2
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry-run: would run graceful-restart $action on $host"
+		return 0
+	fi
 	for i in 1 2 3 4 5 6 7 8 9 10; do
 		out=$(ssh -q "root@$host" "ha-dhcpc ctl graceful-restart $action" 2>/dev/null || true)
 		case "$out" in
@@ -58,6 +97,10 @@ graceful_ctl() {
 }
 
 graceful_disable_any() {
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry-run: would try graceful-restart disable on any host"
+		return 0
+	fi
 	for h in $HOSTS; do
 		out=$(ssh -q "root@$h" "ha-dhcpc ctl graceful-restart disable" 2>/dev/null || true)
 		case "$out" in
@@ -74,6 +117,14 @@ graceful_disable_any() {
 MASTER=$(find_master || true)
 GRACEFUL=0
 if [ -n "$MASTER" ]; then
+	echo "master: $MASTER"
+	if [ "$DRY_RUN" -eq 1 ]; then
+		echo "dry-run: would enable graceful-restart on $MASTER, wait, deploy to: $HOSTS, then disable graceful-restart"
+		for h in $HOSTS; do
+			echo "dry-run: would scp $APK to root@$h:/tmp/ and run 'apk add --allow-untrusted --force /tmp/$(basename "$APK") && /etc/init.d/ha-dhcpc restart'"
+		done
+		exit 0
+	fi
 	if graceful_ctl "$MASTER" enable; then
 		GRACEFUL=1
 		# allow broadcasts/heartbeats to reach and persist on all peers before restarts
@@ -83,7 +134,7 @@ if [ -n "$MASTER" ]; then
 		exit 1
 	fi
 else
-	echo "graceful-restart: master not found; aborting deploy (cannot guarantee no VIP loss). Set a master or deploy manually." >&2
+	echo "graceful-restart: cannot identify a single master; aborting deploy (cannot guarantee no VIP loss). Fix cluster state or deploy manually." >&2
 	exit 1
 fi
 
