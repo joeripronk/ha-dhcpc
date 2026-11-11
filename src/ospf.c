@@ -1233,12 +1233,25 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
             /* peer accepted us as master */
             n->dd_master = true;
             n->state = NSTATE_EXCHANGE;
+            n->dd_last_recv_seq = seq;
+            send_lsreq_missing(n, pkt, len);
+            nbr_send_dbdesc(n, OSPF_DD_FLAG_MS | ((flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0),
+                            n->dd_seq, true);
+            if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
+                n->state = NSTATE_FULL;
+                n->lsa_sync_sent = true;
+            } else if (!(flags & OSPF_DD_FLAG_M)) {
+                n->state = NSTATE_LOADING;
+            }
+            flood_lsas_to_neighbor(n, false);
+            return;
         } else if (!(flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_MS) &&
                    g_ospf.router_id < n->router_id) {
             /* peer is master */
             n->dd_master = false;
             n->dd_seq = seq;
             n->state = NSTATE_EXCHANGE;
+            /* fall through to exchange handling as slave receiving master's DBD */
         } else {
             /* negotiation mismatch/duplicate; retransmit handled by timer */
             return;
