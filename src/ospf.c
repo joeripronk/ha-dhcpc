@@ -164,6 +164,19 @@ static uint16_t lsa_checksum(uint8_t *lsa, size_t len)
     return (uint16_t)((lsa[16] << 8) | lsa[17]);
 }
 
+static bool lsa_checksum_ok(const uint8_t *lsa, size_t len)
+{
+    if (len < 18)
+        return false;
+    uint8_t tmp[OSPF_MTU];
+    if (len > sizeof(tmp))
+        return false;
+    memcpy(tmp, lsa, len);
+    uint16_t old = (uint16_t)((tmp[16] << 8) | tmp[17]);
+    uint16_t calc = lsa_checksum(tmp, len);
+    return old == calc;
+}
+
 static uint32_t rid_to_u32(const char *s)
 {
     struct in_addr a = {0};
@@ -747,9 +760,19 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
     const ospf_hello_t *hello = (const ospf_hello_t *)(pkt + sizeof(*h));
     if (h->version != OSPF_VERSION || h->type != OSPF_HELLO)
         return;
+    if (ntohl(h->area_id) != OSPF_AREA_BACKBONE)
+        return;
     uint32_t rid = ntohl(h->router_id);
     if (rid == g_ospf.router_id)
         return; /* our own */
+    if (iface) {
+        if (hello->network_mask != iface->mask.s_addr)
+            return;
+        if (ntohs(hello->hello_interval) != OSPF_HELLO_INTERVAL)
+            return;
+        if (ntohl(hello->dead_interval) != OSPF_DEAD_INTERVAL)
+            return;
+    }
 
     ospf_neighbor_t *n = find_or_add_neighbor(rid, src);
     if (!n)
@@ -842,12 +865,16 @@ static void handle_lsupdate(const uint8_t *pkt, size_t len, struct in_addr src, 
         uint16_t llen = ntohs(lh->length);
         if (llen < sizeof(*lh) || off + llen > len)
             break;
-        if (ntohl(lh->adv_router) != g_ospf.router_id) {
-            if (install_lsa(pkt + off, llen))
-                changed = true;
+        if (lsa_checksum_ok(pkt + off, llen)) {
+            if (ntohl(lh->adv_router) != g_ospf.router_id) {
+                if (install_lsa(pkt + off, llen))
+                    changed = true;
+            }
+            if (nack < 32)
+                acks[nack++] = *lh;
+        } else {
+            hadc_dbg("ospf: bad LSA checksum from %s (type %u adv %08x)", inet_ntoa(src), lh->type, ntohl(lh->adv_router));
         }
-        if (nack < 32)
-            acks[nack++] = *lh;
         off += llen;
     }
     if (nack) {
@@ -1026,8 +1053,10 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
         if (h->version != OSPF_VERSION)
             continue;
         uint16_t plen = ntohs(h->length);
-        if (plen > (size_t)n)
-            plen = (uint16_t)n;
+        if (plen < sizeof(ospf_hdr_t) || plen > (size_t)n)
+            continue;
+        if (ntohl(h->area_id) != OSPF_AREA_BACKBONE)
+            continue;
         if (!verify_auth(h, ctx)) {
             hadc_dbg("ospf: auth mismatch from %s, dropping", inet_ntoa(src.sin_addr));
             continue;
