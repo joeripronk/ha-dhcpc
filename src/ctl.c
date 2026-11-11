@@ -93,8 +93,56 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
         return;
     const char *reply = "{\"ok\":true}";
     if (!strcmp(cmd, "promote")) {
-        hadc_info("ctl: promote %s", arg[0] ? arg : "(self)");
-        hadc_cluster_promote(ctx, arg[0] ? arg : NULL);
+        const char *target = arg[0] ? arg : ctx->conf.self;
+        hadc_info("ctl: promote %s", target);
+        if (ctx->role != HADC_ROLE_MASTER &&
+            ctx->conf.designated_master[0] &&
+            strcmp(ctx->conf.designated_master, ctx->conf.self) != 0) {
+            const hadc_member_t *master = NULL;
+            for (size_t i = 0; i < ctx->conf.n_members; i++)
+                if (!strcmp(ctx->conf.members[i].id, ctx->conf.designated_master))
+                    master = &ctx->conf.members[i];
+            if (master && ctx->udp_fd >= 0) {
+                json_t *msg = json_pack("{s:s, s:s, s:s, s:I, s:s}", "type", HADC_MSG_CTL_PROMOTE,
+                                        "origin", ctx->conf.self, "master_id",
+                                        ctx->conf.designated_master, "lease_version",
+                                        (json_int_t)ctx->lease.version, "new_master", target);
+                bool forwarded = false;
+                if (msg) {
+                    char *txt = json_dumps(msg, JSON_PRESERVE_ORDER | JSON_COMPACT);
+                    if (txt) {
+                        struct sockaddr_in to = { .sin_family = AF_INET,
+                                                  .sin_port = htons(ctx->conf.cluster.port),
+                                                  .sin_addr = master->sync_address };
+                        ssize_t n = sendto(ctx->udp_fd, txt, strlen(txt), 0,
+                                           (struct sockaddr *)&to, sizeof(to));
+                        forwarded = n >= 0;
+                        if (!forwarded)
+                            hadc_warn("ctl: promote forward to master %s failed: %s",
+                                      ctx->conf.designated_master, strerror(errno));
+                        free(txt);
+                    }
+                    json_decref(msg);
+                }
+                if (forwarded) {
+                    hadc_info("ctl: promote request for %s forwarded to master %s", target,
+                              ctx->conf.designated_master);
+                    reply = "{\"ok\":true,\"forwarded\":true}";
+                } else {
+                    hadc_warn("ctl: promote request for %s could not be forwarded to master %s",
+                              target, ctx->conf.designated_master);
+                    reply = "{\"ok\":false,\"forwarded\":false,\"error\":\"forward failed\"}";
+                }
+            } else {
+                hadc_warn("ctl: promote cannot forward to master %s; attempting locally",
+                          ctx->conf.designated_master);
+                if (hadc_cluster_promote(ctx, target) != 0)
+                    reply = "{\"ok\":false,\"error\":\"promote failed\"}";
+            }
+        } else {
+            if (hadc_cluster_promote(ctx, target) != 0)
+                reply = "{\"ok\":false,\"error\":\"promote failed\"}";
+        }
     } else if (!strcmp(cmd, "demote")) {
         hadc_info("ctl: demote");
         hadc_cluster_demote(ctx);

@@ -256,6 +256,8 @@ void hadc_cluster_set_role_hook(void (*fn)(void *arg, hadc_role_t old_role,
     g_role_hook_arg = arg;
 }
 
+static void send_heartbeats_now(hadc_ctx_t *ctx);
+
 static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
 {
     hadc_role_t old_role = ctx->role;
@@ -264,6 +266,7 @@ static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
     ctx->role = new_role;
     if (g_role_hook != NULL)
         g_role_hook(g_role_hook_arg, old_role, new_role);
+    send_heartbeats_now(ctx);
 }
 
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg)
@@ -284,6 +287,24 @@ static int send_bytes(hadc_ctx_t *ctx, const struct sockaddr_in *to, const uint8
         return -1;
     ssize_t r = sendto(ctx->udp_fd, buf, len, 0, (const struct sockaddr *)to, sizeof(*to));
     return r < 0 ? -1 : 0;
+}
+
+static void send_heartbeats_now(hadc_ctx_t *ctx)
+{
+    if (ctx->udp_fd < 0)
+        return;
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        const hadc_member_t *m = &ctx->conf.members[i];
+        uint8_t hb[HADC_WIRE_HB_LEN];
+        if (!strcmp(m->id, ctx->conf.self))
+            continue;
+        build_bin_heartbeat(ctx, hb);
+        struct sockaddr_in to = { .sin_family = AF_INET,
+                                   .sin_port = htons(ctx->conf.cluster.port),
+                                   .sin_addr = m->sync_address };
+        if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
+            hadc_warn("cluster: send heartbeat to %s failed", m->id);
+    }
 }
 
 static const hadc_member_t *member_by_id(hadc_ctx_t *ctx, const char *id)
@@ -829,6 +850,13 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         }
     } else if (!strcmp(msg.type, HADC_MSG_GRACEFUL)) {
         /* state adopted above */
+    } else if (!strcmp(msg.type, HADC_MSG_CTL_PROMOTE)) {
+        if (ctx->role == HADC_ROLE_MASTER && msg.new_master[0]) {
+            hadc_info("cluster: ctl_promote from %s requests master %s", msg.origin, msg.new_master);
+            hadc_cluster_promote(ctx, msg.new_master);
+        } else {
+            hadc_dbg("cluster: ctl_promote from %s ignored (role=%s)", msg.origin, role_name(ctx->role));
+        }
     } else if (!strcmp(msg.type, HADC_MSG_ROLE_CHANGE)) {
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
         if (hadc_cluster_graceful_active(ctx)) {
@@ -1303,7 +1331,7 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
     if (!c || !self || !beats(c, ctx->conf.self, ctx->conf.priority))
         return 0;
     snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master), "%s", c->id);
-    ctx->role = HADC_ROLE_SLAVE;
+    set_role(ctx, HADC_ROLE_SLAVE);
     hadc_info("startup: live master %s outranks us (%d > %d); following it instead of "
               "resuming master", c->id, c->priority, ctx->conf.priority);
     return 1;

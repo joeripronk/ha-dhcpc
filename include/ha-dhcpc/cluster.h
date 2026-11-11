@@ -21,6 +21,7 @@
 #define HADC_MSG_FULL_STATE_REQ     "full_state_req"     /* slave -> master on join/version gap > 1 */
 #define HADC_MSG_FULL_STATE         "full_state"         /* master -> slave; slave applies before ack */
 #define HADC_MSG_ROLE_CHANGE        "role_change"        /* promote/demote propagated cluster-wide */
+#define HADC_MSG_CTL_PROMOTE        "ctl_promote"        /* member -> master: request handover to new_master */
 #define HADC_MSG_CONF_SYNC          "conf_sync"          /* master -> member: shared document (plan §6) */
 #define HADC_MSG_CONF_REQ           "conf_req"           /* member -> master: our shared digest differs */
 #define HADC_MSG_CONF_ACK           "conf_ack"           /* member -> master: document written + applied */
