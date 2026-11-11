@@ -315,8 +315,18 @@ static void apply_learned_routes(hadc_ctx_t *ctx)
     for (size_t j = 0; j < nwant; j++) {
         if (!want[j].valid) continue;
         if (g_rs.n_installed >= HADC_ROUTING_MAX_INSTALLED) break;
-        int rc = rtmsg_send(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK,
+        /* avoid replacing unrelated/direct routes: try create-only first */
+        int rc = rtmsg_send(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK,
                             want[j].prefix, want[j].prefixlen, want[j].nexthop);
+        if (rc == -EEXIST) {
+            /* already present (possibly managed externally or by us after restart loss);
+             * do not overwrite unknown owner */
+            char p[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &want[j].prefix, p, sizeof(p));
+            inet_ntop(AF_INET, &want[j].nexthop, gw, sizeof(gw));
+            hadc_dbg("routing: learned route %s/%u via %s exists, not overwriting", p, want[j].prefixlen, gw);
+            continue;
+        }
         if (rc < 0) {
             char p[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &want[j].prefix, p, sizeof(p));
