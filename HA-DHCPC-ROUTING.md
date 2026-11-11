@@ -1,13 +1,14 @@
 # HA-DHCPC Inter-Cluster Routing (Plan)
 
 Plan for simple routing between local `ha-dhcpc` clusters so the current holder of a
-cluster's public DHCP address is reachable over the shortest path. The preferred
-mechanism is a small, well-defined subset of OSPF, used only where it keeps
-complexity low.
+cluster's public DHCP address is reachable over the shortest path. The mechanism is
+a small, well-defined subset of **OSPFv2 spoken directly by `ha-dhcpc`**. `ha-dhcpc`
+does **not** rely on an external OSPF daemon, but it **can talk directly** to
+external OSPF routers/daemons on the fabric (standard OSPF adjacency/LSA exchange).
 
 This is **edge-only routing**: an `ha-dhcpc` node originates only its own
 locally owned prefixes and is not a transit/full OSPF router. It must never
-advertise, redistribute, or forward non-local routes learned via OSPF.
+advertise, redistribute, re-originate, or forward non-local routes learned via OSPF.
 
 Status: **proposal / design plan** (not implemented).
 
@@ -42,9 +43,11 @@ change.
   configured unhealthy states.
 - **Edge-only, local-only origination:** participate on the fabric only to announce
   locally owned prefixes. Never act as a transit router and never advertise,
-  redistribute, or forward non-local routes learned via OSPF.
+  redistribute, re-originate, or forward non-local routes learned via OSPF.
 - **Shortest-path reachability to the origin** on the local inter-cluster fabric
-  using dynamic routing, with OSPFv2 preferred if the resulting design stays simple.
+  using dynamic OSPFv2 routing, interoperable with external OSPF speakers.
+- **No external OSPF daemon dependency:** `ha-dhcpc` implements the required OSPF
+  subset itself while remaining able to peer directly with external OSPF routers.
 - **Minimal, explicit configuration:** reuse existing cluster/lease concepts where
   possible; avoid coupling core DHCP/HA behavior to routing internals.
 - **Safe failure behavior:** never create a persistent blackhole or a routing loop
@@ -53,16 +56,15 @@ change.
 ## 3. Non-goals (initial scope)
 
 - Full OSPF feature parity (multiple areas, NSSA/virtual links, traffic
-  engineering, BFD integration in v1 unless trivial via the routing daemon).
+  engineering, BFD integration in v1 unless trivial).
 - Acting as a transit/full OSPF router or carrying transit traffic for non-local
   destinations; propagating, redistributing, or re-advertising any non-local routes
   learned via OSPF.
 - IPv6 / OSPFv3 (IPv4 only, matching current cluster/VIP scope).
 - Replacing the existing default-route, backup-gateway, or gateway-probe logic
   managed by the executor for the DHCP uplink.
-- Providing a general-purpose routing daemon inside `ha-dhcpc`.
 - Automatic discovery of arbitrary network topologies beyond the explicitly
-  configured routing neighbors/interfaces.
+  configured fabric interfaces/peers as required by the minimal profile.
 
 ## 4. Terminology and assumptions
 
@@ -77,7 +79,7 @@ change.
   master-owned interface (e.g. `192.168.10.0/24`), advertised only when owned.
 - **Assumptions:**
   - Nodes that advertise/forward between clusters have L3 connectivity on the
-    fabric links and a working dynamic-routing stack available where needed.
+    fabric links.
   - The fabric links are administratively controlled and can be placed in a single
     OSPF area (Area 0) with a simple topology.
   - The public /32 is meaningful/reachable inside this routing domain (e.g.
@@ -86,96 +88,76 @@ change.
 
 ## 5. Design options
 
-### Option A — Integrate with an external OSPF daemon (recommended)
+### Option A — Native minimal OSPFv2 speaker in ha-dhcpc (recommended)
 
-`ha-dhcpc` determines *what* must be advertised based on authoritative local state
-(role, lease, VIP ownership) and delegates *how* to speak OSPF to a mature routing
-daemon (e.g. FRRouting `ospfd`, BIRD, or an OpenWrt-packaged OSPF implementation).
+`ha-dhcpc` determines *what* must be advertised from authoritative local state
+(role, lease, VIP ownership) and **speaks OSPFv2 directly** to originate and
+withdraw those prefixes. It participates in the minimal protocol machinery needed
+for interoperable edge routing (Hello/adjacency, LSDB synchronization, LSA
+origination/aging/flooding relevant to the supported subset, and shortest-path
+calculation for learned routes of interest). No external OSPF daemon is required.
 
-Mechanisms (one or a combination, chosen per platform):
+**Interoperability:** `ha-dhcpc` can form adjacencies and exchange routing
+information directly with external OSPF routers/daemons (e.g. FRR, BIRD, other
+OSPF speakers) on configured fabric interfaces, provided they use the same minimal
+Area 0 profile and compatible authentication/timers.
 
-1. **Kernel route injection + redistribute:** on become-owner, install a host/connected
-   route for the prefix in a dedicated table or with a specific protocol/tag/metric;
-   configure OSPF to redistribute that route (and filter everything else). On lose-
-   owner, remove it so OSPF withdraws the LSA.
-2. **Daemon control hook:** invoke a small, idempotent helper (e.g. `vtysh`, `birdc`,
-   or a generated include file + reload) to add/remove a prefix advertisement.
-3. **Sidecar announcer:** a tiny companion process reads ha-dhcpc status/socket and
-   maintains OSPF origination; keeps the core daemon routing-agnostic.
+**Pros:** no external routing dependency/packaging coupling; behavior derived
+directly from ha-dhcpc state; direct interoperability with existing OSPF fabric.
+**Cons:** protocol correctness and security burden in `ha-dhcpc` (state machine,
+LSDB/sequence/aging/flooding, SPF, timers, parsing/validation).
 
-**Pros:** correct OSPF behavior, fast convergence features, authentication, and
-ecosystem tooling without implementing SPF/LSDB/adjacencies in C. Matches
-"subset of OSPF" by constraining configuration, not by reimplementing protocol.
-**Cons:** external dependency and per-platform packaging/integration work.
+### Option B — External OSPF daemon integration (not chosen)
 
-### Option B — Minimal built-in OSPFv2 speaker (not recommended)
+Delegate OSPF speaking to FRR/BIRD via kernel redistribution or control hooks.
 
-Implement a constrained OSPFv2 speaker (single area, fixed neighbor set, limited
-LSA types) inside or alongside `ha-dhcpc`.
+**Pros:** mature protocol implementation.
+**Cons:** external dependency and per-platform integration; rejected because the
+routing function should be owned by `ha-dhcpc` and not depend on an external OSPF
+daemon. Direct peering with external daemons is still achieved by Option A.
 
-**Pros:** no external routing dependency.
-**Cons:** high implementation and correctness risk (adjacency state machine,
-flooding, aging, SPF, sequence numbers, MTU/auth edge cases). Disproportionate
-complexity for "simple routing functionality"; violates the preference to keep
-complexity low.
+### Option C — Non-OSPF fallback (contingency only)
 
-### Option C — Non-OSPF fallback (distance-vector/simple) — contingency only
+A bespoke non-OSPF announcer is not preferred because it would not interoperate
+with standard OSPF routers/daemons. Consider only if OSPFv2 interoperability is
+explicitly dropped for a constrained deployment.
 
-Use RIP, Babel, or a static/overlay scheme if OSPF integration proves too heavy on
-a target platform.
+**Decision:** pursue **Option A** (native minimal OSPFv2 speaker), constrained to an
+edge-only subset that interoperates directly with external OSPF speakers.
 
-**Pros:** sometimes lighter to deploy.
-**Cons:** weaker fit for "shortest path" in some topologies, different operational
-model; considered only if Option A is impractical on a required target.
+### 5.1 Minimal interoperable OSPF subset (“heartbeats and route exchange”)
 
-**Decision:** pursue **Option A**. Constrain usage to an OSPF subset (single area,
-point-to-point or broadcast on fabric links as appropriate, no exotic LSA types)
-rather than building a protocol implementation.
+OSPF cannot be reduced to a custom “heartbeat + announce route” message without
+breaking correctness, but `ha-dhcpc` can implement a **minimal interoperable**
+profile:
 
-### 5.1 Can OSPF be limited to “heartbeats and route exchange”?
-
-Partly, but only by **configuration/profile**, not by implementing a stripped-down
-OSPF speaker:
-
-- **Hello packets are the heartbeat.** Neighbor liveness is exactly OSPF Hello +
-  Dead-interval handling.
-- **Route exchange is not a single simple message.** Correct, interoperable OSPF
-  requires adjacency formation, Database Description/LSR/LSU/LSAck exchange, LSAs
-  (at least Router/Network as topology requires and AS-external/summary forms for
-  originated prefixes), sequence-number/aging/flooding rules, and SPF to compute
-  shortest paths. A bespoke “Hello + announce/withdraw route” implementation would
-  omit LSDB consistency and loop/flood protections and would be non-interoperable
-  and correctness-risky (see Option B).
-- **Minimal OSPF profile with Option A (recommended):** run a mature external
-  daemon but limit *our* footprint and daemon config to the essentials: single
-  Area 0, explicit fabric interfaces only, point-to-point where possible, originate
-  only ha-dhcpc-owned `/32`/VIP prefixes (no full connected/kernel redistribution),
-  strict prefix/tag filtering, and tuned Hello/Dead (and SPF throttle) timers for
-  the desired convergence. Operationally this is “heartbeats + route exchange of a
-  few prefixes”, with protocol correctness handled by the daemon.
+- **Hello packets are the heartbeat.** Neighbor liveness uses OSPF Hello and
+  Dead-interval handling on configured fabric interfaces.
+- **Correct route exchange:** implement the adjacency/LSDB exchange required for
+  interoperability in the supported topology (Hello, Database Description,
+  LSR/LSU/LSAck as applicable), originate/age/flood LSAs for locally owned prefixes,
+  and run SPF/path selection to compute reachability for learned prefixes of
+  interest. A bespoke non-OSPF shortcut is out of scope.
+- **Minimal edge-only profile:** single Area 0, explicit fabric interfaces only,
+  simple network types (point-to-point preferred; broadcast where required),
+  originate only ha-dhcpc-owned `/32`/VIP prefixes and optional primary default
+  route, and never originate/redistribute/re-flood learned non-local routes as own
+  advertisements.
 - **Edge-only, non-transit role:** this node is never a transit OSPF router and only
   originates prefixes it locally owns. It must not redistribute, re-originate, or
-  propagate/forward non-local routes in the routing protocol (no re-advertisement of
-  routes learned from OSPF). To keep it off transit paths, enforce strict outbound
-  filtering to local prefixes only and, where supported, a non-transit/stub-router
-  style configuration (e.g. FRR `max-metric router-lsa` / equivalent). Installing
-  routes to reach other clusters’ ha-dhcpc-originated prefixes is in scope for
-  reachability; providing transit for unrelated third-party destinations is not.
-- **Bespoke non-OSPF minimal protocol (contingency, not OSPF):** if an external
-  OSPF dependency is unacceptable on a target, a ha-dhcpc-native announcer could
-  gossip owned prefixes over periodic UDP heartbeats carrying `(prefix, owner/cost,
-  seq/ttl)` and install/remove kernel host routes. This is simpler to build but is
-  **not OSPF**, gives distance-vector-like behavior rather than proven OSPF SPF
-  semantics, and needs explicit loop prevention/horizon rules; it is suitable only
-  for very simple, well-controlled topologies and would be a separate design track.
+  propagate/forward non-local routes in the routing protocol. Implementation must
+  avoid generating LSAs for learned routes, must not advertise transit capability
+  for unrelated traffic, and must scope installed/used learned routes to the
+  intended fabric prefixes where practical. Installing routes to reach other
+  clusters’ ha-dhcpc-originated prefixes is in scope; providing transit for
+  unrelated third-party destinations is not.
 
-## 6. Proposed design (Option A)
+## 6. Proposed design (native speaker)
 
 **Edge-only constraint (invariant):** this node is an originator of locally owned
 prefixes only — never a transit/full OSPF router. It must not redistribute, re-
-originate, or propagate non-local routes learned via OSPF (no forwarding of
-non-local routes within the routing protocol). It must not be used as a transit
-path for unrelated third-party destinations; reachability to other clusters’
+originate, or propagate non-local routes learned via OSPF. It must not be used as a
+transit path for unrelated third-party destinations; reachability to other clusters’
 originated prefixes remains in scope.
 
 ### 6.1 Ownership and advertisement state
@@ -190,15 +172,16 @@ A prefix is **advertisable** from this node only when all of the following hold:
 - A local routing health policy allows advertisement (see §6.4).
 
 On any transition that ends ownership or validity, the node **withdraws** the
-advertisement before or atomically with relinquishing ownership (best-effort; must
-be idempotent).
+advertisement (flush/age-out the corresponding self-originated LSA(s) per OSPF
+rules) before or atomically with relinquishing ownership where possible; must be
+idempotent and conservative.
 
 ### 6.2 What is advertised and accepted
 
 | Prefix/route | Source | Direction | Default | Notes |
 |---|---|---|---|---|
 | Public DHCP IPv4 `/32` | `lease.address` | publish (originate) | **enabled** (when routing feature on) | Primary goal; moves with failover/new lease. |
-| VIP subnet(s) | `cluster.addresses` | publish (originate) | **optional** | Only prefixes explicitly enabled; avoids leaking internal ranges by default. |
+| VIP subnet(s) | `cluster.addresses` | publish (originate) | **optional** | Network prefix calculated from configured address/mask; only explicitly enabled. |
 | Default route `0.0.0.0/0` | primary DHCP/uplink default path | publish and/or accept (configurable) | **disabled** | Optional edge default-route signaling. **Backup routes must never be published** (see below). |
 
 - Prefixes/routes are originated only by the owning/eligible master; slaves never
@@ -220,38 +203,38 @@ be idempotent).
     route from a **remote cluster’s master** as the backup/fallback path.
   - The local (working) default route always takes precedence over any fabric-learned
     default route. When disabled, learned default routes are ignored.
-  Accepting/publishing a default route can affect transit behavior and must remain
-  explicitly opt-in and compatible with the edge-only intent of this feature.
+  Accepting/publishing a default route is explicitly opt-in and must remain
+  compatible with the edge-only intent.
 
 ### 6.3 OSPF subset and topology
 
 To keep complexity bounded, the supported subset is:
 
 - **OSPFv2, single Area 0** only.
-- **Explicit fabric interfaces:** OSPF runs only on the configured fabric interfaces;
-  no implicit enablement on other interfaces.
+- **Explicit fabric interfaces:** OSPF runs only on configured `ospf.interfaces`;
+  no implicit enablement on other interfaces. `ha-dhcpc` can peer directly with
+  external OSPF routers/daemons on these interfaces.
+- **Router ID:** configured explicitly when provided; otherwise defaults to this
+  node’s cluster/sync IP (stable per-node identity from cluster configuration).
 - **Network type:** implementation-selected for simplicity (point-to-point preferred
   on dedicated inter-cluster links; broadcast where required). No NBMA/virtual links
   in scope.
-- **Local-only origination (no transit):** originate only the specific prefixes
-  owned by this ha-dhcpc instance (e.g. its public `/32`, optional selected VIP
-  subnets). **No redistribution of the full kernel/connected table and no
-  propagation/re-advertisement of any non-local route learned via OSPF.** Enforce
-  with explicit outbound allowlists (prefix-list/route-map filtered to
-  ha-dhcpc-owned prefixes only) and reject/omit all other routes. Where supported,
-  configure the daemon in a non-transit/stub-router mode (e.g. FRR
-  `max-metric router-lsa` or equivalent) so other routers do not select this node
-  as transit for unrelated traffic.
+- **Local-only origination (no transit):** originate LSAs only for prefixes owned by
+  this ha-dhcpc instance (public `/32`, optional selected VIP subnets, optional
+  primary healthy default route). **No redistribution and no origination/re-flooding
+  of any non-local route learned via OSPF.** The implementation must not become a
+  transit path for unrelated third-party destinations.
 - **Learned routes handling:** routes to other clusters’ ha-dhcpc-originated
-  prefixes may be learned/installed as needed for reachability and shortest-path
-  selection to those prefixes. Non-local learned routes must never be redistributed
-  or re-originated by this node, and the node must not provide transit for
-  unrelated third-party destinations. Implementation should scope accepted/used
-  routes to the intended fabric prefixes where practical.
-- **Authentication:** optional simple authentication when configured, applied to the
-  configured fabric interfaces (see `ospf` config).
-- **Cost/metric:** backend/default-determined in v1 for simplicity (no separate
-  metric tuning in the minimal config).
+  prefixes may be learned and installed as needed for reachability and shortest-path
+  selection. `local_master` default-route attribution for backup selection is derived
+  from cluster information (heartbeat/designated master), not from unverified
+  non-cluster origin claims; remote defaults require explicit attribution/feed
+  mapping as designed. Fabric-learned defaults are backup-path only and never
+  published.
+- **Authentication:** optional simple authentication when configured (none,
+  plaintext/simple, or MD5 as supported), applied to configured fabric interfaces.
+- **Cost/metric:** fixed/default in v1 for simplicity (no separate metric tuning in
+  the minimal config), unless a minimal knob is added later.
 
 ### 6.4 Lease/health interaction (avoid blackholes)
 
@@ -260,10 +243,9 @@ to/from the upstream creates a blackhole. Policy (configurable, with safe defaul
 
 - **BOUND (healthy), primary path:** advertise eligible prefixes (and default route
   only if `publish` is enabled and no backup route is in use).
-- **RETAINED / degraded uplink:** default **withdraw** (or raise metric if supported
-  and explicitly configured) because reachability of the public path is uncertain;
-  allow an explicit opt-in to keep advertising during retention for deployments that
-  accept this risk.
+- **RETAINED / degraded uplink:** default **withdraw** because reachability of the
+  public path is uncertain; allow an explicit opt-in to keep advertising during
+  retention for deployments that accept this risk.
 - **Gateway probe unreachable / master backup route active / any backup route in use:**
   treat as degraded for advertisement unless explicitly overridden; ties into existing
   `apply.master_backup_gateway` / `gwping` signals. **Backup routes must never be
@@ -275,22 +257,19 @@ VIP) if those prefixes are purely local, but must still withdraw on demotion.
 
 ### 6.5 Integration with ha-dhcpc
 
-Add a routing/advertisement coordination layer that reacts to existing events:
+Add a native routing/OSPF coordination layer that reacts to existing events:
 
 - **Triggers:** role transitions (`set_role`/promote/demote/handoff), lease
   acquire/renew/change/loss, retention entry/exit, gateway-probe verdict changes,
   and executor apply results affecting ownership.
-- **Source of truth:** computed desired advertisement set derived from `ctx->role`,
-  `ctx->lease`, and config — reconciled idempotently (similar to executor desired
-  state), not driven by fragile edge-only hooks.
-- **Action backends (pluggable, platform-specific):**
-  - `backend: frr` — manage a prefix-list/route-map fragment or call `vtysh` to
-    originate/withdraw (exact mechanism chosen in implementation).
-  - `backend: bird` — `birdc`/config fragment + reload or protocol control.
-  - `backend: kernel` — install/remove tagged host routes in a dedicated table for
-    redistribution by an independently managed OSPF daemon (lowest coupling).
-  - `backend: hook` — exec an operator-supplied idempotent script with structured
-    env/args (`up|down`, prefix, interface, reason) for custom integration.
+- **Source of truth:** computed desired advertisement/origination set derived from
+  `ctx->role`, `ctx->lease`, and config — reconciled idempotently (similar to
+  executor desired state), not driven by fragile edge-only hooks.
+- **Native actions:** originate/update/withdraw self-originated LSAs and maintain the
+  minimal LSDB/neighbor state on configured fabric interfaces; install/remove
+  accepted learned routes via the system routing table according to policy (never
+  overwriting unrelated/direct local routes, never publishing backups, local working
+  default precedence preserved).
 - **Ordering:** withdraw before demotion/release where possible; advertise after the
   address/ownership is actually applied (or ready) to avoid transient blackholes.
 
@@ -315,9 +294,8 @@ Add a routing/advertisement coordination layer that reacts to existing events:
 
 ## 7. Proposed configuration (illustrative)
 
-OSPF settings live in a separate, minimal `ospf` block: fabric interfaces and
-optional simple authentication. Routing behavior/ownership remains driven by
-ha-dhcpc state (edge-only, local prefixes only).
+OSPF settings live in a separate, minimal `ospf` block. Routing behavior/ownership
+remains driven by ha-dhcpc state (edge-only, local prefixes only).
 
 ```yaml
 routing:
@@ -327,29 +305,27 @@ routing:
     vip_subnets: false       # optional: selected local VIP prefixes
     default_route: false     # publish 0.0.0.0/0 only on primary healthy path (never backup routes)
   accept:
-    default_route: false     # accept/install 0.0.0.0/0 learned from fabric
+    default_route: false     # accept/install 0.0.0.0/0 learned from fabric (backup path only)
 
 ospf:
+  # router_id: 10.0.0.2      # optional; defaults to this node's cluster/sync IP
   interfaces:                # fabric interfaces to run OSPF on (required when enabled)
     - br-fabric
     # - br-fabric2
   # auth:                    # optional simple authentication (applies to all interfaces)
   #   type: plaintext        # none | plaintext | md5
-  #   key: "secret"         # required for plaintext/md5
+  #   key: "secret"          # required for plaintext/md5
   #   key_id: 1              # md5 only
 ```
 
 Notes:
-- Keep `ospf` as simple as possible (interfaces + optional simple auth). Area is
-  implicitly 0 and advanced OSPF/backend knobs are omitted from the minimal config.
+- Keep `ospf` minimal (router-id defaulted from cluster config, interfaces, optional
+  simple auth). Area is implicitly 0.
 - `routing.advertise.default_route` and `routing.accept.default_route` are
-  independent and default off. Publishing/accepting a default route is opt-in and
-  may affect edge/transit behavior; only the primary healthy path may be published.
-  The local (working) default route always takes precedence over any fabric-learned
-  default route. An accepted default route learned from a local cluster member
-  (master only) maps to `apply.backup_gateway`; if the local cluster master is down,
-  a default route from a remote cluster’s master may be used instead. Backup routes
-  are never published.
+  independent and default off. Only the primary healthy path may be published. A
+  local-cluster-master fabric default, when accepted, maps to `apply.backup_gateway`;
+  remote-cluster-master default may be used only when the local master is down.
+  Backup/fabric-learned defaults are never published.
 - **Backup routes are never published:** `apply.backup_gateway`,
   `apply.master_backup_gateway`, and probe/failover backup paths must not be
   advertised as `0.0.0.0/0`.
@@ -357,14 +333,14 @@ Notes:
   are originated and never non-local/learned routes (see §6.3).
 - `vip_subnets` selection must be precise to prevent accidental leakage of
   non-routable/private prefixes into the fabric.
-- The schema is illustrative; exact names/validation are finalized at implementation.
 
 ## 8. Observability and operations
 
-- Extend `ctl status` / JSON with routing advertisement state: enabled, backend,
-  advertised prefixes, last withdraw/announce reason, backend health/errors.
-- Structured logs on every announce/withdraw with prefix, role, lease version, and
-  reason.
+- Extend `ctl status` / JSON with routing/OSPF state: enabled, router-id, interfaces,
+  neighbor/adjacency summary (as available), originated prefixes, accepted/selected
+  backup candidates, last withdraw/announce reason, errors.
+- Structured logs on every originate/withdraw/adjacency change with prefix, role,
+  lease version, router-id, and reason.
 - A safe manual control (e.g. `ctl routing withdraw|reconcile`) may be added, but
   must not override mastership/ownership invariants.
 
@@ -372,78 +348,79 @@ Notes:
 
 - Treat OSPF as a trusted-fabric protocol: require/encourage authentication on
   fabric interfaces; never enable OSPF on untrusted/DHCP uplink interfaces.
-- Strictly filter originated prefixes so `ha-dhcpc` cannot be induced to advertise
-  arbitrary routes.
-- Hook/backend commands run with daemon privileges: paths must be absolute,
-  arguments controlled, and failures surfaced (no silent partial state).
+- Strictly validate and filter originated prefixes so `ha-dhcpc` cannot be induced
+  to advertise arbitrary routes.
+- Robustly parse/validate all received OSPF packets and LSAs (lengths, checksums,
+  auth, LSA types/ages/sequence handling) to reduce crash/injection risk, given
+  direct protocol exposure.
 
 ## 10. Risks and mitigations
 
 - **Blackhole during retention/uplink loss:** default withdraw / conservative
   policy (§6.4).
 - **Stale advertisement after crash/failover:** idempotent reconcile on startup and
-  periodic verification; withdraw on uncertainty; keep external daemon state
-  minimal and derived.
+  periodic verification; withdraw on uncertainty; age out/flush self-originated LSAs
+  on loss of ownership.
 - **Route flapping on rapid role/lease changes:** debounce/reconcile using current
   desired state (not per-event churn) and respect existing cluster cooldowns.
-- **External dependency drift (FRR/BIRD differences):** isolate via a narrow
-  backend interface and contract tests per backend.
-- **Complexity creep:** enforce the v1 OSPF subset; reject features that require a
-  built-in protocol engine.
-- **Over-trimming OSPF:** attempting a “heartbeat + route only” custom speaker
-  reintroduces LSDB/SPF/flooding correctness risks; prefer the minimal external
-  OSPF profile (§5.1) or an explicitly non-OSPF bespoke track for trivial topologies.
-- **Leaking non-local routes:** misconfiguration could propagate learned routes;
-  enforce strict local-prefix-only outbound filtering and non-transit settings, and
-  verify no non-local prefixes are originated.
+- **Native OSPF correctness/interop risk:** implement only the minimal interoperable
+  subset, test against external OSPF routers/daemons (e.g. FRR/BIRD) in Area 0
+  topologies, and prefer conservative behavior on ambiguity.
+- **Leaking non-local routes / transit:** never originate LSAs for learned routes,
+  enforce edge-only/non-transit behavior, and scope installed/used routes to
+  intended fabric prefixes.
+- **Complexity creep:** enforce the v1 OSPF subset and edge-only scope; avoid full
+  general-purpose routing-daemon features.
 
 ## 11. Implementation milestones
 
-- **R0 — Design freeze:** confirm target platforms/backends (OpenWrt packages
-  available?), exact retention/probe policy, /32 binding model, and VIP selection
-  semantics; finalize config schema and status fields.
-- **R1 — Advertisement core (backend-agnostic):** compute desired prefix set from
-  role/lease/VIP state; idempotent reconcile engine; `kernel` or `hook` backend;
-  status/logging; unit tests for state transitions.
-- **R2 — OSPF backend integration:** one concrete backend (e.g. FRR or BIRD) with a
-  documented Area-0/point-to-point subset, prefix filtering, and packaging notes;
-  lab validation of shortest-path selection and failover convergence.
-- **R3 — Hardening:** retention/probe policy wiring, startup/crash reconciliation,
-  optional VIP subnet advertisement, auth/config passthrough, docs and operational
-  runbook.
-- **R4 — Multi-cluster validation:** netns/lab topology with >=2 clusters and
-  alternate paths; verify /32 (and optional VIP) reachability across failover and
-  shortest-path changes.
+- **R0 — Design freeze:** confirm target topologies/interop peers (FRR/BIRD/other),
+  exact minimal LSA/adjacency/timer/auth profile, retention/probe policy, /32
+  binding model, VIP selection semantics, and router-id defaulting; finalize config
+  schema and status fields.
+- **R1 — Routing core (state-driven):** compute desired originated prefix set from
+  role/lease/VIP state; idempotent reconcile engine; local-master default
+  attribution from cluster information (heartbeat/designated master); in-memory
+  candidate/selection for backup defaults; status/logging; unit tests for state
+  transitions and selection rules.
+- **R2 — Native OSPFv2 speaker (interop):** minimal Area 0 speaker on configured
+  fabric interfaces (Hello/adjacency, LSDB sync, originate/withdraw owned-prefix
+  LSAs, receive/process neighbor LSAs) with router-id/auth support; direct interop
+  with external OSPF routers/daemons; shortest-path reachability and failover
+  convergence validation.
+- **R3 — Route install and hardening:** policy-compliant install of learned fabric
+  routes and accepted backup defaults (local working precedence, no backup publish,
+  no overwrite of unrelated/direct local routes), retention/probe wiring,
+  startup/crash reconciliation, docs and operational runbook.
+- **R4 — Multi-cluster validation:** netns/lab topology with >=2 clusters, external
+  OSPF peers, and alternate paths; verify /32 (and optional VIP) reachability across
+  failover and shortest-path changes.
 
 ## 12. Open questions
 
-1. Which OSPF daemon(s) must be supported first on the target deployments (FRR,
-   BIRD, `ospfd` package on OpenWrt), and what control interface is stable there?
-2. During `RETAINED` with an unreachable gateway, should the default be strict
-   withdraw of the public /32, or a configurable metric penalty?
-3. Should the public /32 be bound to the DHCP interface, a loopback, or a
-   routing-only construct to decouple advertisement from interface specifics?
-4. Which `cluster.addresses` (all, per-interface allowlist, or explicit CIDRs) are
+1. Which minimal LSA types and origination strategy best fit edge-only interop in
+   Area 0 for `/32`, VIP subnets, and optional default route (while remaining
+   interoperable with FRR/BIRD)?
+2. Which external OSPF speakers/topologies must be validated first for direct
+   interoperability, and what Hello/Dead/timer defaults are acceptable?
+3. During `RETAINED` with an unreachable gateway, should the default be strict
+   withdraw of the public /32, or a configurable metric/penalty if supported?
+4. Should the public /32 be bound to the DHCP interface, a loopback, or a
+   routing-only construct to decouple advertisement from forwarding specifics?
+5. Which `cluster.addresses` (all, per-interface allowlist, or explicit CIDRs) are
    eligible for optional advertisement?
-5. Is equal-cost multipath (ECMP) across fabric links desired/acceptable in v1, or
-   should the design assume a single best path?
-6. What convergence target (seconds) is required for inter-cluster reroute on
-   failover, and is it achievable with the chosen backend’s default timers?
-7. Is the minimal external-OSPF profile (§5.1) sufficient for all target
-   topologies, or do any require the non-OSPF bespoke announcer contingency (and
-   if so, is the topology simple enough to bound loops/convergence)?
-8. How should the edge-only/non-transit constraint be enforced per backend
-   (outbound-only local prefix filters, non-transit/max-metric LSA, and scoping of
-   installed learned routes) to guarantee no non-local routes are propagated?
-9. Is global `ospf.auth` sufficient for all fabric interfaces, or is simple
-   per-interface auth needed while keeping the config minimal?
-10. (Resolved) Local (working) default route always takes precedence over any
-    fabric-learned `0.0.0.0/0`. A default route learned from a local cluster member
-    (master only), if accepted, is mapped to `apply.backup_gateway` as a backup path.
-    If the local cluster master is down/unavailable, a default route from a remote
-    cluster’s master may be used as backup/fallback. Fabric-learned defaults must
-    never cause backup-route publication and must remain compatible with edge-only
-    intent.
-11. How are fabric-learned default routes attributed to a local cluster member
-    (master only) versus a remote cluster’s master (router-id/origin mapping or
-    equivalent) to drive `apply.backup_gateway` selection?
+6. Is equal-cost multipath (ECMP) across fabric links desired/acceptable in v1?
+7. How should the edge-only/non-transit constraint be enforced concretely in the
+   native speaker (no self-originated transit LSAs/routes, no learned-route
+   re-origination, scoped route installation) to guarantee no non-local routes are
+   propagated?
+8. How are fabric-learned default routes from remote clusters attributed
+   (router-id/origin mapping or equivalent) to identify a remote cluster master for
+   fallback, given local-master attribution is derived from cluster information?
+9. (Resolved) Local (working) default route always takes precedence over any
+   fabric-learned `0.0.0.0/0`. A default route learned from a local cluster member
+   (master only), if accepted, is mapped to `apply.backup_gateway` as a backup path.
+   If the local cluster master is down/unavailable, a default route from a remote
+   cluster’s master may be used as backup/fallback. Fabric-learned defaults must
+   never cause backup-route publication and must remain compatible with edge-only
+   intent.
