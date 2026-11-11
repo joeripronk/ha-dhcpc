@@ -21,6 +21,7 @@
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/reload.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 static const char *role_name(hadc_role_t r)
@@ -75,6 +76,7 @@ static json_t *status_object(hadc_ctx_t *ctx)
     }
     json_object_set_new(o, "cluster_addresses", cluster);
     json_object_set_new(o, "executor", hadc_executor_status());
+    json_object_set_new(o, "routing", hadc_routing_status(ctx));
     return o;
 }
 

@@ -30,6 +30,7 @@
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 static int nl_addr_add(struct nl_sock *sk, int ifindex, const struct in_addr *ip,
@@ -185,12 +186,18 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
     snprintf(out->interface, sizeof(out->interface), "%s", ctx->conf.interface);
     out->add_routes = ctx->conf.apply.routes;
     out->backup_gateway = ctx->conf.apply.backup_gateway;
+    {
+        struct in_addr rgw = hadc_routing_backup_gateway(ctx);
+        if (rgw.s_addr != 0)
+            out->backup_gateway = rgw;
+    }
     out->cluster_addrs_present = ctx->role == HADC_ROLE_MASTER;
     out->n_cluster_ifaces = ctx->conf.cluster.n_ifaces;
     for (size_t i = 0; i < out->n_cluster_ifaces; i++)
         out->cluster_ifaces[i] = ctx->conf.cluster.ifaces[i];
     /* Backup default route: a slave keeps a higher-metric route so it stays
-     * reachable when its synced lease has no gateway; a master never uses it. */
+     * reachable when its synced lease has no gateway; a master never uses it.
+     * Effective gateway may come from static config or fabric-learned routing. */
     out->backup_route = ctx->role == HADC_ROLE_SLAVE && out->backup_gateway.s_addr != 0;
 
     if (lease->state == HADC_LEASE_NONE) {

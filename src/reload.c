@@ -26,6 +26,7 @@
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/reload.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 static const struct in_addr *self_sync(hadc_ctx_t *ctx)
@@ -90,6 +91,17 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     int cluster_addrs = next.cluster.n_ifaces != ctx->conf.cluster.n_ifaces ||
         memcmp(next.cluster.ifaces, ctx->conf.cluster.ifaces,
                sizeof(next.cluster.ifaces)) != 0;
+    int routing_changed = next.routing.enabled != ctx->conf.routing.enabled ||
+        next.routing.advertise.public_ip32 != ctx->conf.routing.advertise.public_ip32 ||
+        next.routing.advertise.vip_subnets != ctx->conf.routing.advertise.vip_subnets ||
+        next.routing.advertise.default_route != ctx->conf.routing.advertise.default_route ||
+        next.routing.accept.default_route != ctx->conf.routing.accept.default_route ||
+        next.ospf.n_interfaces != ctx->conf.ospf.n_interfaces ||
+        memcmp(next.ospf.interfaces, ctx->conf.ospf.interfaces, sizeof(next.ospf.interfaces)) != 0 ||
+        next.ospf.auth.type != ctx->conf.ospf.auth.type ||
+        strcmp(next.ospf.auth.key, ctx->conf.ospf.auth.key) != 0 ||
+        next.ospf.auth.key_id != ctx->conf.ospf.auth.key_id;
+
     int apply = interface_changed || cluster_addrs ||
         next.apply.routes != ctx->conf.apply.routes ||
         next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||
@@ -102,7 +114,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.apply.abort_tcp_on_newip != ctx->conf.apply.abort_tcp_on_newip ||
         next.apply.disable_ipv6 != ctx->conf.apply.disable_ipv6 ||
         next.apply.dhcp_disable_ipv6_set != ctx->conf.apply.dhcp_disable_ipv6_set ||
-        next.apply.dhcp_disable_ipv6 != ctx->conf.apply.dhcp_disable_ipv6;
+        next.apply.dhcp_disable_ipv6 != ctx->conf.apply.dhcp_disable_ipv6 ||
+        routing_changed;
 
     if (heartbeat)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%sheartbeat", n ? " " : "");
@@ -119,6 +132,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     if (role_timers)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%srole/priority/timers",
                               n ? " " : "");
+    if (routing_changed)
+        n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%srouting", n ? " " : "");
     if (cluster_addrs)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%scluster_addresses",
                               n ? " " : "");
@@ -156,6 +171,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
      * the engine starts speaking on it. */
     if (apply) {
         hadc_desired_t desired;
+        if (routing_changed)
+            hadc_routing_reconcile(ctx, "reload");
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired, "RELOAD");
         if (ctx->role == HADC_ROLE_MASTER && cluster_addrs)
@@ -163,6 +180,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         hadc_gwping_stop(ctx);
         if (ctx->role == HADC_ROLE_MASTER)
             hadc_gwping_start(ctx);
+    } else if (routing_changed) {
+        hadc_routing_reconcile(ctx, "reload");
     }
     if (dhcp_knobs)
         hadc_dhcpcore_reload(ctx);

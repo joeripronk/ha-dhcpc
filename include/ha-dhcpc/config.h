@@ -99,6 +99,26 @@ typedef struct {
         bool dhcp_disable_ipv6_set;    /* override for the DHCP interface */
         bool dhcp_disable_ipv6;
     } apply;
+    struct {
+        bool enabled;
+        struct {
+            bool public_ip32;
+            bool vip_subnets;
+            bool default_route; /* publish primary healthy 0.0.0.0/0 only */
+        } advertise;
+        struct {
+            bool default_route; /* accept fabric 0.0.0.0/0 as backup path only */
+        } accept;
+    } routing;
+    struct {
+        char interfaces[HADC_CLUSTER_IF_MAX][HADC_IFNAME_MAX];
+        size_t n_interfaces;
+        struct {
+            int type; /* 0 none, 1 plaintext, 2 md5 */
+            char key[128];
+            int key_id;
+        } auth;
+    } ospf;
     char ctl_socket[HADC_PATH_MAX];
     /* Engine lease DB (the dhclient-compatible lease file the core reads at
      * start and the daemon keeps current on slaves). Relative names resolve

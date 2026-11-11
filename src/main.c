@@ -31,6 +31,7 @@
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 #include <sys/socket.h>
@@ -101,6 +102,7 @@ static void periodic_ready(hadc_ctx_t *ctx, int fd)
     (void)!read(fd, &exp, sizeof(exp));
     hadc_executor_audit_tick(ctx); /* rate-limited live-state audit (plan §3) */
     hadc_gwping_tick(ctx); /* 1 s gateway probes + reply timeouts/failover */
+    hadc_routing_reconcile(ctx, "periodic");
 }
 
 static void signal_ready(hadc_ctx_t *ctx, int fd)
@@ -349,6 +351,12 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
     }
     ctx->acked_version = ctx->lease.version;
     cache_gw_mac(ctx);
+    hadc_routing_reconcile(ctx, lease ? "lease-update" : "lease-lost");
+    if (ctx->role == HADC_ROLE_SLAVE) {
+        hadc_desired_t rd;
+        hadc_executor_desired(ctx, &ctx->lease, &rd);
+        hadc_executor_apply(ctx, &rd, "ROUTING-RECONCILE");
+    }
     hadc_cluster_push_state(ctx, &ctx->lease); /* master-only (plan §4) */
     hadc_persist_save(ctx);
 }
@@ -366,6 +374,7 @@ static void cb_retention(void *arg, bool entered)
         ctx->lease.state = HADC_LEASE_BOUND;
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, entered ? "RETAINED-ENTER" : "RETAINED-EXIT");
+    hadc_routing_reconcile(ctx, entered ? "retention-enter" : "retention-exit");
     ctx->acked_version = ctx->lease.version;
     hadc_cluster_push_state(ctx, &ctx->lease);
     hadc_persist_save(ctx);
@@ -415,6 +424,7 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                       rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
         }
     }
+    hadc_routing_reconcile(ctx, new_role == HADC_ROLE_MASTER ? "promote" : "demote");
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
     if (new_role == HADC_ROLE_MASTER) {
@@ -609,6 +619,7 @@ int main(int argc, char **argv)
         return 1; /* before election: the role hook brings the link up */
     hadc_executor_monitor_start(ctx); /* drift self-heal: re-apply when managed
                                        * resources change underneath us */
+    hadc_routing_init(ctx);
     hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
 
     /* Startup desired-state pass from the restored cache: apply the interface
@@ -619,6 +630,7 @@ int main(int argc, char **argv)
     {
         hadc_desired_t desired;
         bool resume = pv.found && ctx->lease.address.s_addr != 0;
+        hadc_routing_reconcile(ctx, "startup");
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         if (resume && ctx->conf.dhcp.retention != HADC_RETENTION_OFF)
             cb_retention(ctx, true);
@@ -718,6 +730,7 @@ int main(int argc, char **argv)
     }
     hadc_dhcpcore_stop(ctx);
     hadc_gwping_stop(ctx);
+    hadc_routing_shutdown(ctx);
     if (hadc_cluster_graceful_active(ctx))
         hadc_info("graceful restart active: leaving cluster/VIP state applied on exit");
     else

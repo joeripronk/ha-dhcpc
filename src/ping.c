@@ -17,6 +17,7 @@
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 /* magic + pid + per-probe seq + padding, so stray echo replies cannot be
@@ -61,6 +62,7 @@ static void reroute(hadc_ctx_t *ctx, const char *reason)
 {
     hadc_desired_t desired;
 
+    hadc_routing_reconcile(ctx, reason);
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, reason);
 }

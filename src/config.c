@@ -777,6 +777,109 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     if (!out->ctl_socket[0])
         snprintf(out->ctl_socket, HADC_PATH_MAX, "/run/ha-dhcpc.ctl");
 
+    /* routing (edge-only inter-cluster routing; off by default). */
+    out->routing.enabled = false;
+    out->routing.advertise.public_ip32 = true;
+    out->routing.advertise.vip_subnets = false;
+    out->routing.advertise.default_route = false;
+    out->routing.accept.default_route = false;
+    out->ospf.n_interfaces = 0;
+    out->ospf.auth.type = 0;
+    out->ospf.auth.key[0] = '\0';
+    out->ospf.auth.key_id = 0;
+    {
+        json_t *r = json_object_get(root, "routing");
+        if (r) {
+            if (!json_is_object(r)) {
+                snprintf(err, errlen, "config: routing must be a mapping");
+                goto derr;
+            }
+            if (get_bool(r, "enabled", &out->routing.enabled, false)) goto derr;
+            json_t *ra = json_object_get(r, "advertise");
+            if (ra) {
+                if (!json_is_object(ra)) {
+                    snprintf(err, errlen, "config: routing.advertise must be a mapping");
+                    goto derr;
+                }
+                if (get_bool(ra, "public_ip32", &out->routing.advertise.public_ip32, true)) goto derr;
+                if (get_bool(ra, "vip_subnets", &out->routing.advertise.vip_subnets, false)) goto derr;
+                if (get_bool(ra, "default_route", &out->routing.advertise.default_route, false)) goto derr;
+            }
+            json_t *rc = json_object_get(r, "accept");
+            if (rc) {
+                if (!json_is_object(rc)) {
+                    snprintf(err, errlen, "config: routing.accept must be a mapping");
+                    goto derr;
+                }
+                if (get_bool(rc, "default_route", &out->routing.accept.default_route, false)) goto derr;
+            }
+        }
+        json_t *o = json_object_get(root, "ospf");
+        if (o) {
+            if (!json_is_object(o)) {
+                snprintf(err, errlen, "config: ospf must be a mapping");
+                goto derr;
+            }
+            json_t *ifs = json_object_get(o, "interfaces");
+            if (!ifs)
+                ifs = json_object_get(o, "interface");
+            if (ifs && json_is_string(ifs)) {
+                if (out->ospf.n_interfaces < HADC_CLUSTER_IF_MAX)
+                    snprintf(out->ospf.interfaces[out->ospf.n_interfaces++], HADC_IFNAME_MAX, "%s",
+                             json_string_value(ifs));
+            } else if (ifs && json_is_array(ifs)) {
+                json_t *e;
+                size_t idx;
+                json_array_foreach(ifs, idx, e) {
+                    if (!json_is_string(e) || out->ospf.n_interfaces >= HADC_CLUSTER_IF_MAX) {
+                        snprintf(err, errlen, "config: bad ospf.interfaces entry");
+                        goto derr;
+                    }
+                    snprintf(out->ospf.interfaces[out->ospf.n_interfaces++], HADC_IFNAME_MAX, "%s",
+                             json_string_value(e));
+                }
+            } else if (ifs) {
+                snprintf(err, errlen, "config: ospf.interfaces must be a list or string");
+                goto derr;
+            }
+            json_t *au = json_object_get(o, "auth");
+            if (au && !json_is_null(au)) {
+                if (!json_is_object(au)) {
+                    snprintf(err, errlen, "config: ospf.auth must be a mapping");
+                    goto derr;
+                }
+                const char *t = "none";
+                json_t *tv = json_object_get(au, "type");
+                if (tv && json_is_string(tv))
+                    t = json_string_value(tv);
+                if (!strcmp(t, "none") || !strcmp(t, "off"))
+                    out->ospf.auth.type = 0;
+                else if (!strcmp(t, "plaintext") || !strcmp(t, "simple"))
+                    out->ospf.auth.type = 1;
+                else if (!strcmp(t, "md5"))
+                    out->ospf.auth.type = 2;
+                else {
+                    snprintf(err, errlen, "config: unknown ospf.auth.type %s", t);
+                    goto derr;
+                }
+                json_t *kv = json_object_get(au, "key");
+                if (kv && json_is_string(kv))
+                    snprintf(out->ospf.auth.key, sizeof(out->ospf.auth.key), "%s", json_string_value(kv));
+                json_t *kid = json_object_get(au, "key_id");
+                if (kid && json_is_integer(kid))
+                    out->ospf.auth.key_id = (int)json_integer_value(kid);
+                if (out->ospf.auth.type != 0 && out->ospf.auth.key[0] == '\0') {
+                    snprintf(err, errlen, "config: ospf.auth.key required for %s", t);
+                    goto derr;
+                }
+            }
+        }
+        if (out->routing.enabled && out->ospf.n_interfaces == 0) {
+            snprintf(err, errlen, "config: ospf.interfaces required when routing.enabled is true");
+            goto derr;
+        }
+    }
+
     /* Lease DB: relative names resolve against the shared config file's
      * directory; absolute names are used as given; none/off/no/~ opts out of the
      * file entirely (the daemon's own state file stays the persistence, and the
