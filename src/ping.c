@@ -14,9 +14,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
 
@@ -67,11 +69,29 @@ static void reroute(hadc_ctx_t *ctx, const char *reason)
     hadc_executor_apply(ctx, &desired, reason);
 }
 
+static void validate_retained_lease(hadc_ctx_t *ctx)
+{
+    hadc_desired_t desired;
+
+    if (!ctx->lease.retention_active || ctx->role != HADC_ROLE_MASTER ||
+        ctx->lease.state != HADC_LEASE_RETAINED || ctx->lease.address.s_addr == 0)
+        return;
+
+    hadc_info("gwping: gateway validated; promoting retained lease to BOUND");
+    ctx->lease.retention_active = false;
+    ctx->lease.state = HADC_LEASE_BOUND;
+    hadc_executor_desired(ctx, &ctx->lease, &desired);
+    hadc_executor_apply(ctx, &desired, "RETAINED-EXIT");
+    hadc_routing_reconcile(ctx, "gwping-validated");
+    ctx->acked_version = ctx->lease.version;
+    hadc_cluster_push_state(ctx, &ctx->lease);
+    hadc_persist_save(ctx);
+}
+
 static void ping_ready(hadc_ctx_t *ctx, int fd)
 {
     uint8_t buf[1024];
 
-    (void)ctx;
     for (;;) {
         ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n < 0) {
@@ -119,6 +139,7 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
         } else {
             hadc_dbg("gwping: gateway echo ok (rtt %llums)", (long long)rtt);
         }
+        validate_retained_lease(ctx);
     }
 }
 
