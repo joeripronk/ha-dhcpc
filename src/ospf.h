@@ -24,4 +24,7 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
 struct json_t;
 struct json_t *hadc_ospf_status(hadc_ctx_t *ctx);
 
+/* Collect fabric-learned default-route candidates from LSDB (AS-external 0/0). */
+size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max);
+
 #endif /* HA_DHCPC_OSPF_H */

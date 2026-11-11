@@ -343,6 +343,9 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 
     update_local_candidate(ctx);
 
+    /* Refresh fabric-learned default candidates from native OSPF LSDB. */
+    g_rs.n_remote_cands = hadc_ospf_default_candidates(ctx, g_rs.remote_cands, HADC_ROUTING_MAX_CANDIDATES);
+
     /* Desired advertisements: local owned prefixes only, edge-only. Never publish
      * backup routes; withdraw default-route advertisement while on backup. */
     bool want_pub = enabled && g_rs.publish_public_ip32 && healthy_bound;

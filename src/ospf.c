@@ -1040,8 +1040,8 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     g_ospf.last_self_orig = now;
 
     char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(g_ospf.router_id, ridbuf, sizeof(ridbuf));
-    hadc_dbg("ospf: originated Router-LSA (rid %s, seq 0x%08x, %zu stub links)",
-             ridbuf, ntohl(lh->seq), nlinks);
+    hadc_dbg("ospf: originated self LSAs (rid %s, %zu stub links, default=%s)",
+             ridbuf, nlinks, want_default_route ? "yes" : "no");
 
     for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
         if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
@@ -1096,6 +1096,62 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
     }
 }
 
+
+
+size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max)
+{
+    size_t n = 0;
+    if (!g_ospf.enabled || !out || max == 0)
+        return 0;
+    for (size_t i = 0; i < g_ospf.n_lsas && n < max; i++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || e->self)
+            continue;
+        if (e->hdr.type != OSPF_LSA_AS_EXTERNAL)
+            continue;
+        if (ntohl(e->hdr.id) != 0)
+            continue; /* only default route */
+        if (e->body_len < 16)
+            continue;
+        /* body: mask(4), metric(4, includes E/TOS), fwd addr(4), tag(4) */
+        uint32_t mask = 0, metric = 0, fwd = 0;
+        memcpy(&mask, e->body, 4);
+        memcpy(&metric, e->body + 4, 4);
+        memcpy(&fwd, e->body + 8, 4);
+        if (mask != 0)
+            continue; /* not 0.0.0.0/0 */
+
+        struct in_addr gw = {0};
+        if (fwd != 0) {
+            gw.s_addr = fwd;
+        } else {
+            /* forwarding addr 0.0.0.0 => ASBR; nexthop unknown without SPF.
+             * Do not fabricate a gateway. */
+            continue;
+        }
+
+        hadc_routing_default_candidate_t *c = &out[n++];
+        memset(c, 0, sizeof(*c));
+        c->gateway = gw;
+        c->scope = HADC_ROUTE_SCOPE_REMOTE_MASTER;
+        c->valid = true;
+        char rid[INET_ADDRSTRLEN];
+        u32_to_rid(ntohl(e->hdr.adv_router), rid, sizeof(rid));
+        /* attribute origin; if matches a known cluster member, record id */
+        snprintf(c->origin, sizeof(c->origin), "%s", rid);
+        if (ctx) {
+            for (size_t m = 0; m < ctx->conf.n_members; m++) {
+                char ms[INET_ADDRSTRLEN] = "";
+                inet_ntop(AF_INET, &ctx->conf.members[m].sync_address, ms, sizeof(ms));
+                if (!strcmp(ms, rid)) {
+                    snprintf(c->origin, sizeof(c->origin), "%s", ctx->conf.members[m].id);
+                    break;
+                }
+            }
+        }
+    }
+    return n;
+}
 
 json_t *hadc_ospf_status(hadc_ctx_t *ctx)
 {
