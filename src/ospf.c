@@ -712,6 +712,8 @@ static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t le
     oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
     send_to(n->ip, n->ifindex, out, ooff);
     n->last_lsreq_sent = time(NULL);
+    if (n->state == NSTATE_EXCHANGE)
+        n->state = NSTATE_LOADING;
     hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, inet_ntoa(n->ip));
 }
 
@@ -779,7 +781,10 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
         char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(rid, ridbuf, sizeof(ridbuf));
         const char *sn = n->state == NSTATE_DOWN ? "Down" :
                          n->state == NSTATE_INIT ? "Init" :
-                         n->state == NSTATE_2WAY ? "2-Way" : "Full-ish";
+                         n->state == NSTATE_2WAY ? "2-Way" :
+                         n->state == NSTATE_EXSTART ? "ExStart" :
+                         n->state == NSTATE_EXCHANGE ? "Exchange" :
+                         n->state == NSTATE_LOADING ? "Loading" : "Full";
         hadc_info("ospf: neighbor %s (%s) on %s -> %s", ridbuf, inet_ntoa(src),
                   iface ? iface->name : "?", sn);
     }
@@ -936,10 +941,16 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         send_to(n->ip, n->ifindex, out, olen);
         n->last_dbdesc_sent = time(NULL);
         if (!(flags & OSPF_DD_FLAG_M)) {
-            n->state = NSTATE_FULL;
-            n->lsa_sync_sent = true;
+            /* if we requested LSAs we stay/loading until updates arrive; simple:
+             * promote to Full when no outstanding request recently */
+            if (time(NULL) - n->last_lsreq_sent > 2 || n->last_lsreq_sent == 0) {
+                n->state = NSTATE_FULL;
+                n->lsa_sync_sent = true;
+            } else {
+                n->state = NSTATE_LOADING;
+            }
         } else {
-            n->state = NSTATE_LOADING;
+            n->state = NSTATE_EXCHANGE;
         }
         flood_lsas_to_neighbor(n, false);
         return;
@@ -1295,18 +1306,26 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
 
     /* Periodically reflood LSAs and retransmit adjacency packets for interop */
     static time_t last_flood, last_full_flood;
-    if (now - last_flood >= 30) {
+    if (now - last_flood >= 5) {
         for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
             ospf_neighbor_t *n = &g_ospf.nbrs[i];
             if (!n->in_use) continue;
-            if (n->state >= NSTATE_2WAY)
-                flood_self_lsas_to_neighbor(n);
+            if (n->state == NSTATE_LOADING && n->last_lsreq_sent != 0 && now - n->last_lsreq_sent >= 5) {
+                n->state = NSTATE_FULL;
+                n->lsa_sync_sent = true;
+            }
             if (n->state == NSTATE_EXSTART && now - n->last_dbdesc_sent >= 5) {
                 uint8_t out[OSPF_MTU]; size_t olen = 0;
                 build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
                 send_to(n->ip, n->ifindex, out, olen);
                 n->last_dbdesc_sent = now;
             }
+        }
+    }
+    if (now - last_flood >= 30) {
+        for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+            if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
+                flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
         }
         last_flood = now;
     }
