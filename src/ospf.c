@@ -1372,6 +1372,35 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
     return n;
 }
 
+static struct in_addr nbr_nexthop_for(uint32_t adv_router)
+{
+    struct in_addr gw = {0};
+    for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
+        ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
+        if (!nb->in_use || nb->state < NSTATE_2WAY)
+            continue;
+        if (nb->router_id == adv_router)
+            return nb->ip;
+    }
+    return gw;
+}
+
+static void append_learned_prefix(json_t *arr, struct in_addr pfx, struct in_addr mask,
+                                  const char *origin, const char *nexthop, const char *source, uint8_t lsa_type)
+{
+    char p[INET_ADDRSTRLEN], m[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &pfx, p, sizeof(p));
+    inet_ntop(AF_INET, &mask, m, sizeof(m));
+    /* compute prefixlen */
+    uint32_t mv = ntohl(mask.s_addr);
+    int plen = 0;
+    for (int i = 31; i >= 0; i--) { if (mv & (1u << i)) plen++; else break; }
+    json_array_append_new(arr, json_pack("{s:s,s:i,s:s,s:s,s:s,s:s,s:i}",
+                                         "prefix", p, "prefixlen", plen, "mask", m,
+                                         "origin", origin, "nexthop", nexthop, "source", source,
+                                         "lsa_type", (int)lsa_type));
+}
+
 json_t *hadc_ospf_status(hadc_ctx_t *ctx)
 {
     (void)ctx;
@@ -1396,17 +1425,57 @@ json_t *hadc_ospf_status(hadc_ctx_t *ctx)
                                               "ip", ip, "state", sn,
                                               "dead_in", (int)(n->dead_at > now ? n->dead_at - now : 0)));
     }
+    json_t *learned = json_array();
     int self_lsas = 0, other_lsas = 0;
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
-        if (!g_ospf.lsdb[i].valid) continue;
-        if (g_ospf.lsdb[i].self) self_lsas++; else other_lsas++;
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid) continue;
+        if (e->self) { self_lsas++; continue; }
+        other_lsas++;
+        char origin[INET_ADDRSTRLEN];
+        u32_to_rid(ntohl(e->hdr.adv_router), origin, sizeof(origin));
+        struct in_addr nh = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+        char nhs[INET_ADDRSTRLEN] = "";
+        if (nh.s_addr) inet_ntop(AF_INET, &nh, nhs, sizeof(nhs));
+
+        if (e->hdr.type == OSPF_LSA_ROUTER && e->body_len >= 4) {
+            /* parse stub links (type 3) */
+            uint16_t nlinks = 0;
+            memcpy(&nlinks, e->body + 2, 2);
+            nlinks = ntohs(nlinks);
+            size_t off = 4;
+            for (uint16_t li = 0; li < nlinks && off + 12 <= e->body_len; li++, off += 12) {
+                uint8_t ltype = e->body[off + 8];
+                if (ltype != 3) continue; /* stub only */
+                struct in_addr id, data;
+                memcpy(&id, e->body + off, 4);
+                memcpy(&data, e->body + off + 4, 4);
+                /* id=network, data=mask for stub */
+                append_learned_prefix(learned, id, data, origin, nhs, "router-stub", e->hdr.type);
+            }
+        } else if (e->hdr.type == OSPF_LSA_AS_EXTERNAL && e->body_len >= 8) {
+            struct in_addr mask, pfx, fwd;
+            pfx.s_addr = e->hdr.id;
+            memcpy(&mask, e->body, 4);
+            memcpy(&fwd, e->body + 8, 4);
+            char enhs[INET_ADDRSTRLEN] = "";
+            if (fwd.s_addr != 0) inet_ntop(AF_INET, &fwd, enhs, sizeof(enhs));
+            else if (nh.s_addr) snprintf(enhs, sizeof(enhs), "%s", nhs);
+            append_learned_prefix(learned, pfx, mask, origin, enhs, "as-external", e->hdr.type);
+        } else if ((e->hdr.type == OSPF_LSA_SUMMARY || e->hdr.type == 4) && e->body_len >= 8) {
+            struct in_addr mask, pfx;
+            pfx.s_addr = e->hdr.id;
+            memcpy(&mask, e->body, 4);
+            append_learned_prefix(learned, pfx, mask, origin, nhs, "summary", e->hdr.type);
+        }
     }
-    return json_pack("{s:b,s:i,s:i,s:i,s:i,s:i,s:o}",
+    return json_pack("{s:b,s:i,s:i,s:i,s:i,s:i,s:o,s:o}",
                      "enabled", g_ospf.enabled,
                      "neighbors", (int)json_array_size(nbrs),
                      "neighbors_2way", nfullish,
                      "lsdb_self", self_lsas,
                      "lsdb_other", other_lsas,
                      "lsdb_total", self_lsas + other_lsas,
-                     "neighbor_list", nbrs);
+                     "neighbor_list", nbrs,
+                     "learned_prefixes", learned);
 }
