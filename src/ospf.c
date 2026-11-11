@@ -1439,12 +1439,22 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     ospf_lsa_t old_self[OSPF_MAX_LSAS];
     size_t n_old_self = 0;
     for (size_t i = 0; i < g_ospf.n_lsas && n_old_self < OSPF_MAX_LSAS; i++) {
-        if (g_ospf.lsdb[i].valid && g_ospf.lsdb[i].self)
-            old_self[n_old_self++] = g_ospf.lsdb[i];
+        if (g_ospf.lsdb[i].valid && g_ospf.lsdb[i].self) {
+            old_self[n_old_self] = g_ospf.lsdb[i];
+            old_self[n_old_self].body = NULL;
+            if (g_ospf.lsdb[i].body_len && g_ospf.lsdb[i].body) {
+                old_self[n_old_self].body = malloc(g_ospf.lsdb[i].body_len);
+                if (old_self[n_old_self].body)
+                    memcpy(old_self[n_old_self].body, g_ospf.lsdb[i].body, g_ospf.lsdb[i].body_len);
+                else
+                    old_self[n_old_self].body_len = 0;
+            }
+            n_old_self++;
+        }
     }
 
     /* Build a single self Router-LSA with stub links for originated prefixes. */
-    /* remove self from lsdb (bodies freed) but keep snapshots above */
+    /* remove self from lsdb (bodies freed); snapshots above own copies */
     for (size_t i = 0; i < g_ospf.n_lsas; ) {
         if (g_ospf.lsdb[i].self) {
             free(g_ospf.lsdb[i].body);

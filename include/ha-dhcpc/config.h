@@ -102,7 +102,7 @@ typedef struct {
     struct {
         bool enabled;
         struct {
-            bool public_ip32;
+            enum { HADC_ADV_PUB_OFF = 0, HADC_ADV_PUB_MASTER = 1, HADC_ADV_PUB_ALWAYS = 2 } public_ip32;
             bool vip_subnets;
             bool default_route; /* publish primary healthy 0.0.0.0/0 only */
         } advertise;

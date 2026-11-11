@@ -779,7 +779,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
 
     /* routing (edge-only inter-cluster routing; off by default). */
     out->routing.enabled = false;
-    out->routing.advertise.public_ip32 = true;
+    out->routing.advertise.public_ip32 = HADC_ADV_PUB_MASTER;
     out->routing.advertise.vip_subnets = false;
     out->routing.advertise.default_route = false;
     out->routing.accept.default_route = false;
@@ -810,7 +810,31 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     snprintf(err, errlen, "config: routing.advertise must be a mapping");
                     goto derr;
                 }
-                if (get_bool(ra, "public_ip32", &out->routing.advertise.public_ip32, true)) goto derr;
+                {
+                    json_t *pub = json_object_get(ra, "public_ip32");
+                    if (pub) {
+                        if (json_is_boolean(pub)) {
+                            out->routing.advertise.public_ip32 = json_is_true(pub) ? HADC_ADV_PUB_MASTER : HADC_ADV_PUB_OFF;
+                        } else if (json_is_string(pub)) {
+                            const char *s = json_string_value(pub);
+                            if (!strcmp(s, "always"))
+                                out->routing.advertise.public_ip32 = HADC_ADV_PUB_ALWAYS;
+                            else if (!strcmp(s, "on") || !strcmp(s, "true") || !strcmp(s, "master"))
+                                out->routing.advertise.public_ip32 = HADC_ADV_PUB_MASTER;
+                            else if (!strcmp(s, "off") || !strcmp(s, "false") || !strcmp(s, "none"))
+                                out->routing.advertise.public_ip32 = HADC_ADV_PUB_OFF;
+                            else {
+                                snprintf(err, errlen, "config: unknown routing.advertise.public_ip32 %s", s);
+                                goto derr;
+                            }
+                        } else {
+                            snprintf(err, errlen, "config: routing.advertise.public_ip32 must be a boolean or string");
+                            goto derr;
+                        }
+                    } else {
+                        out->routing.advertise.public_ip32 = HADC_ADV_PUB_MASTER;
+                    }
+                }
                 if (get_bool(ra, "vip_subnets", &out->routing.advertise.vip_subnets, false)) goto derr;
                 if (get_bool(ra, "default_route", &out->routing.advertise.default_route, false)) goto derr;
             }

@@ -169,8 +169,8 @@ static void compute_want_prefixes(hadc_ctx_t *ctx, bool enabled, bool master_own
     if (!enabled)
         return;
 
-    /* DHCP/public IP is always originated/advertised as a /32 when owned. */
-    if (ctx->conf.routing.advertise.public_ip32 && g_rs.want_advertised_public_ip32 &&
+    /* DHCP/public IP is originated/advertised as a /32 when owned, or always when configured. */
+    if (ctx->conf.routing.advertise.public_ip32 != HADC_ADV_PUB_OFF && g_rs.want_advertised_public_ip32 &&
         ctx->lease.address.s_addr != 0) {
         add_want_prefix(ctx->lease.address, 32, ctx->conf.interface);
     }
@@ -515,7 +515,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     g_rs.local_working_default = local_working_default_path(ctx);
     g_rs.using_backup_path = backup;
     g_rs.accept_default_route = enabled && ctx->conf.routing.accept.default_route;
-    g_rs.publish_public_ip32 = enabled && ctx->conf.routing.advertise.public_ip32;
+    g_rs.publish_public_ip32 = enabled && ctx->conf.routing.advertise.public_ip32 != HADC_ADV_PUB_OFF;
     g_rs.publish_default_route = enabled && ctx->conf.routing.advertise.default_route;
     g_rs.public_ip32 = ctx->lease.address;
     snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
@@ -527,7 +527,13 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 
     /* Desired advertisements: local owned prefixes only, edge-only. Never publish
      * backup routes; withdraw default-route advertisement while on backup. */
-    bool want_pub = enabled && g_rs.publish_public_ip32 && healthy_bound;
+    bool want_pub = false;
+    if (enabled && ctx->conf.routing.advertise.public_ip32 != HADC_ADV_PUB_OFF && ctx->lease.address.s_addr != 0) {
+        if (ctx->conf.routing.advertise.public_ip32 == HADC_ADV_PUB_ALWAYS)
+            want_pub = true;
+        else
+            want_pub = healthy_bound;
+    }
     bool want_def = enabled && g_rs.publish_default_route && healthy_bound && !backup;
 
     if (!enabled) {
@@ -621,10 +627,18 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
     if (!o)
         return json_object();
     json_object_set_new(o, "enabled", json_boolean(ctx->conf.routing.enabled));
-    json_object_set_new(o, "advertise", json_pack("{s:b,s:b,s:b}",
-        "public_ip32", ctx->conf.routing.advertise.public_ip32,
-        "vip_subnets", ctx->conf.routing.advertise.vip_subnets,
-        "default_route", ctx->conf.routing.advertise.default_route));
+    {
+        const char *pub_mode = "off";
+        switch (ctx->conf.routing.advertise.public_ip32) {
+        case HADC_ADV_PUB_ALWAYS: pub_mode = "always"; break;
+        case HADC_ADV_PUB_MASTER: pub_mode = "on"; break;
+        default: pub_mode = "off"; break;
+        }
+        json_object_set_new(o, "advertise", json_pack("{s:s,s:b,s:b}",
+            "public_ip32", pub_mode,
+            "vip_subnets", ctx->conf.routing.advertise.vip_subnets,
+            "default_route", ctx->conf.routing.advertise.default_route));
+    }
     json_object_set_new(o, "accept", json_pack("{s:b}",
         "default_route", ctx->conf.routing.accept.default_route));
     json_t *state = json_object();
