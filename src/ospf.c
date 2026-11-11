@@ -295,6 +295,44 @@ typedef struct {
     uint64_t auth;
 } __attribute__((packed)) ospf_hdr_t;
 
+static void apply_auth(ospf_hdr_t *h, hadc_ctx_t *ctx, const uint8_t *pkt, size_t len)
+{
+    (void)pkt; (void)len;
+    h->autype = 0;
+    h->auth = 0;
+    if (!ctx)
+        return;
+    if (ctx->conf.ospf.auth.type == 1) { /* plaintext (8 bytes) */
+        h->autype = htons(1);
+        uint8_t key[8] = {0};
+        size_t klen = strnlen(ctx->conf.ospf.auth.key, sizeof(key));
+        memcpy(key, ctx->conf.ospf.auth.key, klen);
+        memcpy(&h->auth, key, 8);
+    } else if (ctx->conf.ospf.auth.type == 2) {
+        /* MD5 auth not implemented; fall back to none but log? handled elsewhere */
+        h->autype = 0;
+        h->auth = 0;
+    }
+}
+
+static bool verify_auth(const ospf_hdr_t *h, hadc_ctx_t *ctx)
+{
+    if (!ctx)
+        return true;
+    uint16_t at = ntohs(h->autype);
+    if (ctx->conf.ospf.auth.type == 0)
+        return at == 0;
+    if (ctx->conf.ospf.auth.type == 1) {
+        if (at != 1) return false;
+        uint8_t key[8] = {0};
+        size_t klen = strnlen(ctx->conf.ospf.auth.key, sizeof(key));
+        memcpy(key, ctx->conf.ospf.auth.key, klen);
+        return memcmp(&h->auth, key, 8) == 0;
+    }
+    /* md5 not implemented: accept as best-effort interop? better reject to be safe */
+    return false;
+}
+
 typedef struct {
     uint32_t network_mask;
     uint16_t hello_interval;
@@ -432,13 +470,13 @@ static void build_lsack(const ospf_lsa_hdr_t *hdrs, size_t count, uint8_t *buf, 
     h->type = OSPF_LSACK;
     h->router_id = htonl(g_ospf.router_id);
     h->area_id = htonl(OSPF_AREA_BACKBONE);
-    h->autype = 0; h->auth = 0;
     size_t off = sizeof(*h);
     for (size_t i = 0; i < count && off + sizeof(ospf_lsa_hdr_t) <= OSPF_MTU; i++) {
         memcpy(buf + off, &hdrs[i], sizeof(ospf_lsa_hdr_t));
         off += sizeof(ospf_lsa_hdr_t);
     }
     h->length = htons((uint16_t)off);
+    apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
     h->checksum = ip_checksum(buf, off);
     *outlen = off;
@@ -461,7 +499,6 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
     h->type = OSPF_LSUPDATE;
     h->router_id = htonl(g_ospf.router_id);
     h->area_id = htonl(OSPF_AREA_BACKBONE);
-    h->autype = 0; h->auth = 0;
     size_t off = sizeof(*h) + 4; /* + #lsas */
     uint32_t nlsas = 0;
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
@@ -486,6 +523,7 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
     uint32_t nl = htonl(nlsas);
     memcpy(buf + sizeof(*h), &nl, 4);
     h->length = htons((uint16_t)off);
+    apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
     h->checksum = ip_checksum(buf, off);
     *outlen = off;
@@ -519,8 +557,6 @@ static void build_hello(uint8_t *buf, size_t *outlen, ospf_if_t *iface)
     h->type = OSPF_HELLO;
     h->router_id = htonl(g_ospf.router_id);
     h->area_id = htonl(OSPF_AREA_BACKBONE);
-    h->autype = 0;
-    h->auth = 0;
     hello->network_mask = iface->mask.s_addr;
     hello->hello_interval = htons(OSPF_HELLO_INTERVAL);
     hello->options = 0x02; /* E-bit */
@@ -773,6 +809,7 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
     uint32_t nl = htonl(nlsas);
     memcpy(out + sizeof(ospf_hdr_t), &nl, 4);
     oh->length = htons((uint16_t)ooff);
+    apply_auth(oh, g_ospf.ctx, out, ooff);
     oh->checksum = 0;
     oh->checksum = ip_checksum(out, ooff);
     if (iface && iface->ifindex)
@@ -822,6 +859,10 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
         uint16_t plen = ntohs(h->length);
         if (plen > (size_t)n)
             plen = (uint16_t)n;
+        if (!verify_auth(h, ctx)) {
+            hadc_dbg("ospf: auth mismatch from %s, dropping", inet_ntoa(src.sin_addr));
+            continue;
+        }
         ospf_if_t *iface = iface_for_src(src.sin_addr);
         switch (h->type) {
         case OSPF_HELLO:
