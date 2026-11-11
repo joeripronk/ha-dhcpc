@@ -78,6 +78,8 @@ typedef struct {
     uint32_t dd_seq;
     bool dd_master;
     bool dd_last_sent_init;
+    time_t last_dbdesc_sent;
+    time_t last_lsreq_sent;
 } ospf_neighbor_t;
 
 typedef struct {
@@ -709,6 +711,7 @@ static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t le
     apply_auth(oh, g_ospf.ctx, out, ooff);
     oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
     send_to(n->ip, n->ifindex, out, ooff);
+    n->last_lsreq_sent = time(NULL);
     hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, inet_ntoa(n->ip));
 }
 
@@ -755,10 +758,10 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
             n->state = NSTATE_EXSTART;
             n->dd_seq = (uint32_t)time(NULL);
             n->dd_master = (g_ospf.router_id > n->router_id);
-            /* send initial DBD */
             uint8_t out[OSPF_MTU]; size_t olen = 0;
             build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
             send_to(n->ip, n->ifindex, out, olen);
+            n->last_dbdesc_sent = time(NULL);
         }
     } else {
         n->state = NSTATE_INIT;
@@ -931,8 +934,13 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         uint8_t out[OSPF_MTU]; size_t olen = 0;
         build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, seq, true);
         send_to(n->ip, n->ifindex, out, olen);
-        if (!(flags & OSPF_DD_FLAG_M))
+        n->last_dbdesc_sent = time(NULL);
+        if (!(flags & OSPF_DD_FLAG_M)) {
             n->state = NSTATE_FULL;
+            n->lsa_sync_sent = true;
+        } else {
+            n->state = NSTATE_LOADING;
+        }
         flood_lsas_to_neighbor(n, false);
         return;
     }
@@ -952,11 +960,12 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
             n->lsa_sync_sent = true;
         } else {
             n->state = NSTATE_EXCHANGE;
-            uint8_t out[OSPF_MTU]; size_t olen = 0;
             uint32_t nseq = n->dd_master ? (n->dd_seq + 1) : seq;
             n->dd_seq = nseq;
+            uint8_t out[OSPF_MTU]; size_t olen = 0;
             build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, nseq, true);
             send_to(n->ip, n->ifindex, out, olen);
+            n->last_dbdesc_sent = time(NULL);
         }
     } else if (n->state == NSTATE_FULL) {
         flood_lsas_to_neighbor(n, false);
@@ -1284,12 +1293,20 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
         i++;
     }
 
-    /* Periodically reflood LSAs to 2-Way neighbors for simple interop */
+    /* Periodically reflood LSAs and retransmit adjacency packets for interop */
     static time_t last_flood, last_full_flood;
     if (now - last_flood >= 30) {
         for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
-            if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
-                flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
+            ospf_neighbor_t *n = &g_ospf.nbrs[i];
+            if (!n->in_use) continue;
+            if (n->state >= NSTATE_2WAY)
+                flood_self_lsas_to_neighbor(n);
+            if (n->state == NSTATE_EXSTART && now - n->last_dbdesc_sent >= 5) {
+                uint8_t out[OSPF_MTU]; size_t olen = 0;
+                build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
+                send_to(n->ip, n->ifindex, out, olen);
+                n->last_dbdesc_sent = now;
+            }
         }
         last_flood = now;
     }
