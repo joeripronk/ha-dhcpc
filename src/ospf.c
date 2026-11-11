@@ -1723,6 +1723,154 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
 
 
 
+
+static struct in_addr nbr_nexthop_for(uint32_t adv_router)
+{
+    struct in_addr gw = {0};
+    for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
+        ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
+        if (!nb->in_use || nb->state < NSTATE_2WAY)
+            continue;
+        if (nb->router_id == adv_router)
+            return nb->ip;
+    }
+    return gw;
+}
+
+static const ospf_lsa_t *find_router_lsa(uint32_t adv_router)
+{
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        const ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || e->hdr.type != OSPF_LSA_ROUTER)
+            continue;
+        if (ntohl(e->hdr.adv_router) == adv_router)
+            return e;
+    }
+    return NULL;
+}
+
+typedef struct {
+    uint32_t rid;
+    uint32_t dist;
+    struct in_addr nexthop;
+    bool known;
+    bool visited;
+} spf_node_t;
+
+static bool nexthop_on_fabric(struct in_addr nh)
+{
+    if (nh.s_addr == 0)
+        return false;
+    for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
+        ospf_if_t *oi = &g_ospf.ifaces[i];
+        if (!oi->up || oi->mask.s_addr == 0)
+            continue;
+        if ((nh.s_addr & oi->mask.s_addr) == oi->network.s_addr)
+            return true;
+    }
+    return false;
+}
+
+/* Minimal intra-area SPF (Dijkstra) over Router-LSAs to resolve nexthop to a
+ * router (ASBR/advertising router). Seeds with directly adjacent neighbors as
+ * first hops; traverses point-to-point router links (type 1). Transit/network
+ * links are not modeled (no Network-LSA origination in this edge-only speaker),
+ * so paths requiring them may remain unresolved. */
+static bool spf_nexthop_to_router(uint32_t dest_rid, struct in_addr *out_nh)
+{
+    if (out_nh) out_nh->s_addr = 0;
+    if (dest_rid == 0 || dest_rid == g_ospf.router_id)
+        return false;
+
+    /* direct adjacency first */
+    struct in_addr direct = nbr_nexthop_for(dest_rid);
+    if (direct.s_addr != 0 && nexthop_on_fabric(direct)) {
+        if (out_nh) *out_nh = direct;
+        return true;
+    }
+
+    spf_node_t nodes[OSPF_MAX_LSAS + OSPF_MAX_NEIGHBORS + 1];
+    size_t nn = 0;
+
+    #define SPF_ADD(r) ({ \
+        int _idx = -1; \
+        for (size_t _i = 0; _i < nn; _i++) if (nodes[_i].rid == (r)) { _idx = (int)_i; break; } \
+        if (_idx < 0 && nn < sizeof(nodes)/sizeof(nodes[0])) { \
+            memset(&nodes[nn], 0, sizeof(nodes[nn])); nodes[nn].rid = (r); nodes[nn].dist = UINT32_MAX; _idx = (int)nn++; \
+        } _idx; })
+
+    int self_idx = SPF_ADD(g_ospf.router_id);
+    if (self_idx < 0) return false;
+    nodes[self_idx].known = true;
+    nodes[self_idx].dist = 0;
+
+    /* seed direct neighbors */
+    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+        ospf_neighbor_t *nb = &g_ospf.nbrs[i];
+        if (!nb->in_use || nb->state < NSTATE_2WAY)
+            continue;
+        int ni = SPF_ADD(nb->router_id);
+        if (ni < 0) continue;
+        if (!nexthop_on_fabric(nb->ip)) continue;
+        if (1 < nodes[ni].dist) {
+            nodes[ni].dist = 1;
+            nodes[ni].nexthop = nb->ip;
+            nodes[ni].known = true;
+        }
+    }
+
+    /* add all router-LSA vertices */
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        if (g_ospf.lsdb[i].valid && g_ospf.lsdb[i].hdr.type == OSPF_LSA_ROUTER)
+            SPF_ADD(ntohl(g_ospf.lsdb[i].hdr.adv_router));
+    }
+
+    for (;;) {
+        int u = -1;
+        for (size_t i = 0; i < nn; i++) {
+            if (!nodes[i].known || nodes[i].visited) continue;
+            if (u < 0 || nodes[i].dist < nodes[u].dist) u = (int)i;
+        }
+        if (u < 0) break;
+        nodes[u].visited = true;
+        if (nodes[u].rid == dest_rid) break;
+
+        const ospf_lsa_t *rlsa = find_router_lsa(nodes[u].rid);
+        if (!rlsa || rlsa->body_len < 4) continue;
+        uint16_t nlinks = 0;
+        memcpy(&nlinks, rlsa->body + 2, 2);
+        nlinks = ntohs(nlinks);
+        size_t off = 4;
+        for (uint16_t li = 0; li < nlinks && off + 12 <= rlsa->body_len; li++, off += 12) {
+            uint8_t ltype = rlsa->body[off + 8];
+            if (ltype != 1) continue; /* point-to-point */
+            uint32_t nbr_rid = 0; memcpy(&nbr_rid, rlsa->body + off, 4); nbr_rid = ntohl(nbr_rid);
+            uint16_t lm = 0; memcpy(&lm, rlsa->body + off + 10, 2);
+            uint32_t cost = ntohs(lm);
+            if (cost == 0) cost = 1;
+            int vi = SPF_ADD(nbr_rid);
+            if (vi < 0) continue;
+            uint32_t nd = nodes[u].dist + cost;
+            if (!nodes[vi].known || nd < nodes[vi].dist) {
+                nodes[vi].dist = nd;
+                nodes[vi].nexthop = nodes[u].nexthop; /* first-hop from root */
+                nodes[vi].known = (nodes[u].nexthop.s_addr != 0);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < nn; i++) {
+        if (nodes[i].rid == dest_rid && nodes[i].known && nodes[i].nexthop.s_addr != 0 &&
+            nexthop_on_fabric(nodes[i].nexthop)) {
+            if (out_nh) *out_nh = nodes[i].nexthop;
+            return true;
+        }
+    }
+    #undef SPF_ADD
+    return false;
+}
+
+
 size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max)
 {
     size_t n = 0;
@@ -1750,21 +1898,13 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
         if (fwd != 0) {
             gw.s_addr = fwd;
         } else {
-            /* forwarding addr 0.0.0.0 => traffic to ASBR; use known neighbor IP
-             * of the advertising router as nexthop when directly adjacent. */
-            bool found = false;
-            for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
-                ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
-                if (!nb->in_use || nb->state < NSTATE_2WAY)
-                    continue;
-                if (nb->router_id == ntohl(e->hdr.adv_router)) {
-                    gw = nb->ip;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found)
-                continue; /* nexthop unknown without SPF/topology resolution */
+            /* forwarding addr 0.0.0.0 => traffic to ASBR; resolve via adjacent
+             * neighbor or intra-area SPF path to advertising router. */
+            gw = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+            if (gw.s_addr == 0)
+                (void)spf_nexthop_to_router(ntohl(e->hdr.adv_router), &gw);
+            if (gw.s_addr == 0 || !nexthop_on_fabric(gw))
+                continue; /* nexthop unknown/unreachable on local fabric */
         }
 
         hadc_routing_default_candidate_t *c = &out[n++];
@@ -1790,34 +1930,6 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
     }
     return n;
 }
-
-static struct in_addr nbr_nexthop_for(uint32_t adv_router)
-{
-    struct in_addr gw = {0};
-    for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
-        ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
-        if (!nb->in_use || nb->state < NSTATE_2WAY)
-            continue;
-        if (nb->router_id == adv_router)
-            return nb->ip;
-    }
-    return gw;
-}
-
-static bool nexthop_on_fabric(struct in_addr nh)
-{
-    if (nh.s_addr == 0)
-        return false;
-    for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
-        ospf_if_t *oi = &g_ospf.ifaces[i];
-        if (!oi->up || oi->mask.s_addr == 0)
-            continue;
-        if ((nh.s_addr & oi->mask.s_addr) == oi->network.s_addr)
-            return true;
-    }
-    return false;
-}
-
 static bool is_self_originated_prefix(struct in_addr pfx, struct in_addr mask)
 {
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
@@ -1859,7 +1971,10 @@ size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out,
         if (!e->valid || e->self)
             continue;
 
-        struct in_addr pfx = {0}, mask = {0}, nh = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+        struct in_addr pfx = {0}, mask = {0};
+        struct in_addr nh = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+        if (nh.s_addr == 0)
+            (void)spf_nexthop_to_router(ntohl(e->hdr.adv_router), &nh);
         uint32_t metric = 0;
         bool ok = false;
 
@@ -1894,7 +2009,11 @@ size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out,
             memcpy(&metric, e->body + 4, 4);
             metric = ntohl(metric) & 0x00ffffffu;
             uint32_t fwd = 0; memcpy(&fwd, e->body + 8, 4);
-            if (fwd != 0) { nh.s_addr = fwd; }
+            if (fwd != 0) {
+                struct in_addr fwdnh; fwdnh.s_addr = fwd;
+                if (nexthop_on_fabric(fwdnh)) nh = fwdnh;
+                else { (void)spf_nexthop_to_router(ntohl(e->hdr.adv_router), &nh); }
+            }
             /* skip default route here (handled as backup candidate/policy) */
             if (pfx.s_addr == 0 && mask.s_addr == 0)
                 continue;
@@ -1973,6 +2092,8 @@ json_t *hadc_ospf_status(hadc_ctx_t *ctx)
         char origin[INET_ADDRSTRLEN];
         u32_to_rid(ntohl(e->hdr.adv_router), origin, sizeof(origin));
         struct in_addr nh = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+        if (nh.s_addr == 0)
+            (void)spf_nexthop_to_router(ntohl(e->hdr.adv_router), &nh);
         char nhs[INET_ADDRSTRLEN] = "";
         if (nh.s_addr) inet_ntop(AF_INET, &nh, nhs, sizeof(nhs));
 
