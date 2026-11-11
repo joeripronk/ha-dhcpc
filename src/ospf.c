@@ -74,6 +74,10 @@ typedef struct {
     bool in_use;
     bool lsa_sync_sent;
     unsigned ifindex;
+    /* minimal DBD/LSR state for interop */
+    uint32_t dd_seq;
+    bool dd_master;
+    bool dd_last_sent_init;
 } ospf_neighbor_t;
 
 typedef struct {
@@ -634,6 +638,80 @@ static ospf_neighbor_t *find_or_add_neighbor(uint32_t rid, struct in_addr ip)
     return free_slot;
 }
 
+
+#define OSPF_DD_FLAG_MS 0x01
+#define OSPF_DD_FLAG_M  0x02
+#define OSPF_DD_FLAG_I  0x04
+
+typedef struct {
+    uint16_t mtu;
+    uint8_t options;
+    uint8_t flags;
+    uint32_t seq;
+} __attribute__((packed)) ospf_dbdesc_t;
+
+static void build_dbdesc(uint8_t *buf, size_t *outlen, uint8_t flags, uint32_t seq, bool include_headers)
+{
+    memset(buf, 0, OSPF_MTU);
+    ospf_hdr_t *h = (ospf_hdr_t *)buf;
+    ospf_dbdesc_t *dd = (ospf_dbdesc_t *)(buf + sizeof(*h));
+    h->version = OSPF_VERSION;
+    h->type = OSPF_DBDESC;
+    h->router_id = htonl(g_ospf.router_id);
+    h->area_id = htonl(OSPF_AREA_BACKBONE);
+    dd->mtu = htons(0);
+    dd->options = 0x02; /* E */
+    dd->flags = flags;
+    dd->seq = htonl(seq);
+    size_t off = sizeof(*h) + sizeof(*dd);
+    if (include_headers) {
+        for (size_t i = 0; i < g_ospf.n_lsas && off + sizeof(ospf_lsa_hdr_t) <= OSPF_MTU; i++) {
+            if (!g_ospf.lsdb[i].valid) continue;
+            memcpy(buf + off, &g_ospf.lsdb[i].hdr, sizeof(ospf_lsa_hdr_t));
+            off += sizeof(ospf_lsa_hdr_t);
+        }
+    }
+    h->length = htons((uint16_t)off);
+    apply_auth(h, g_ospf.ctx, buf, off);
+    h->checksum = 0;
+    h->checksum = ip_checksum(buf, off);
+    *outlen = off;
+}
+
+static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t len)
+{
+    /* pkt is DBD; request any listed LSA headers we don't have or that are newer */
+    if (len < sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t))
+        return;
+    size_t off = sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t);
+    uint8_t out[OSPF_MTU];
+    memset(out, 0, sizeof(out));
+    ospf_hdr_t *oh = (ospf_hdr_t *)out;
+    oh->version = OSPF_VERSION; oh->type = OSPF_LSREQ;
+    oh->router_id = htonl(g_ospf.router_id); oh->area_id = htonl(OSPF_AREA_BACKBONE);
+    size_t ooff = sizeof(*oh);
+    size_t nreq = 0;
+    while (off + sizeof(ospf_lsa_hdr_t) <= len && ooff + 12 <= OSPF_MTU) {
+        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+        off += sizeof(ospf_lsa_hdr_t);
+        if (ntohl(lh->adv_router) == g_ospf.router_id)
+            continue;
+        ospf_lsa_t *have = find_lsa(lh);
+        if (have && have->valid && !lsa_more_recent(lh, &have->hdr))
+            continue;
+        uint32_t t = htonl(lh->type), id = lh->id, adv = lh->adv_router;
+        memcpy(out + ooff, &t, 4); memcpy(out + ooff + 4, &id, 4); memcpy(out + ooff + 8, &adv, 4);
+        ooff += 12; nreq++;
+    }
+    if (!nreq)
+        return;
+    oh->length = htons((uint16_t)ooff);
+    apply_auth(oh, g_ospf.ctx, out, ooff);
+    oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
+    send_to(n->ip, n->ifindex, out, ooff);
+    hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, inet_ntoa(n->ip));
+}
+
 static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
 {
     if (len < sizeof(ospf_hdr_t) + sizeof(ospf_hello_t))
@@ -673,15 +751,21 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
     n->dead_at = n->last_hello + (time_t)dead;
 
     if (see_self) {
-        if (n->state < NSTATE_2WAY)
-            n->state = NSTATE_2WAY;
-        /* Edge-only/simple: treat 2WAY as sufficient adjacency for LSA exchange
-         * on point-to-multipoint-like peering; full DR/BDR/EXSTART omitted. */
+        if (n->state < NSTATE_2WAY) {
+            n->state = NSTATE_EXSTART;
+            n->dd_seq = (uint32_t)time(NULL);
+            n->dd_master = (g_ospf.router_id > n->router_id);
+            /* send initial DBD */
+            uint8_t out[OSPF_MTU]; size_t olen = 0;
+            build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
+            send_to(n->ip, n->ifindex, out, olen);
+        }
     } else {
         n->state = NSTATE_INIT;
+        n->dd_seq = 0;
     }
 
-    if (n->state >= NSTATE_2WAY && !n->lsa_sync_sent) {
+    if (n->state >= NSTATE_2WAY && !n->lsa_sync_sent && n->state != NSTATE_EXSTART) {
         flood_lsas_to_neighbor(n, false);
         n->lsa_sync_sent = true;
     }
@@ -770,7 +854,6 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
 {
     if (len < sizeof(ospf_hdr_t) + 12)
         return;
-    /* Each request is 12 bytes: type(4), id(4), adv_router(4) */
     size_t off = sizeof(ospf_hdr_t);
     uint8_t out[OSPF_MTU];
     memset(out, 0, sizeof(out));
@@ -819,22 +902,66 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
     hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s", nlsas, inet_ntoa(src));
 }
 
+
 static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
 {
-    (void)len;
-    /* Minimal DBD handling for interop: acknowledge by flooding self LSAs and
-     * treating peer as advancing adjacency if in 2-Way; full master/slave DBD
-     * exchange is not implemented. */
-    (void)pkt;
+    if (len < sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t))
+        return;
+    const ospf_dbdesc_t *dd = (const ospf_dbdesc_t *)(pkt + sizeof(ospf_hdr_t));
+    ospf_neighbor_t *n = NULL;
     for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
-        ospf_neighbor_t *n = &g_ospf.nbrs[i];
-        if (!n->in_use || n->ip.s_addr != src.s_addr)
-            continue;
-        if (n->state >= NSTATE_2WAY) {
-            flood_self_lsas_to_neighbor(n);
+        if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].ip.s_addr == src.s_addr) { n = &g_ospf.nbrs[i]; break; }
+    }
+    if (!n) return;
+    n->ifindex = iface ? iface->ifindex : n->ifindex;
+    uint8_t flags = dd->flags;
+    uint32_t seq = ntohl(dd->seq);
+
+    if (n->state < NSTATE_2WAY) {
+        flood_self_lsas_to_neighbor(n);
+        return;
+    }
+
+    /* Simplified exchange for interop: if peer is master (I,M,MS) we act as slave */
+    if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS)) {
+        n->state = NSTATE_EXCHANGE;
+        n->dd_master = false;
+        n->dd_seq = seq;
+        send_lsreq_missing(n, pkt, len);
+        uint8_t out[OSPF_MTU]; size_t olen = 0;
+        build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, seq, true);
+        send_to(n->ip, n->ifindex, out, olen);
+        if (!(flags & OSPF_DD_FLAG_M))
+            n->state = NSTATE_FULL;
+        flood_lsas_to_neighbor(n, false);
+        return;
+    }
+
+    /* If we initiated as master/slave or mid-exchange, advance */
+    if (n->state == NSTATE_EXSTART) {
+        n->dd_master = (g_ospf.router_id > n->router_id);
+        if (!n->dd_master) {
+            n->dd_seq = seq;
+            n->state = NSTATE_EXCHANGE;
         }
-        (void)iface;
-        break;
+    }
+    if (n->state == NSTATE_EXCHANGE || n->state == NSTATE_LOADING) {
+        send_lsreq_missing(n, pkt, len);
+        if (!(flags & OSPF_DD_FLAG_M)) {
+            n->state = NSTATE_FULL;
+            n->lsa_sync_sent = true;
+        } else {
+            n->state = NSTATE_EXCHANGE;
+            uint8_t out[OSPF_MTU]; size_t olen = 0;
+            uint32_t nseq = n->dd_master ? (n->dd_seq + 1) : seq;
+            n->dd_seq = nseq;
+            build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, nseq, true);
+            send_to(n->ip, n->ifindex, out, olen);
+        }
+    } else if (n->state == NSTATE_FULL) {
+        flood_lsas_to_neighbor(n, false);
+    } else {
+        flood_self_lsas_to_neighbor(n);
     }
 }
 
@@ -1260,7 +1387,10 @@ json_t *hadc_ospf_status(hadc_ctx_t *ctx)
         inet_ntop(AF_INET, &n->ip, ip, sizeof(ip));
         const char *sn = n->state == NSTATE_DOWN ? "down" :
                          n->state == NSTATE_INIT ? "init" :
-                         n->state == NSTATE_2WAY ? "2way" : "adjacent";
+                         n->state == NSTATE_2WAY ? "2way" :
+                         n->state == NSTATE_EXSTART ? "exstart" :
+                         n->state == NSTATE_EXCHANGE ? "exchange" :
+                         n->state == NSTATE_LOADING ? "loading" : "full";
         if (n->state >= NSTATE_2WAY) nfullish++;
         json_array_append_new(nbrs, json_pack("{s:s,s:s,s:s,s:i}", "router_id", rid,
                                               "ip", ip, "state", sn,
