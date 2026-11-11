@@ -6,6 +6,12 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
+#include <netlink/attr.h>
+#include <netlink/msg.h>
+#include <netlink/netlink.h>
 #include <string.h>
 
 #include "ha-dhcpc/cluster.h"
@@ -15,6 +21,8 @@
 #include "internal.h"
 
 #define HADC_ROUTING_MAX_PREFIXES 64
+#define HADC_ROUTING_TABLE 201
+#define HADC_ROUTING_ROUTE_METRIC 200
 
 typedef struct {
     struct in_addr prefix;
@@ -45,6 +53,9 @@ typedef struct {
     size_t n_remote_cands;
     hadc_routing_prefix_t want_prefixes[HADC_ROUTING_MAX_PREFIXES];
     size_t n_want_prefixes;
+    hadc_routing_prefix_t applied_prefixes[HADC_ROUTING_MAX_PREFIXES];
+    size_t n_applied_prefixes;
+    struct nl_sock *sk;
 } hadc_routing_state_t;
 
 static hadc_routing_state_t g_rs;
@@ -172,19 +183,113 @@ static void compute_want_prefixes(hadc_ctx_t *ctx, bool enabled, bool master_own
     }
 }
 
+static bool prefix_eq(const hadc_routing_prefix_t *a, const hadc_routing_prefix_t *b)
+{
+    return a->prefix.s_addr == b->prefix.s_addr && a->prefixlen == b->prefixlen &&
+           !strcmp(a->ifname, b->ifname);
+}
+
+static int nl_prefix_change(const hadc_routing_prefix_t *p, bool add)
+{
+    unsigned ifindex;
+    struct nl_msg *m;
+    struct rtmsg *rt;
+    uint32_t metric = HADC_ROUTING_ROUTE_METRIC;
+
+    if (!g_rs.sk)
+        return -1;
+    ifindex = if_nametoindex(p->ifname);
+    if (!ifindex)
+        return -1;
+    m = nlmsg_alloc_simple(add ? RTM_NEWROUTE : RTM_DELROUTE,
+                           NLM_F_REQUEST | NLM_F_ACK |
+                               (add ? (NLM_F_CREATE | NLM_F_REPLACE) : 0));
+    if (!m)
+        return -1;
+    rt = (struct rtmsg *)nlmsg_reserve(m, sizeof(*rt), NLMSG_ALIGNTO);
+    if (!rt) {
+        nlmsg_free(m);
+        return -1;
+    }
+    rt->rtm_family = AF_INET;
+    rt->rtm_dst_len = (unsigned char)p->prefixlen;
+    rt->rtm_src_len = 0;
+    rt->rtm_tos = 0;
+    rt->rtm_table = HADC_ROUTING_TABLE;
+    rt->rtm_protocol = RTPROT_BOOT;
+    rt->rtm_scope = (p->prefixlen == 32) ? RT_SCOPE_HOST : RT_SCOPE_LINK;
+    rt->rtm_type = RTN_UNICAST;
+    if (nla_put(m, RTA_DST, 4, &p->prefix) < 0 ||
+        nla_put(m, RTA_OIF, 4, &ifindex) < 0 ||
+        nla_put(m, RTA_PRIORITY, 4, &metric) < 0) {
+        nlmsg_free(m);
+        return -1;
+    }
+    return nl_send_sync(g_rs.sk, m);
+}
+
+static void apply_announced_prefixes(const char *reason)
+{
+    /* Announce originated prefixes to neighbors via a dedicated kernel routing
+     * table for external OSPF redistribution. Never touches main/local routes. */
+    for (size_t i = 0; i < g_rs.n_applied_prefixes; i++) {
+        bool keep = false;
+        for (size_t j = 0; j < g_rs.n_want_prefixes; j++) {
+            if (prefix_eq(&g_rs.applied_prefixes[i], &g_rs.want_prefixes[j])) {
+                keep = true;
+                break;
+            }
+        }
+        if (keep)
+            continue;
+        char dst[INET_ADDRSTRLEN] = "0.0.0.0";
+        inet_ntop(AF_INET, &g_rs.applied_prefixes[i].prefix, dst, sizeof(dst));
+        int rc = nl_prefix_change(&g_rs.applied_prefixes[i], false);
+        if (rc < 0 && rc != -NLE_OBJ_NOTFOUND && rc != -NLE_NOADDR)
+            hadc_dbg("routing: withdraw announced %s/%u dev %s table %d failed: %s (%s)", dst,
+                     g_rs.applied_prefixes[i].prefixlen, g_rs.applied_prefixes[i].ifname,
+                     HADC_ROUTING_TABLE, nl_geterror(rc), reason);
+        else
+            hadc_info("routing: withdraw announced %s/%u dev %s table %d (%s)", dst,
+                      g_rs.applied_prefixes[i].prefixlen, g_rs.applied_prefixes[i].ifname,
+                      HADC_ROUTING_TABLE, reason);
+    }
+
+    size_t applied = 0;
+    for (size_t i = 0; i < g_rs.n_want_prefixes; i++) {
+        char dst[INET_ADDRSTRLEN] = "0.0.0.0";
+        inet_ntop(AF_INET, &g_rs.want_prefixes[i].prefix, dst, sizeof(dst));
+        int rc = nl_prefix_change(&g_rs.want_prefixes[i], true);
+        if (rc < 0 && rc != -NLE_EXIST) {
+            hadc_warn("routing: announce %s/%u dev %s table %d failed: %s (%s)", dst,
+                      g_rs.want_prefixes[i].prefixlen, g_rs.want_prefixes[i].ifname,
+                      HADC_ROUTING_TABLE, nl_geterror(rc), reason);
+            continue;
+        }
+        bool existed = false;
+        for (size_t j = 0; j < g_rs.n_applied_prefixes; j++)
+            if (prefix_eq(&g_rs.applied_prefixes[j], &g_rs.want_prefixes[i])) { existed = true; break; }
+        if (!existed)
+            hadc_info("routing: announce %s/%u dev %s table %d (router-id %s, %s)", dst,
+                      g_rs.want_prefixes[i].prefixlen, g_rs.want_prefixes[i].ifname,
+                      HADC_ROUTING_TABLE, g_rs.router_id[0] ? g_rs.router_id : "unset", reason);
+        if (applied < HADC_ROUTING_MAX_PREFIXES)
+            g_rs.applied_prefixes[applied++] = g_rs.want_prefixes[i];
+    }
+    g_rs.n_applied_prefixes = applied;
+}
+
 static void backend_apply_local(hadc_ctx_t *ctx, bool want_pub, bool want_def,
                                   struct in_addr prev_bgw, const char *reason)
 {
-    /* Local backend: apply routing effects on this node. Effective backup
-     * gateway is consumed by executor desired state; reapply when it changes so
-     * fabric-learned/local-cluster defaults take effect without waiting for an
-     * external event. Originated prefixes are calculated from local state/config
-     * (DHCP/public IP as /32, VIPs as network subnets) and used only by the
-     * master for sending/advertising to neighbors; routes/addresses are already
-     * present locally and are not installed into the kernel routing table here. */
+    /* Local backend: announces originated prefixes (DHCP/public /32, VIP
+     * networks) to neighbors via a dedicated kernel table for external OSPF
+     * redistribution. Never overwrites/installs routes in the main table; local
+     * routes/addresses already present are left untouched. Only master-owned
+     * prefixes are announced. Effective backup gateway is consumed by executor. */
     g_rs.advertised_public_ip32 = want_pub;
     g_rs.advertised_default_route = want_def;
-    (void)reason;
+    apply_announced_prefixes(reason ? reason : "routing");
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         hadc_desired_t desired;
         hadc_executor_desired(ctx, &ctx->lease, &desired);
@@ -270,6 +375,12 @@ int hadc_routing_init(hadc_ctx_t *ctx)
     snprintf(g_rs.backend, sizeof(g_rs.backend), "%s",
              ctx->conf.routing.backend[0] ? ctx->conf.routing.backend : "local");
     snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
+    g_rs.sk = nl_socket_alloc();
+    if (g_rs.sk && nl_connect(g_rs.sk, NETLINK_ROUTE) != 0) {
+        nl_socket_free(g_rs.sk);
+        g_rs.sk = NULL;
+        hadc_warn("routing: netlink route socket unavailable; announcements disabled");
+    }
     hadc_routing_reconcile(ctx, "init");
     return 0;
 }
@@ -278,6 +389,11 @@ void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
     hadc_routing_reconcile(ctx, "shutdown");
     g_rs.n_want_prefixes = 0;
+    apply_announced_prefixes("shutdown");
+    if (g_rs.sk) {
+        nl_socket_free(g_rs.sk);
+        g_rs.sk = NULL;
+    }
     g_rs.advertised_public_ip32 = false;
     g_rs.advertised_default_route = false;
     g_rs.public_ip32.s_addr = 0;
@@ -430,7 +546,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
     }
 
     json_t *o = json_pack(
-        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o,s:i,s:o}, s:{s:s,s:s}, s:o}",
+        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o,s:i,s:o,s:i}, s:{s:s,s:s}, s:o}",
         "enabled", ctx->conf.routing.enabled,
         "advertise",
             "public_ip32", ctx->conf.routing.advertise.public_ip32,
@@ -453,6 +569,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
             "candidates", cands ? cands : json_array(),
             "originated_prefix_count", (int)g_rs.n_want_prefixes,
             "originated_prefixes", prefixes ? prefixes : json_array(),
+            "announce_table", HADC_ROUTING_TABLE,
         "backend",
             "name", g_rs.backend,
             "router_id", g_rs.router_id,
