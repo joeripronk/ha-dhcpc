@@ -9,6 +9,7 @@
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
