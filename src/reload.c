@@ -96,8 +96,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.routing.advertise.vip_subnets != ctx->conf.routing.advertise.vip_subnets ||
         next.routing.advertise.default_route != ctx->conf.routing.advertise.default_route ||
         next.routing.accept.default_route != ctx->conf.routing.accept.default_route ||
+        strcmp(next.routing.backend, ctx->conf.routing.backend) != 0 ||
         next.ospf.n_interfaces != ctx->conf.ospf.n_interfaces ||
         memcmp(next.ospf.interfaces, ctx->conf.ospf.interfaces, sizeof(next.ospf.interfaces)) != 0 ||
+        strcmp(next.ospf.router_id, ctx->conf.ospf.router_id) != 0 ||
         next.ospf.auth.type != ctx->conf.ospf.auth.type ||
         strcmp(next.ospf.auth.key, ctx->conf.ospf.auth.key) != 0 ||
         next.ospf.auth.key_id != ctx->conf.ospf.auth.key_id;

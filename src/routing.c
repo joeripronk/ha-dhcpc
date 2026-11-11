@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "ha-dhcpc/cluster.h"
+#include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
@@ -26,6 +27,7 @@ typedef struct {
     char backup_origin[HADC_ROUTING_ORIGIN_MAX];
     char reason[64];
     char backend[16];
+    char router_id[INET_ADDRSTRLEN];
     bool advertised_public_ip32;
     bool advertised_default_route;
     bool want_advertised_public_ip32;
@@ -107,15 +109,37 @@ static void update_local_candidate(hadc_ctx_t *ctx)
     g_rs.local_cand.valid = true;
 }
 
-/* Backend interface: origination/install is external (OSPF daemon/hook/kernel).
- * Stub keeps reconcile idempotent and observable without side effects. */
-static void backend_apply(hadc_ctx_t *ctx, bool want_pub, bool want_def, const char *reason)
+static void backend_apply_local(hadc_ctx_t *ctx, bool want_pub, bool want_def,
+                                  struct in_addr prev_bgw, const char *reason)
 {
-    (void)ctx;
-    (void)reason;
-    /* advertise.vip_subnets not acted on yet (needs per-prefix ownership/backend). */
+    /* Local backend: apply routing effects on this node. Effective backup
+     * gateway is consumed by executor desired state; reapply when it changes so
+     * fabric-learned/local-cluster defaults take effect without waiting for an
+     * external event. Advertised-prefix origination to OSPF is not performed by
+     * the local backend (requires external daemon integration). */
     g_rs.advertised_public_ip32 = want_pub;
     g_rs.advertised_default_route = want_def;
+    if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
+        hadc_desired_t desired;
+        hadc_executor_desired(ctx, &ctx->lease, &desired);
+        hadc_executor_apply(ctx, &desired, reason ? reason : "routing");
+    }
+}
+
+static void backend_apply(hadc_ctx_t *ctx, bool want_pub, bool want_def,
+                          struct in_addr prev_bgw, const char *reason)
+{
+    snprintf(g_rs.backend, sizeof(g_rs.backend), "%s",
+             ctx->conf.routing.backend[0] ? ctx->conf.routing.backend : "local");
+    if (!strcmp(g_rs.backend, "stub")) {
+        g_rs.advertised_public_ip32 = want_pub;
+        g_rs.advertised_default_route = want_def;
+        (void)prev_bgw;
+        (void)reason;
+        return;
+    }
+    /* default/local */
+    backend_apply_local(ctx, want_pub, want_def, prev_bgw, reason);
 }
 
 static void select_backup_gateway(hadc_ctx_t *ctx)
@@ -177,7 +201,9 @@ int hadc_routing_init(hadc_ctx_t *ctx)
 {
     memset(&g_rs, 0, sizeof(g_rs));
     snprintf(g_rs.reason, sizeof(g_rs.reason), "init");
-    snprintf(g_rs.backend, sizeof(g_rs.backend), "stub");
+    snprintf(g_rs.backend, sizeof(g_rs.backend), "%s",
+             ctx->conf.routing.backend[0] ? ctx->conf.routing.backend : "local");
+    snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
     hadc_routing_reconcile(ctx, "init");
     return 0;
 }
@@ -245,6 +271,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     g_rs.publish_public_ip32 = enabled && ctx->conf.routing.advertise.public_ip32;
     g_rs.publish_default_route = enabled && ctx->conf.routing.advertise.default_route;
     g_rs.public_ip32 = ctx->lease.address;
+    snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
 
     update_local_candidate(ctx);
 
@@ -259,31 +286,41 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     }
 
     if (want_pub != g_rs.want_advertised_public_ip32) {
-        hadc_info("routing: %s public /32 %s (%s)", want_pub ? "advertise" : "withdraw",
+        hadc_info("routing: %s public /32 %s (router-id %s, %s)", want_pub ? "advertise" : "withdraw",
                   ctx->lease.address.s_addr ? inet_ntoa(ctx->lease.address) : "0.0.0.0",
-                  g_rs.reason);
+                  g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
         g_rs.want_advertised_public_ip32 = want_pub;
     }
     if (want_def != g_rs.want_advertised_default_route) {
-        hadc_info("routing: %s default route 0.0.0.0/0 (%s)",
-                  want_def ? "advertise" : "withdraw", g_rs.reason);
+        hadc_info("routing: %s default route 0.0.0.0/0 (router-id %s, %s)",
+                  want_def ? "advertise" : "withdraw",
+                  g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
         g_rs.want_advertised_default_route = want_def;
     }
 
-    backend_apply(ctx, want_pub, want_def, g_rs.reason);
-
     struct in_addr prev_bgw = g_rs.backup_gw;
     select_backup_gateway(ctx);
+
+    backend_apply(ctx, want_pub, want_def, prev_bgw, g_rs.reason);
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
-        char old[INET_ADDRSTRLEN] = "0.0.0.0", cur[INET_ADDRSTRLEN] = "0.0.0.0";
+        char oldgw[INET_ADDRSTRLEN] = "0.0.0.0", cur[INET_ADDRSTRLEN] = "0.0.0.0";
         if (prev_bgw.s_addr)
-            inet_ntop(AF_INET, &prev_bgw, old, sizeof(old));
+            inet_ntop(AF_INET, &prev_bgw, oldgw, sizeof(oldgw));
         if (g_rs.backup_gw.s_addr)
             inet_ntop(AF_INET, &g_rs.backup_gw, cur, sizeof(cur));
-        hadc_info("routing: backup gateway %s -> %s (%s, %s, %s)", old, cur,
+        hadc_info("routing: backup gateway %s -> %s (%s, %s, %s)", oldgw, cur,
                   g_rs.backup_scope[0] ? g_rs.backup_scope : "none", g_rs.reason,
                   g_rs.local_master_up ? "local-master-up" : "local-master-down");
     }
+}
+
+
+
+const char *hadc_routing_router_id(hadc_ctx_t *ctx)
+{
+    if (ctx && ctx->conf.ospf.router_id[0])
+        return ctx->conf.ospf.router_id;
+    return g_rs.router_id;
 }
 
 json_t *hadc_routing_status(hadc_ctx_t *ctx)
@@ -315,7 +352,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
 
     int cand_count = g_rs.n_remote_cands + ((g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr) ? 1 : 0);
     json_t *o = json_pack(
-        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o}, s:{s:s}, s:o}",
+        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o}, s:{s:s,s:s}, s:o}",
         "enabled", ctx->conf.routing.enabled,
         "advertise",
             "public_ip32", ctx->conf.routing.advertise.public_ip32,
@@ -338,7 +375,9 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
             "candidates", cands ? cands : json_array(),
         "backend",
             "name", g_rs.backend,
-        "ospf", json_pack("{s:o, s:{s:s}}",
+            "router_id", g_rs.router_id,
+        "ospf", json_pack("{s:s, s:o, s:{s:s}}",
+            "router_id", ctx->conf.ospf.router_id,
             "interfaces", (json_t *)({
                 json_t *a = json_array();
                 for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++)

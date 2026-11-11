@@ -45,6 +45,9 @@ void hadc_routing_set_default_candidates(hadc_ctx_t *ctx,
  * (fabric-learned default route handling). Returns 0.0.0.0 when none. */
 struct in_addr hadc_routing_backup_gateway(hadc_ctx_t *ctx);
 
+/* Effective router-id used for routing/OSPF identity (defaults to self cluster IP). */
+const char *hadc_routing_router_id(hadc_ctx_t *ctx);
+
 /* JSON status facet for ctl/status. */
 json_t *hadc_routing_status(hadc_ctx_t *ctx);
 

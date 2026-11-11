@@ -783,7 +783,9 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->routing.advertise.vip_subnets = false;
     out->routing.advertise.default_route = false;
     out->routing.accept.default_route = false;
+    snprintf(out->routing.backend, sizeof(out->routing.backend), "local");
     out->ospf.n_interfaces = 0;
+    out->ospf.router_id[0] = '\0';
     out->ospf.auth.type = 0;
     out->ospf.auth.key[0] = '\0';
     out->ospf.auth.key_id = 0;
@@ -795,6 +797,13 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 goto derr;
             }
             if (get_bool(r, "enabled", &out->routing.enabled, false)) goto derr;
+            json_t *rb = json_object_get(r, "backend");
+            if (rb && json_is_string(rb))
+                snprintf(out->routing.backend, sizeof(out->routing.backend), "%s", json_string_value(rb));
+            else if (rb) {
+                snprintf(err, errlen, "config: routing.backend must be a string");
+                goto derr;
+            }
             json_t *ra = json_object_get(r, "advertise");
             if (ra) {
                 if (!json_is_object(ra)) {
@@ -818,6 +827,13 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         if (o) {
             if (!json_is_object(o)) {
                 snprintf(err, errlen, "config: ospf must be a mapping");
+                goto derr;
+            }
+            json_t *rid = json_object_get(o, "router_id");
+            if (rid && json_is_string(rid))
+                snprintf(out->ospf.router_id, sizeof(out->ospf.router_id), "%s", json_string_value(rid));
+            else if (rid) {
+                snprintf(err, errlen, "config: ospf.router_id must be a string");
                 goto derr;
             }
             json_t *ifs = json_object_get(o, "interfaces");
@@ -877,6 +893,21 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         if (out->routing.enabled && out->ospf.n_interfaces == 0) {
             snprintf(err, errlen, "config: ospf.interfaces required when routing.enabled is true");
             goto derr;
+        }
+        if (out->ospf.router_id[0]) {
+            struct in_addr rid;
+            if (inet_pton(AF_INET, out->ospf.router_id, &rid) != 1 || rid.s_addr == 0) {
+                snprintf(err, errlen, "config: bad ospf.router_id %s", out->ospf.router_id);
+                goto derr;
+            }
+        } else {
+            for (size_t i = 0; i < out->n_members; i++) {
+                if (!strcmp(out->members[i].id, out->self) && out->members[i].sync_address.s_addr) {
+                    inet_ntop(AF_INET, &out->members[i].sync_address, out->ospf.router_id,
+                              sizeof(out->ospf.router_id));
+                    break;
+                }
+            }
         }
     }
 
