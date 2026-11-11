@@ -122,14 +122,23 @@ static void update_local_candidate(hadc_ctx_t *ctx)
 {
     memset(&g_rs.local_cand, 0, sizeof(g_rs.local_cand));
     /* Local-master candidate derived from cluster information (heartbeat/sync):
-     * designated master is the local cluster master by config/cluster state; its
-     * default gateway is known from the synced lease when available. */
+     * the local cluster master is the effective backup nexthop for slaves, so
+     * use the master's fabric/sync address (reachable on the fabric), not the
+     * public DHCP lease gateway. */
     if (!ctx->conf.designated_master[0])
         return;
     if (ctx->lease.gateway.s_addr == 0)
         return;
-    /* Only meaningful when we have cluster-master context for this lease/gateway. */
-    g_rs.local_cand.gateway = ctx->lease.gateway;
+    struct in_addr nexthop = {0};
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        if (!strcmp(ctx->conf.members[i].id, ctx->conf.designated_master)) {
+            nexthop = ctx->conf.members[i].sync_address;
+            break;
+        }
+    }
+    if (nexthop.s_addr == 0)
+        return;
+    g_rs.local_cand.gateway = nexthop;
     g_rs.local_cand.scope = HADC_ROUTE_SCOPE_LOCAL_MASTER;
     snprintf(g_rs.local_cand.origin, sizeof(g_rs.local_cand.origin), "%s",
              ctx->conf.designated_master);
