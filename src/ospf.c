@@ -116,6 +116,8 @@ typedef struct {
     size_t n_lsas;
     uint32_t lsa_seq;
     time_t last_hello_sent;
+    time_t last_self_orig;
+    uint32_t last_orig_hash;
     hadc_ctx_t *ctx;
 } ospf_state_t;
 
@@ -775,6 +777,30 @@ static void expire_neighbors(void)
 
 /* ---- self-originated Router LSA ---- */
 
+
+static uint32_t orig_hash(bool want_pub, struct in_addr pub, bool want_def, hadc_ctx_t *c)
+{
+    uint32_t h = 2166136261u;
+    #define FNV(x) do { h ^= (uint32_t)(x); h *= 16777619u; } while(0)
+    FNV(want_pub);
+    FNV(pub.s_addr);
+    FNV(want_def);
+    if (c && c->conf.routing.advertise.vip_subnets && c->role == HADC_ROLE_MASTER) {
+        for (size_t i = 0; i < c->conf.cluster.n_ifaces; i++) {
+            const hadc_cluster_if_t *ci = &c->conf.cluster.ifaces[i];
+            for (size_t j = 0; j < ci->n_addrs; j++) {
+                unsigned pl = ci->addrs[j].prefixlen;
+                uint32_t mask = (pl == 0) ? 0 : htonl(0xffffffffu << (32 - (pl >= 32 ? 32 : pl)));
+                if (pl >= 32) mask = 0xffffffffu;
+                FNV(ci->addrs[j].address.s_addr & mask);
+                FNV(mask);
+            }
+        }
+    }
+    #undef FNV
+    return h;
+}
+
 static void clear_self_lsas(void)
 {
     for (size_t i = 0; i < g_ospf.n_lsas; ) {
@@ -792,9 +818,17 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
                          bool want_default_route,
                          const void *vip_prefixes, size_t vip_prefix_count)
 {
-    (void)ctx;
     (void)vip_prefixes; (void)vip_prefix_count;
     if (!g_ospf.enabled)
+        return;
+    g_ospf.ctx = ctx;
+
+    struct in_addr pub = public_ip32 ? *public_ip32 : (struct in_addr){0};
+    if (!want_pub) pub.s_addr = 0;
+    uint32_t h = orig_hash(want_pub, pub, want_default_route, ctx);
+    time_t now = time(NULL);
+    bool refresh = (g_ospf.last_self_orig != 0 && now - g_ospf.last_self_orig >= OSPF_LSA_REFRESH);
+    if (h == g_ospf.last_orig_hash && !refresh)
         return;
 
     /* Build a single self Router-LSA with stub links for originated prefixes. */
@@ -893,6 +927,9 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     e->originated = time(NULL);
     e->self = true;
     e->valid = true;
+
+    g_ospf.last_orig_hash = h;
+    g_ospf.last_self_orig = now;
 
     char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(g_ospf.router_id, ridbuf, sizeof(ridbuf));
     hadc_dbg("ospf: originated Router-LSA (rid %s, seq 0x%08x, %zu stub links)",
