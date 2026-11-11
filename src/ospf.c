@@ -889,17 +889,6 @@ static uint32_t orig_hash(bool want_pub, struct in_addr pub, bool want_def, hadc
     return h;
 }
 
-static void clear_self_lsas(void)
-{
-    for (size_t i = 0; i < g_ospf.n_lsas; ) {
-        if (g_ospf.lsdb[i].self) {
-            free(g_ospf.lsdb[i].body);
-            g_ospf.lsdb[i] = g_ospf.lsdb[--g_ospf.n_lsas];
-            continue;
-        }
-        i++;
-    }
-}
 
 void hadc_ospf_originate(hadc_ctx_t *ctx,
                          const struct in_addr *public_ip32, bool want_pub,
