@@ -1332,13 +1332,19 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
                 break;
             break;
         }
-        if (n < (ssize_t)sizeof(ospf_hdr_t))
+        if (n < (ssize_t)sizeof(struct iphdr))
             continue;
-        const ospf_hdr_t *h = (const ospf_hdr_t *)buf;
+        const struct iphdr *ip = (const struct iphdr *)buf;
+        size_t ihl = (size_t)ip->ihl * 4;
+        if (ihl < sizeof(struct iphdr) || (size_t)n < ihl + sizeof(ospf_hdr_t))
+            continue;
+        const uint8_t *pkt = buf + ihl;
+        size_t pktlen = (size_t)n - ihl;
+        const ospf_hdr_t *h = (const ospf_hdr_t *)pkt;
         if (h->version != OSPF_VERSION)
             continue;
         uint16_t plen = ntohs(h->length);
-        if (plen < sizeof(ospf_hdr_t) || plen > (size_t)n)
+        if (plen < sizeof(ospf_hdr_t) || plen > pktlen)
             continue;
         if (ntohl(h->area_id) != OSPF_AREA_BACKBONE)
             continue;
@@ -1349,19 +1355,19 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
         ospf_if_t *iface = iface_for_src(src.sin_addr);
         switch (h->type) {
         case OSPF_HELLO:
-            handle_hello(buf, (size_t)plen, src.sin_addr, iface);
+            handle_hello(pkt, (size_t)plen, src.sin_addr, iface);
             break;
         case OSPF_LSUPDATE:
-            handle_lsupdate(buf, (size_t)plen, src.sin_addr, iface);
+            handle_lsupdate(pkt, (size_t)plen, src.sin_addr, iface);
             break;
         case OSPF_LSACK:
-            handle_lsack(buf, (size_t)plen, src.sin_addr);
+            handle_lsack(pkt, (size_t)plen, src.sin_addr);
             break;
         case OSPF_LSREQ:
-            handle_lsreq(buf, (size_t)plen, src.sin_addr, iface);
+            handle_lsreq(pkt, (size_t)plen, src.sin_addr, iface);
             break;
         case OSPF_DBDESC:
-            handle_dbdesc(buf, (size_t)plen, src.sin_addr, iface);
+            handle_dbdesc(pkt, (size_t)plen, src.sin_addr, iface);
             hadc_dbg("ospf: rx DBD from %s on %s (len %u)", inet_ntoa(src.sin_addr),
                      iface ? iface->name : "?", plen);
             break;

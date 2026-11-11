@@ -203,7 +203,7 @@ static int rtmsg_send(int type, unsigned flags, struct in_addr prefix, unsigned 
     memset(&req, 0, sizeof(req));
     req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
     req.nh.nlmsg_type = type;
-    req.nh.nlmsg_flags = flags;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | flags;
     req.nh.nlmsg_seq = 1;
     req.nh.nlmsg_pid = 0;
     req.rt.rtm_family = AF_INET;
@@ -556,6 +556,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     backend_apply(ctx, want_pub, want_def, prev_bgw, g_rs.reason);
     hadc_ospf_originate(ctx, &g_rs.public_ip32, want_pub, want_def, NULL, 0);
     hadc_ospf_tick(ctx);
+    g_rs.n_remote_cands = hadc_ospf_default_candidates(ctx, g_rs.remote_cands, HADC_ROUTING_MAX_CANDIDATES);
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         char oldgw[INET_ADDRSTRLEN] = "0.0.0.0", cur[INET_ADDRSTRLEN] = "0.0.0.0";
         if (prev_bgw.s_addr)
@@ -587,6 +588,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
         inet_ntop(AF_INET, &g_rs.backup_gw, bgw, sizeof(bgw));
 
     json_t *cands = json_array();
+    if (!cands) cands = json_array();
     if (g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr != 0) {
         char gw[INET_ADDRSTRLEN] = "0.0.0.0";
         inet_ntop(AF_INET, &g_rs.local_cand.gateway, gw, sizeof(gw));
@@ -606,6 +608,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
 
     int cand_count = g_rs.n_remote_cands + ((g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr) ? 1 : 0);
     json_t *prefixes = json_array();
+    if (!prefixes) prefixes = json_array();
     for (size_t i = 0; i < g_rs.n_want_prefixes; i++) {
         char dst[INET_ADDRSTRLEN] = "0.0.0.0";
         inet_ntop(AF_INET, &g_rs.want_prefixes[i].prefix, dst, sizeof(dst));
@@ -614,47 +617,50 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
                                                   g_rs.want_prefixes[i].ifname));
     }
 
-    json_t *o = json_pack(
-        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o,s:i,s:o}, s:{s:s,s:s}, s:o}",
-        "enabled", ctx->conf.routing.enabled,
-        "advertise",
-            "public_ip32", ctx->conf.routing.advertise.public_ip32,
-            "vip_subnets", ctx->conf.routing.advertise.vip_subnets,
-            "default_route", ctx->conf.routing.advertise.default_route,
-        "accept",
-            "default_route", ctx->conf.routing.accept.default_route,
-        "state",
-            "advertised_public_ip32", g_rs.advertised_public_ip32,
-            "advertised_default_route", g_rs.advertised_default_route,
-            "using_backup_path", g_rs.using_backup_path,
-            "local_master_up", g_rs.local_master_up,
-            "local_working_default", g_rs.local_working_default,
-            "public_ip32", pub,
-            "backup_gateway", bgw,
-            "backup_scope", g_rs.backup_scope[0] ? g_rs.backup_scope : "none",
-            "backup_origin", g_rs.backup_origin,
-            "reason", g_rs.reason,
-            "candidate_count", cand_count,
-            "candidates", cands ? cands : json_array(),
-            "originated_prefix_count", (int)g_rs.n_want_prefixes,
-            "originated_prefixes", prefixes ? prefixes : json_array(),
-            "installed_route_count", (int)g_rs.n_installed,
-        "backend",
-            "name", g_rs.backend,
-            "router_id", g_rs.router_id,
-        "ospf", (json_t *)({
-            json_t *ifaces = json_array();
-            for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++)
-                json_array_append_new(ifaces, json_string(ctx->conf.ospf.interfaces[i]));
-            json_t *ost = hadc_ospf_status(ctx);
-            json_object_set_new(ost, "router_id", json_string(ctx->conf.ospf.router_id));
-            json_object_set_new(ost, "interfaces", ifaces);
-            json_object_set_new(ost, "auth", json_pack("{s:s}", "type",
-                ctx->conf.ospf.auth.type == 2 ? "md5" :
-                (ctx->conf.ospf.auth.type == 1 ? "plaintext" : "none")));
-            ost;
-        }));
+    json_t *o = json_object();
     if (!o)
         return json_object();
+    json_object_set_new(o, "enabled", json_boolean(ctx->conf.routing.enabled));
+    json_object_set_new(o, "advertise", json_pack("{s:b,s:b,s:b}",
+        "public_ip32", ctx->conf.routing.advertise.public_ip32,
+        "vip_subnets", ctx->conf.routing.advertise.vip_subnets,
+        "default_route", ctx->conf.routing.advertise.default_route));
+    json_object_set_new(o, "accept", json_pack("{s:b}",
+        "default_route", ctx->conf.routing.accept.default_route));
+    json_t *state = json_object();
+    if (state) {
+        json_object_set_new(state, "advertised_public_ip32", json_boolean(g_rs.advertised_public_ip32));
+        json_object_set_new(state, "advertised_default_route", json_boolean(g_rs.advertised_default_route));
+        json_object_set_new(state, "using_backup_path", json_boolean(g_rs.using_backup_path));
+        json_object_set_new(state, "local_master_up", json_boolean(g_rs.local_master_up));
+        json_object_set_new(state, "local_working_default", json_boolean(g_rs.local_working_default));
+        json_object_set_new(state, "public_ip32", json_string(pub));
+        json_object_set_new(state, "backup_gateway", json_string(bgw));
+        json_object_set_new(state, "backup_scope", json_string(g_rs.backup_scope[0] ? g_rs.backup_scope : "none"));
+        json_object_set_new(state, "backup_origin", json_string(g_rs.backup_origin));
+        json_object_set_new(state, "reason", json_string(g_rs.reason));
+        json_object_set_new(state, "candidate_count", json_integer(cand_count));
+        json_object_set_new(state, "candidates", cands ? cands : json_array());
+        json_object_set_new(state, "originated_prefix_count", json_integer((int)g_rs.n_want_prefixes));
+        json_object_set_new(state, "originated_prefixes", prefixes ? prefixes : json_array());
+        json_object_set_new(state, "installed_route_count", json_integer((int)g_rs.n_installed));
+        json_object_set_new(o, "state", state);
+    } else {
+        json_decref(cands);
+        json_decref(prefixes);
+    }
+    json_object_set_new(o, "backend", json_pack("{s:s,s:s}", "name", g_rs.backend, "router_id", g_rs.router_id));
+
+    json_t *ost = hadc_ospf_status(ctx);
+    if (!ost) ost = json_object();
+    json_object_set_new(ost, "router_id", json_string(ctx->conf.ospf.router_id));
+    json_t *ifaces = json_array();
+    for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++)
+        json_array_append_new(ifaces, json_string(ctx->conf.ospf.interfaces[i]));
+    json_object_set_new(ost, "interfaces", ifaces);
+    json_object_set_new(ost, "auth", json_pack("{s:s}", "type",
+        ctx->conf.ospf.auth.type == 2 ? "md5" :
+        (ctx->conf.ospf.auth.type == 1 ? "plaintext" : "none")));
+    json_object_set_new(o, "ospf", ost);
     return o;
 }
