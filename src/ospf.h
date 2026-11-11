@@ -27,4 +27,18 @@ struct json_t *hadc_ospf_status(hadc_ctx_t *ctx);
 /* Collect fabric-learned default-route candidates from LSDB (AS-external 0/0). */
 size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max);
 
+typedef struct {
+    struct in_addr prefix;
+    struct in_addr mask;
+    unsigned prefixlen;
+    struct in_addr nexthop;
+    uint32_t metric;
+    uint8_t lsa_type;
+    char origin[HADC_ROUTING_ORIGIN_MAX];
+    bool valid;
+} hadc_ospf_learned_route_t;
+
+size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max);
+
+
 #endif /* HA_DHCPC_OSPF_H */

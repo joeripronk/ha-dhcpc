@@ -53,6 +53,8 @@
 #define OSPF_MAX_LSREQ 64
 #define OSPF_RXMT_INTERVAL 5
 
+#define HADC_OSPF_MAX_LEARNED_ROUTES 128
+
 typedef enum {
     NSTATE_DOWN = 0,
     NSTATE_INIT,
@@ -1801,6 +1803,125 @@ static struct in_addr nbr_nexthop_for(uint32_t adv_router)
     }
     return gw;
 }
+
+static bool nexthop_on_fabric(struct in_addr nh)
+{
+    if (nh.s_addr == 0)
+        return false;
+    for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
+        ospf_if_t *oi = &g_ospf.ifaces[i];
+        if (!oi->up || oi->mask.s_addr == 0)
+            continue;
+        if ((nh.s_addr & oi->mask.s_addr) == oi->network.s_addr)
+            return true;
+    }
+    return false;
+}
+
+static bool is_self_originated_prefix(struct in_addr pfx, struct in_addr mask)
+{
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || !e->self)
+            continue;
+        if (e->hdr.type == OSPF_LSA_ROUTER && e->body_len >= 4) {
+            uint16_t nlinks = 0;
+            memcpy(&nlinks, e->body + 2, 2);
+            nlinks = ntohs(nlinks);
+            size_t off = 4;
+            for (uint16_t li = 0; li < nlinks && off + 12 <= e->body_len; li++, off += 12) {
+                if (e->body[off + 8] != 3) continue;
+                struct in_addr id, data;
+                memcpy(&id, e->body + off, 4);
+                memcpy(&data, e->body + off + 4, 4);
+                if (id.s_addr == pfx.s_addr && data.s_addr == mask.s_addr)
+                    return true;
+            }
+        } else if (e->hdr.type == OSPF_LSA_AS_EXTERNAL && e->body_len >= 8) {
+            struct in_addr epfx, emask;
+            epfx.s_addr = e->hdr.id;
+            memcpy(&emask, e->body, 4);
+            if (epfx.s_addr == pfx.s_addr && emask.s_addr == mask.s_addr)
+                return true;
+        }
+    }
+    return false;
+}
+
+size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max)
+{
+    (void)ctx;
+    size_t n = 0;
+    if (!g_ospf.enabled || !out || max == 0)
+        return 0;
+    for (size_t i = 0; i < g_ospf.n_lsas && n < max; i++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || e->self)
+            continue;
+
+        struct in_addr pfx = {0}, mask = {0}, nh = nbr_nexthop_for(ntohl(e->hdr.adv_router));
+        uint32_t metric = 0;
+        bool ok = false;
+
+        if (e->hdr.type == OSPF_LSA_ROUTER && e->body_len >= 4) {
+            uint16_t nlinks = 0;
+            memcpy(&nlinks, e->body + 2, 2);
+            nlinks = ntohs(nlinks);
+            size_t off = 4;
+            for (uint16_t li = 0; li < nlinks && off + 12 <= e->body_len && n < max; li++, off += 12) {
+                if (e->body[off + 8] != 3)
+                    continue;
+                memcpy(&pfx, e->body + off, 4);
+                memcpy(&mask, e->body + off + 4, 4);
+                uint16_t m = 0; memcpy(&m, e->body + off + 10, 2); metric = ntohs(m);
+                if (nh.s_addr == 0 || !nexthop_on_fabric(nh))
+                    continue;
+                if (is_self_originated_prefix(pfx, mask))
+                    continue;
+                hadc_ospf_learned_route_t *r = &out[n++];
+                memset(r, 0, sizeof(*r));
+                r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
+                r->lsa_type = e->hdr.type; r->valid = true;
+                uint32_t mv = ntohl(mask.s_addr);
+                unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
+                r->prefixlen = plen;
+                u32_to_rid(ntohl(e->hdr.adv_router), r->origin, sizeof(r->origin));
+            }
+            continue;
+        } else if (e->hdr.type == OSPF_LSA_AS_EXTERNAL && e->body_len >= 16) {
+            pfx.s_addr = e->hdr.id;
+            memcpy(&mask, e->body, 4);
+            memcpy(&metric, e->body + 4, 4);
+            metric = ntohl(metric) & 0x00ffffffu;
+            uint32_t fwd = 0; memcpy(&fwd, e->body + 8, 4);
+            if (fwd != 0) { nh.s_addr = fwd; }
+            /* skip default route here (handled as backup candidate/policy) */
+            if (pfx.s_addr == 0 && mask.s_addr == 0)
+                continue;
+            ok = (nh.s_addr != 0 && nexthop_on_fabric(nh));
+        } else if ((e->hdr.type == OSPF_LSA_SUMMARY || e->hdr.type == 4) && e->body_len >= 8) {
+            pfx.s_addr = e->hdr.id;
+            memcpy(&mask, e->body, 4);
+            memcpy(&metric, e->body + 4, 4);
+            metric = ntohl(metric) & 0x00ffffffu;
+            ok = (nh.s_addr != 0 && nexthop_on_fabric(nh));
+        }
+        if (!ok)
+            continue;
+        if (is_self_originated_prefix(pfx, mask))
+            continue;
+        hadc_ospf_learned_route_t *r = &out[n++];
+        memset(r, 0, sizeof(*r));
+        r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
+        r->lsa_type = e->hdr.type; r->valid = true;
+        uint32_t mv = ntohl(mask.s_addr);
+        unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
+        r->prefixlen = plen;
+        u32_to_rid(ntohl(e->hdr.adv_router), r->origin, sizeof(r->origin));
+    }
+    return n;
+}
+
 
 static void append_learned_prefix(json_t *arr, struct in_addr pfx, struct in_addr mask,
                                   const char *origin, const char *nexthop, const char *source, uint8_t lsa_type)

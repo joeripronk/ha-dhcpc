@@ -4,7 +4,12 @@
  * a backend interface (stub/no-op here), and expose status. Backup routes and
  * fabric-learned defaults are never published. */
 #include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
@@ -14,12 +19,20 @@
 #include "ospf.h"
 
 #define HADC_ROUTING_MAX_PREFIXES 64
+#define HADC_ROUTING_MAX_INSTALLED 128
 
 typedef struct {
     struct in_addr prefix;
     unsigned prefixlen;
     char ifname[HADC_IFNAME_MAX];
 } hadc_routing_prefix_t;
+
+typedef struct {
+    struct in_addr prefix;
+    unsigned prefixlen;
+    struct in_addr nexthop;
+    bool valid;
+} hadc_routing_installed_t;
 
 typedef struct {
     bool publish_public_ip32;
@@ -44,6 +57,9 @@ typedef struct {
     size_t n_remote_cands;
     hadc_routing_prefix_t want_prefixes[HADC_ROUTING_MAX_PREFIXES];
     size_t n_want_prefixes;
+
+    hadc_routing_installed_t installed[HADC_ROUTING_MAX_INSTALLED];
+    size_t n_installed;
 
 } hadc_routing_state_t;
 
@@ -173,6 +189,149 @@ static void compute_want_prefixes(hadc_ctx_t *ctx, bool enabled, bool master_own
 }
 
 
+static int rtmsg_send(int type, unsigned flags, struct in_addr prefix, unsigned prefixlen,
+                       struct in_addr nexthop)
+{
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    if (fd < 0)
+        return -1;
+    struct {
+        struct nlmsghdr nh;
+        struct rtmsg rt;
+        char buf[256];
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+    req.nh.nlmsg_type = type;
+    req.nh.nlmsg_flags = flags;
+    req.nh.nlmsg_seq = 1;
+    req.nh.nlmsg_pid = 0;
+    req.rt.rtm_family = AF_INET;
+    req.rt.rtm_dst_len = (unsigned char)prefixlen;
+    req.rt.rtm_table = RT_TABLE_MAIN;
+    req.rt.rtm_protocol = RTPROT_OSPF;
+    req.rt.rtm_scope = RT_SCOPE_UNIVERSE;
+    req.rt.rtm_type = RTN_UNICAST;
+
+    struct rtattr *rta = (struct rtattr *)(((char *)&req) + req.nh.nlmsg_len);
+    rta->rta_type = RTA_DST;
+    rta->rta_len = RTA_LENGTH(4);
+    memcpy(RTA_DATA(rta), &prefix.s_addr, 4);
+    req.nh.nlmsg_len += RTA_SPACE(4);
+
+    rta = (struct rtattr *)(((char *)&req) + req.nh.nlmsg_len);
+    rta->rta_type = RTA_GATEWAY;
+    rta->rta_len = RTA_LENGTH(4);
+    memcpy(RTA_DATA(rta), &nexthop.s_addr, 4);
+    req.nh.nlmsg_len += RTA_SPACE(4);
+
+    struct sockaddr_nl sa = {.nl_family = AF_NETLINK};
+    int rc = 0;
+    if (sendto(fd, &req, req.nh.nlmsg_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0)
+        rc = -1;
+    /* best-effort: drain ack/error for create/replace; ignore for delete */
+    if (rc == 0 && (flags & NLM_F_ACK)) {
+        char ack[512];
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ssize_t n = recv(fd, ack, sizeof(ack), 0);
+        if (n >= (ssize_t)sizeof(struct nlmsghdr)) {
+            struct nlmsghdr *nh = (struct nlmsghdr *)ack;
+            if (nh->nlmsg_type == NLMSG_ERROR) {
+                struct nlmsgerr *e = (struct nlmsgerr *)NLMSG_DATA(nh);
+                if (e->error < 0)
+                    rc = e->error;
+            }
+        }
+    }
+    close(fd);
+    return rc;
+}
+
+static bool nexthop_reachable_on_fabric(struct in_addr nh)
+{
+    if (nh.s_addr == 0) return false;
+    struct ifaddrs *ifas = NULL;
+    bool ok = false;
+    if (getifaddrs(&ifas) != 0) return false;
+    for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!ifa->ifa_netmask) continue;
+        struct in_addr a = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+        struct in_addr m = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
+        if ((a.s_addr & m.s_addr) == (nh.s_addr & m.s_addr)) { ok = true; break; }
+    }
+    freeifaddrs(ifas);
+    return ok;
+}
+
+static void apply_learned_routes(hadc_ctx_t *ctx)
+{
+    (void)ctx;
+    if (!g_rs.accept_default_route && strcmp(g_rs.backend, "stub") == 0) {
+        /* even if not accepting default, still allow non-default prefix install? accept flag
+         * controls default route acceptance; learned non-default prefixes are installed as
+         * fabric reachability when routing enabled (edge-only). */
+    }
+
+    hadc_ospf_learned_route_t learned[HADC_ROUTING_MAX_INSTALLED];
+    size_t nlearn = hadc_ospf_learned_routes(ctx, learned, HADC_ROUTING_MAX_INSTALLED);
+
+    hadc_routing_installed_t want[HADC_ROUTING_MAX_INSTALLED];
+    size_t nwant = 0;
+    for (size_t i = 0; i < nlearn && nwant < HADC_ROUTING_MAX_INSTALLED; i++) {
+        if (!learned[i].valid) continue;
+        if (learned[i].nexthop.s_addr == 0) continue;
+        if (!nexthop_reachable_on_fabric(learned[i].nexthop)) continue;
+        want[nwant].prefix = learned[i].prefix;
+        want[nwant].prefixlen = learned[i].prefixlen;
+        want[nwant].nexthop = learned[i].nexthop;
+        want[nwant].valid = true;
+        nwant++;
+    }
+
+    /* remove stale installed routes not desired (or changed nexthop) */
+    for (size_t i = 0; i < g_rs.n_installed; ) {
+        bool keep = false;
+        for (size_t j = 0; j < nwant; j++) {
+            if (g_rs.installed[i].prefix.s_addr == want[j].prefix.s_addr &&
+                g_rs.installed[i].prefixlen == want[j].prefixlen &&
+                g_rs.installed[i].nexthop.s_addr == want[j].nexthop.s_addr) {
+                keep = true;
+                want[j].valid = false; /* already present */
+                break;
+            }
+        }
+        if (keep) { i++; continue; }
+        rtmsg_send(RTM_DELROUTE, NLM_F_ACK, g_rs.installed[i].prefix,
+                   g_rs.installed[i].prefixlen, g_rs.installed[i].nexthop);
+        char p[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &g_rs.installed[i].prefix, p, sizeof(p));
+        inet_ntop(AF_INET, &g_rs.installed[i].nexthop, gw, sizeof(gw));
+        hadc_dbg("routing: removed learned route %s/%u via %s", p, g_rs.installed[i].prefixlen, gw);
+        g_rs.installed[i] = g_rs.installed[--g_rs.n_installed];
+    }
+
+    for (size_t j = 0; j < nwant; j++) {
+        if (!want[j].valid) continue;
+        if (g_rs.n_installed >= HADC_ROUTING_MAX_INSTALLED) break;
+        int rc = rtmsg_send(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK,
+                            want[j].prefix, want[j].prefixlen, want[j].nexthop);
+        if (rc < 0) {
+            char p[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &want[j].prefix, p, sizeof(p));
+            inet_ntop(AF_INET, &want[j].nexthop, gw, sizeof(gw));
+            hadc_dbg("routing: failed to install learned route %s/%u via %s: %s", p, want[j].prefixlen, gw, strerror(-rc > 0 ? -rc : errno));
+            continue;
+        }
+        g_rs.installed[g_rs.n_installed++] = want[j];
+        char p[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &want[j].prefix, p, sizeof(p));
+        inet_ntop(AF_INET, &want[j].nexthop, gw, sizeof(gw));
+        hadc_info("routing: installed learned route %s/%u via %s proto ospf", p, want[j].prefixlen, gw);
+    }
+}
+
 static void backend_apply_local(hadc_ctx_t *ctx, bool want_pub, bool want_def,
                                   struct in_addr prev_bgw, const char *reason)
 {
@@ -183,7 +342,11 @@ static void backend_apply_local(hadc_ctx_t *ctx, bool want_pub, bool want_def,
      * prefixes are originated. Effective backup gateway is consumed by executor. */
     g_rs.advertised_public_ip32 = want_pub;
     g_rs.advertised_default_route = want_def;
-    (void)reason;
+
+    /* Install/remove fabric-learned non-default routes from LSDB (edge-only,
+     * nexthop must be on local fabric; never self-originated, never default). */
+    apply_learned_routes(ctx);
+
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         hadc_desired_t desired;
         hadc_executor_desired(ctx, &ctx->lease, &desired);
@@ -277,6 +440,12 @@ int hadc_routing_init(hadc_ctx_t *ctx)
 void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
     hadc_routing_reconcile(ctx, "shutdown");
+    /* remove routes we installed */
+    for (size_t i = 0; i < g_rs.n_installed; i++) {
+        rtmsg_send(RTM_DELROUTE, NLM_F_ACK, g_rs.installed[i].prefix,
+                   g_rs.installed[i].prefixlen, g_rs.installed[i].nexthop);
+    }
+    g_rs.n_installed = 0;
     hadc_ospf_shutdown(ctx);
     g_rs.n_want_prefixes = 0;
     g_rs.advertised_public_ip32 = false;
@@ -459,6 +628,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
             "candidates", cands ? cands : json_array(),
             "originated_prefix_count", (int)g_rs.n_want_prefixes,
             "originated_prefixes", prefixes ? prefixes : json_array(),
+            "installed_route_count", (int)g_rs.n_installed,
         "backend",
             "name", g_rs.backend,
             "router_id", g_rs.router_id,
