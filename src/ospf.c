@@ -1113,17 +1113,17 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
         g_ospf.last_hello_sent = now;
     }
 
-    /* Age out LSAs and refresh self-originated ones */
+    /* Age out learned LSAs; self LSAs are refreshed by originate/reconcile. */
     for (size_t i = 0; i < g_ospf.n_lsas; ) {
         if (!g_ospf.lsdb[i].valid) { remove_lsa_at(i); continue; }
-        uint16_t age = ntohs(g_ospf.lsdb[i].hdr.age);
-        unsigned adv = (unsigned)(now - g_ospf.lsdb[i].originated);
-        if (age + adv >= OSPF_LSA_MAXAGE && !g_ospf.lsdb[i].self) {
-            remove_lsa_at(i);
-            continue;
+        if (!g_ospf.lsdb[i].self) {
+            uint16_t age = ntohs(g_ospf.lsdb[i].hdr.age);
+            unsigned adv = (unsigned)(now - g_ospf.lsdb[i].originated);
+            if (age + adv >= OSPF_LSA_MAXAGE) {
+                remove_lsa_at(i);
+                continue;
+            }
         }
-        if (g_ospf.lsdb[i].self && adv >= OSPF_LSA_REFRESH)
-            g_ospf.lsdb[i].originated = now; /* rebuilt by originate on reconcile */
         i++;
     }
 
