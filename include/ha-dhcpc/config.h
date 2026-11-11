@@ -104,7 +104,7 @@ typedef struct {
         struct {
             enum { HADC_ADV_PUB_OFF = 0, HADC_ADV_PUB_MASTER = 1, HADC_ADV_PUB_ALWAYS = 2 } public_ip32;
             bool vip_subnets;
-            bool default_route; /* publish primary healthy 0.0.0.0/0 only */
+            enum { HADC_ADV_DEF_OFF = 0, HADC_ADV_DEF_MASTER = 1, HADC_ADV_DEF_ALWAYS = 2 } default_route; /* publish 0.0.0.0/0 */
         } advertise;
         struct {
             bool default_route; /* accept fabric 0.0.0.0/0 as backup path only */

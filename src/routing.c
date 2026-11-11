@@ -123,15 +123,35 @@ static void update_local_candidate(hadc_ctx_t *ctx)
     memset(&g_rs.local_cand, 0, sizeof(g_rs.local_cand));
     /* Local-master candidate derived from cluster information (heartbeat/sync):
      * the local cluster master is the effective backup nexthop for slaves, so
-     * use the master's fabric/sync address (reachable on the fabric), not the
-     * public DHCP lease gateway. */
-    if (!ctx->conf.designated_master[0])
+     * use the current master's fabric/sync address (reachable on the fabric),
+     * not the public DHCP lease gateway. */
+    const char *master_id = NULL;
+    if (ctx->role == HADC_ROLE_MASTER)
+        master_id = ctx->conf.self;
+    else if (ctx->conf.designated_master[0])
+        master_id = ctx->conf.designated_master;
+    else {
+        for (size_t i = 0; i < ctx->conf.n_members; i++) {
+            if (ctx->peers[i].role_view[0] &&
+                !strcmp(ctx->peers[i].role_view, "master") &&
+                ctx->peers[i].alive) {
+                master_id = ctx->conf.members[i].id;
+                break;
+            }
+            if (ctx->peers[i].master_view[0] &&
+                !strcmp(ctx->peers[i].master_view, ctx->conf.members[i].id) &&
+                ctx->peers[i].alive) {
+                master_id = ctx->conf.members[i].id;
+                break;
+            }
+        }
+    }
+    if (!master_id || !*master_id)
         return;
-    if (ctx->lease.gateway.s_addr == 0)
-        return;
+
     struct in_addr nexthop = {0};
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
-        if (!strcmp(ctx->conf.members[i].id, ctx->conf.designated_master)) {
+        if (!strcmp(ctx->conf.members[i].id, master_id)) {
             nexthop = ctx->conf.members[i].sync_address;
             break;
         }
@@ -140,8 +160,7 @@ static void update_local_candidate(hadc_ctx_t *ctx)
         return;
     g_rs.local_cand.gateway = nexthop;
     g_rs.local_cand.scope = HADC_ROUTE_SCOPE_LOCAL_MASTER;
-    snprintf(g_rs.local_cand.origin, sizeof(g_rs.local_cand.origin), "%s",
-             ctx->conf.designated_master);
+    snprintf(g_rs.local_cand.origin, sizeof(g_rs.local_cand.origin), "%s", master_id);
     g_rs.local_cand.valid = true;
 }
 
@@ -416,8 +435,7 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
             break;
         if (want == HADC_ROUTE_SCOPE_LOCAL_MASTER) {
             const hadc_routing_default_candidate_t *c = &g_rs.local_cand;
-            if (c->valid && c->gateway.s_addr != 0 &&
-                !strcmp(c->origin, ctx->conf.designated_master)) {
+            if (c->valid && c->gateway.s_addr != 0) {
                 chosen = c->gateway;
                 scope = scope_name(HADC_ROUTE_SCOPE_LOCAL_MASTER);
                 origin = c->origin;
@@ -526,7 +544,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     g_rs.using_backup_path = backup;
     g_rs.accept_default_route = enabled && ctx->conf.routing.accept.default_route;
     g_rs.publish_public_ip32 = enabled && ctx->conf.routing.advertise.public_ip32 != HADC_ADV_PUB_OFF;
-    g_rs.publish_default_route = enabled && ctx->conf.routing.advertise.default_route;
+    g_rs.publish_default_route = enabled && ctx->conf.routing.advertise.default_route != HADC_ADV_DEF_OFF;
     g_rs.public_ip32 = ctx->lease.address;
     snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
 
@@ -544,7 +562,13 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
         else
             want_pub = healthy_bound;
     }
-    bool want_def = enabled && g_rs.publish_default_route && healthy_bound && !backup;
+    bool want_def = false;
+    if (enabled && ctx->conf.routing.advertise.default_route != HADC_ADV_DEF_OFF && ctx->lease.address.s_addr != 0) {
+        if (ctx->conf.routing.advertise.default_route == HADC_ADV_DEF_ALWAYS)
+            want_def = true;
+        else
+            want_def = healthy_bound && !backup;
+    }
 
     if (!enabled) {
         want_pub = false;
@@ -638,16 +662,21 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
         return json_object();
     json_object_set_new(o, "enabled", json_boolean(ctx->conf.routing.enabled));
     {
-        const char *pub_mode = "off";
+        const char *pub_mode = "off", *def_mode = "off";
         switch (ctx->conf.routing.advertise.public_ip32) {
         case HADC_ADV_PUB_ALWAYS: pub_mode = "always"; break;
         case HADC_ADV_PUB_MASTER: pub_mode = "on"; break;
         default: pub_mode = "off"; break;
         }
-        json_object_set_new(o, "advertise", json_pack("{s:s,s:b,s:b}",
+        switch (ctx->conf.routing.advertise.default_route) {
+        case HADC_ADV_DEF_ALWAYS: def_mode = "always"; break;
+        case HADC_ADV_DEF_MASTER: def_mode = "on"; break;
+        default: def_mode = "off"; break;
+        }
+        json_object_set_new(o, "advertise", json_pack("{s:s,s:b,s:s}",
             "public_ip32", pub_mode,
             "vip_subnets", ctx->conf.routing.advertise.vip_subnets,
-            "default_route", ctx->conf.routing.advertise.default_route));
+            "default_route", def_mode));
     }
     json_object_set_new(o, "accept", json_pack("{s:b}",
         "default_route", ctx->conf.routing.accept.default_route));

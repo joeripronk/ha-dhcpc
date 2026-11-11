@@ -781,7 +781,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->routing.enabled = false;
     out->routing.advertise.public_ip32 = HADC_ADV_PUB_MASTER;
     out->routing.advertise.vip_subnets = false;
-    out->routing.advertise.default_route = false;
+    out->routing.advertise.default_route = HADC_ADV_DEF_OFF;
     out->routing.accept.default_route = false;
     snprintf(out->routing.backend, sizeof(out->routing.backend), "local");
     out->ospf.n_interfaces = 0;
@@ -836,7 +836,31 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     }
                 }
                 if (get_bool(ra, "vip_subnets", &out->routing.advertise.vip_subnets, false)) goto derr;
-                if (get_bool(ra, "default_route", &out->routing.advertise.default_route, false)) goto derr;
+                {
+                    json_t *dr = json_object_get(ra, "default_route");
+                    if (dr) {
+                        if (json_is_boolean(dr)) {
+                            out->routing.advertise.default_route = json_is_true(dr) ? HADC_ADV_DEF_MASTER : HADC_ADV_DEF_OFF;
+                        } else if (json_is_string(dr)) {
+                            const char *s = json_string_value(dr);
+                            if (!strcmp(s, "always"))
+                                out->routing.advertise.default_route = HADC_ADV_DEF_ALWAYS;
+                            else if (!strcmp(s, "on") || !strcmp(s, "true") || !strcmp(s, "master"))
+                                out->routing.advertise.default_route = HADC_ADV_DEF_MASTER;
+                            else if (!strcmp(s, "off") || !strcmp(s, "false") || !strcmp(s, "none"))
+                                out->routing.advertise.default_route = HADC_ADV_DEF_OFF;
+                            else {
+                                snprintf(err, errlen, "config: unknown routing.advertise.default_route %s", s);
+                                goto derr;
+                            }
+                        } else {
+                            snprintf(err, errlen, "config: routing.advertise.default_route must be a boolean or string");
+                            goto derr;
+                        }
+                    } else {
+                        out->routing.advertise.default_route = HADC_ADV_DEF_OFF;
+                    }
+                }
             }
             json_t *rc = json_object_get(r, "accept");
             if (rc) {
