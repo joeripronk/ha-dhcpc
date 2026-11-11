@@ -919,18 +919,29 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     if (h == g_ospf.last_orig_hash && !refresh)
         return;
 
-    /* Build a single self Router-LSA with stub links for originated prefixes. */
-    clear_self_lsas();
-    if (g_ospf.n_lsas >= OSPF_MAX_LSAS)
-        return;
+    /* Snapshot current self LSAs to detect withdrawals (flush as MaxAge). */
+    ospf_lsa_t old_self[OSPF_MAX_LSAS];
+    size_t n_old_self = 0;
+    for (size_t i = 0; i < g_ospf.n_lsas && n_old_self < OSPF_MAX_LSAS; i++) {
+        if (g_ospf.lsdb[i].valid && g_ospf.lsdb[i].self)
+            old_self[n_old_self++] = g_ospf.lsdb[i];
+    }
 
-    /* count links: public /32, default route 0/0, plus one stub per vip prefix
-     * (vip prefixes passed generically not wired yet; originate called from routing
-     * with computed want_prefixes later - keep simple: caller supplies counts via state) */
-    /* We'll build body after counting in caller-aware way; for now store intent in LSA
-       as stubs derived from ctx lease/vip config is done in routing - instead accept
-       prefix list via a simpler route: routing will call originate and we read its
-       desired public/default; VIPs added below by scanning ctx conf. */
+    /* Build a single self Router-LSA with stub links for originated prefixes. */
+    /* remove self from lsdb (bodies freed) but keep snapshots above */
+    for (size_t i = 0; i < g_ospf.n_lsas; ) {
+        if (g_ospf.lsdb[i].self) {
+            free(g_ospf.lsdb[i].body);
+            g_ospf.lsdb[i].body = NULL;
+            g_ospf.lsdb[i] = g_ospf.lsdb[--g_ospf.n_lsas];
+            continue;
+        }
+        i++;
+    }
+    if (g_ospf.n_lsas >= OSPF_MAX_LSAS) {
+        for (size_t i = 0; i < n_old_self; i++) free(old_self[i].body);
+        return;
+    }
 
     typedef struct { uint32_t id; uint32_t data; uint8_t type; uint8_t tos; uint16_t metric; } __attribute__((packed)) rlink_t;
     rlink_t links[64];
@@ -1034,6 +1045,44 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
             e->valid = true;
         }
         free(buf);
+    }
+
+    /* Withdraw (MaxAge) any previously self-originated LSA no longer present. */
+    for (size_t i = 0; i < n_old_self; i++) {
+        bool still = false;
+        for (size_t j = 0; j < g_ospf.n_lsas; j++) {
+            if (!g_ospf.lsdb[j].valid || !g_ospf.lsdb[j].self) continue;
+            if (lsa_same(&g_ospf.lsdb[j].hdr, &old_self[i].hdr)) { still = true; break; }
+        }
+        if (!still) {
+            /* flush with MaxAge */
+            size_t l = sizeof(ospf_lsa_hdr_t) + old_self[i].body_len;
+            uint8_t *pkt = calloc(1, sizeof(ospf_hdr_t) + 4 + l);
+            if (pkt) {
+                ospf_hdr_t *oh = (ospf_hdr_t *)pkt;
+                oh->version = OSPF_VERSION; oh->type = OSPF_LSUPDATE;
+                oh->router_id = htonl(g_ospf.router_id); oh->area_id = htonl(OSPF_AREA_BACKBONE);
+                uint32_t nl = htonl(1);
+                memcpy(pkt + sizeof(ospf_hdr_t), &nl, 4);
+                uint8_t *lp = pkt + sizeof(ospf_hdr_t) + 4;
+                memcpy(lp, &old_self[i].hdr, sizeof(old_self[i].hdr));
+                if (old_self[i].body_len && old_self[i].body)
+                    memcpy(lp + sizeof(old_self[i].hdr), old_self[i].body, old_self[i].body_len);
+                ((ospf_lsa_hdr_t *)lp)->age = htons(OSPF_LSA_MAXAGE);
+                ((ospf_lsa_hdr_t *)lp)->seq = old_self[i].hdr.seq;
+                lsa_checksum(lp, l);
+                size_t plen = sizeof(ospf_hdr_t) + 4 + l;
+                oh->length = htons((uint16_t)plen);
+                oh->checksum = 0; oh->checksum = ip_checksum(pkt, plen);
+                for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
+                    if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY)
+                        send_to(g_ospf.nbrs[k].ip, g_ospf.nbrs[k].ifindex, pkt, plen);
+                }
+                hadc_info("ospf: flushed withdrawn self LSA type %u id %08x", old_self[i].hdr.type, ntohl(old_self[i].hdr.id));
+                free(pkt);
+            }
+        }
+        free(old_self[i].body);
     }
 
     g_ospf.last_orig_hash = h;
