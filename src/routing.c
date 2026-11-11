@@ -459,19 +459,18 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
         "backend",
             "name", g_rs.backend,
             "router_id", g_rs.router_id,
-        "ospf", json_pack("{s:s, s:o, s:{s:s}}",
-            "router_id", ctx->conf.ospf.router_id,
-            "interfaces", (json_t *)({
-                json_t *a = json_array();
-                for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++)
-                    json_array_append_new(a, json_string(ctx->conf.ospf.interfaces[i]));
-                a;
-            }),
-            "auth",
-                "type",
+        "ospf", (json_t *)({
+            json_t *ifaces = json_array();
+            for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++)
+                json_array_append_new(ifaces, json_string(ctx->conf.ospf.interfaces[i]));
+            json_t *ost = hadc_ospf_status(ctx);
+            json_object_set_new(ost, "router_id", json_string(ctx->conf.ospf.router_id));
+            json_object_set_new(ost, "interfaces", ifaces);
+            json_object_set_new(ost, "auth", json_pack("{s:s}", "type",
                 ctx->conf.ospf.auth.type == 2 ? "md5" :
-                (ctx->conf.ospf.auth.type == 1 ? "plaintext" : "none")
-        ));
+                (ctx->conf.ospf.auth.type == 1 ? "plaintext" : "none")));
+            ost;
+        }));
     if (!o)
         return json_object();
     return o;

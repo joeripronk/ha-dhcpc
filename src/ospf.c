@@ -18,6 +18,7 @@
 
 #include "ha-dhcpc/log.h"
 #include "internal.h"
+#include <jansson.h>
 #include "ospf.h"
 
 #define OSPF_PROTO 89
@@ -941,4 +942,41 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
         }
         last_flood = now;
     }
+}
+
+
+json_t *hadc_ospf_status(hadc_ctx_t *ctx)
+{
+    (void)ctx;
+    json_t *nbrs = json_array();
+    int nfullish = 0;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+        ospf_neighbor_t *n = &g_ospf.nbrs[i];
+        if (!n->in_use)
+            continue;
+        char rid[INET_ADDRSTRLEN], ip[INET_ADDRSTRLEN];
+        u32_to_rid(n->router_id, rid, sizeof(rid));
+        inet_ntop(AF_INET, &n->ip, ip, sizeof(ip));
+        const char *sn = n->state == NSTATE_DOWN ? "down" :
+                         n->state == NSTATE_INIT ? "init" :
+                         n->state == NSTATE_2WAY ? "2way" : "adjacent";
+        if (n->state >= NSTATE_2WAY) nfullish++;
+        json_array_append_new(nbrs, json_pack("{s:s,s:s,s:s,s:i}", "router_id", rid,
+                                              "ip", ip, "state", sn,
+                                              "dead_in", (int)(n->dead_at > now ? n->dead_at - now : 0)));
+    }
+    int self_lsas = 0, other_lsas = 0;
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        if (!g_ospf.lsdb[i].valid) continue;
+        if (g_ospf.lsdb[i].self) self_lsas++; else other_lsas++;
+    }
+    return json_pack("{s:b,s:i,s:i,s:i,s:i,s:i,s:o}",
+                     "enabled", g_ospf.enabled,
+                     "neighbors", (int)json_array_size(nbrs),
+                     "neighbors_2way", nfullish,
+                     "lsdb_self", self_lsas,
+                     "lsdb_other", other_lsas,
+                     "lsdb_total", self_lsas + other_lsas,
+                     "neighbor_list", nbrs);
 }

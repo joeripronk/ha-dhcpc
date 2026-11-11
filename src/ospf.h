@@ -20,4 +20,8 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
                          bool want_default_route,
                          const void *vip_prefixes, size_t vip_prefix_count);
 
+/* JSON status (neighbors/LSDB) for routing status. */
+struct json_t;
+struct json_t *hadc_ospf_status(hadc_ctx_t *ctx);
+
 #endif /* HA_DHCPC_OSPF_H */
