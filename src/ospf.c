@@ -701,17 +701,74 @@ static void handle_lsack(const uint8_t *pkt, size_t len)
     /* acknowledgements accepted; no retransmission queue in minimal implementation */
 }
 
-static void handle_dbd_lsreq(const uint8_t *pkt, size_t len, struct in_addr src)
+static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
 {
-    (void)pkt; (void)len;
-    /* Minimal: on adjacency attempt, proactively flood our self LSAs; full DBD/LSR
-     * exchange can be added for stricter interop. */
-    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
-        if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].ip.s_addr == src.s_addr &&
-            g_ospf.nbrs[i].state >= NSTATE_2WAY) {
-            flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
+    if (len < sizeof(ospf_hdr_t) + 12)
+        return;
+    /* Each request is 12 bytes: type(4), id(4), adv_router(4) */
+    size_t off = sizeof(ospf_hdr_t);
+    uint8_t out[OSPF_MTU];
+    memset(out, 0, sizeof(out));
+    ospf_hdr_t *oh = (ospf_hdr_t *)out;
+    oh->version = OSPF_VERSION;
+    oh->type = OSPF_LSUPDATE;
+    oh->router_id = htonl(g_ospf.router_id);
+    oh->area_id = htonl(OSPF_AREA_BACKBONE);
+    size_t ooff = sizeof(ospf_hdr_t) + 4;
+    uint32_t nlsas = 0;
+    while (off + 12 <= len) {
+        uint32_t type, id, adv;
+        memcpy(&type, pkt + off, 4);
+        memcpy(&id, pkt + off + 4, 4);
+        memcpy(&adv, pkt + off + 8, 4);
+        off += 12;
+        ospf_lsa_hdr_t key = {0};
+        key.type = (uint8_t)ntohl(type);
+        key.id = id;
+        key.adv_router = adv;
+        ospf_lsa_t *e = find_lsa(&key);
+        if (!e || !e->valid)
+            continue;
+        size_t l = sizeof(ospf_lsa_hdr_t) + e->body_len;
+        if (ooff + l > OSPF_MTU)
             break;
+        memcpy(out + ooff, &e->hdr, sizeof(e->hdr));
+        if (e->body_len && e->body)
+            memcpy(out + ooff + sizeof(e->hdr), e->body, e->body_len);
+        lsa_checksum(out + ooff, l);
+        ooff += l;
+        nlsas++;
+    }
+    if (!nlsas)
+        return;
+    uint32_t nl = htonl(nlsas);
+    memcpy(out + sizeof(ospf_hdr_t), &nl, 4);
+    oh->length = htons((uint16_t)ooff);
+    oh->checksum = 0;
+    oh->checksum = ip_checksum(out, ooff);
+    if (iface && iface->ifindex)
+        send_to(src, iface->ifindex, out, ooff);
+    else
+        send_to(src, 0, out, ooff);
+    hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s", nlsas, inet_ntoa(src));
+}
+
+static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
+{
+    (void)len;
+    /* Minimal DBD handling for interop: acknowledge by flooding self LSAs and
+     * treating peer as advancing adjacency if in 2-Way; full master/slave DBD
+     * exchange is not implemented. */
+    (void)pkt;
+    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+        ospf_neighbor_t *n = &g_ospf.nbrs[i];
+        if (!n->in_use || n->ip.s_addr != src.s_addr)
+            continue;
+        if (n->state >= NSTATE_2WAY) {
+            flood_self_lsas_to_neighbor(n);
         }
+        (void)iface;
+        break;
     }
 }
 
@@ -747,11 +804,13 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
         case OSPF_LSACK:
             handle_lsack(buf, (size_t)plen);
             break;
-        case OSPF_DBDESC:
         case OSPF_LSREQ:
-            handle_dbd_lsreq(buf, (size_t)plen, src.sin_addr);
-            hadc_dbg("ospf: rx type %u from %s on %s (len %u)", h->type,
-                     inet_ntoa(src.sin_addr), iface ? iface->name : "?", plen);
+            handle_lsreq(buf, (size_t)plen, src.sin_addr, iface);
+            break;
+        case OSPF_DBDESC:
+            handle_dbdesc(buf, (size_t)plen, src.sin_addr, iface);
+            hadc_dbg("ospf: rx DBD from %s on %s (len %u)", inet_ntoa(src.sin_addr),
+                     iface ? iface->name : "?", plen);
             break;
         default:
             break;
