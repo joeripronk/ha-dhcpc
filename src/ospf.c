@@ -280,6 +280,9 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
         hadc_warn("ospf: failed to register socket in event loop");
     }
 
+    if (ctx->conf.ospf.auth.type == 2)
+        hadc_warn("ospf: md5 auth configured but not implemented; OSPF packets will be rejected (use plaintext or none)");
+
     hadc_info("ospf: started (area 0, %zu interfaces, router-id %s)",
               g_ospf.n_ifaces, ctx->conf.ospf.router_id);
     return 0;
