@@ -6,6 +6,11 @@
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
+#include <netlink/netlink.h>
+#include <netlink/route/route.h>
 #include <string.h>
 
 #include "ha-dhcpc/cluster.h"
@@ -13,6 +18,15 @@
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
+
+#define HADC_ROUTING_MAX_ROUTES 64
+#define HADC_ROUTING_ROUTE_METRIC 200
+
+typedef struct {
+    struct in_addr dst;
+    unsigned prefixlen;
+    char ifname[HADC_IFNAME_MAX];
+} hadc_routing_route_t;
 
 typedef struct {
     bool publish_public_ip32;
@@ -35,6 +49,11 @@ typedef struct {
     hadc_routing_default_candidate_t local_cand; /* from cluster/heartbeat info */
     hadc_routing_default_candidate_t remote_cands[HADC_ROUTING_MAX_CANDIDATES];
     size_t n_remote_cands;
+    hadc_routing_route_t want_routes[HADC_ROUTING_MAX_ROUTES];
+    size_t n_want_routes;
+    hadc_routing_route_t applied_routes[HADC_ROUTING_MAX_ROUTES];
+    size_t n_applied_routes;
+    struct nl_sock *sk;
 } hadc_routing_state_t;
 
 static hadc_routing_state_t g_rs;
@@ -109,16 +128,163 @@ static void update_local_candidate(hadc_ctx_t *ctx)
     g_rs.local_cand.valid = true;
 }
 
+static struct in_addr mask_addr(struct in_addr addr, unsigned prefixlen)
+{
+    struct in_addr out = {0};
+    if (prefixlen == 0) {
+        out.s_addr = 0;
+        return out;
+    }
+    if (prefixlen >= 32) {
+        out = addr;
+        return out;
+    }
+    uint32_t mask = htonl(0xffffffffu << (32 - prefixlen));
+    out.s_addr = addr.s_addr & mask;
+    return out;
+}
+
+static bool route_eq(const hadc_routing_route_t *a, const hadc_routing_route_t *b)
+{
+    return a->dst.s_addr == b->dst.s_addr && a->prefixlen == b->prefixlen &&
+           !strcmp(a->ifname, b->ifname);
+}
+
+static void add_want_route(struct in_addr dst, unsigned prefixlen, const char *ifname)
+{
+    if (g_rs.n_want_routes >= HADC_ROUTING_MAX_ROUTES)
+        return;
+    if (!ifname || !*ifname)
+        return;
+    hadc_routing_route_t *r = &g_rs.want_routes[g_rs.n_want_routes++];
+    r->dst = dst;
+    r->prefixlen = prefixlen;
+    snprintf(r->ifname, sizeof(r->ifname), "%s", ifname);
+}
+
+static void compute_want_routes(hadc_ctx_t *ctx, bool enabled, bool master_owner)
+{
+    g_rs.n_want_routes = 0;
+    if (!enabled)
+        return;
+
+    /* DHCP/public IP is always originated as a /32 when owned/advertised. */
+    if (ctx->conf.routing.advertise.public_ip32 && g_rs.want_advertised_public_ip32 &&
+        ctx->lease.address.s_addr != 0) {
+        add_want_route(ctx->lease.address, 32, ctx->conf.interface);
+    }
+
+    /* VIP subnets carry prefix info in config; calculate network routes. */
+    if (ctx->conf.routing.advertise.vip_subnets && master_owner) {
+        for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+            const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+            for (size_t j = 0; j < ci->n_addrs; j++) {
+                struct in_addr net = mask_addr(ci->addrs[j].address, ci->addrs[j].prefixlen);
+                add_want_route(net, ci->addrs[j].prefixlen, ci->interface);
+            }
+        }
+    }
+}
+
+static int nl_route_change(const hadc_routing_route_t *r, bool add)
+{
+    unsigned ifindex;
+    struct nl_msg *m;
+    struct rtmsg *rt;
+    uint32_t metric = HADC_ROUTING_ROUTE_METRIC;
+
+    if (!g_rs.sk)
+        return -1;
+    ifindex = if_nametoindex(r->ifname);
+    if (!ifindex)
+        return -1;
+    m = nlmsg_alloc_simple(add ? RTM_NEWROUTE : RTM_DELROUTE,
+                           NLM_F_REQUEST | NLM_F_ACK |
+                               (add ? (NLM_F_CREATE | NLM_F_REPLACE) : 0));
+    if (!m)
+        return -1;
+    rt = (struct rtmsg *)nlmsg_reserve(m, sizeof(*rt), NLMSG_ALIGNTO);
+    if (!rt) {
+        nlmsg_free(m);
+        return -1;
+    }
+    rt->rtm_family = AF_INET;
+    rt->rtm_dst_len = (unsigned char)r->prefixlen;
+    rt->rtm_src_len = 0;
+    rt->rtm_tos = 0;
+    rt->rtm_table = RT_TABLE_MAIN;
+    rt->rtm_protocol = RTPROT_BOOT;
+    rt->rtm_scope = (r->prefixlen == 32) ? RT_SCOPE_HOST : RT_SCOPE_LINK;
+    rt->rtm_type = RTN_UNICAST;
+    if (nla_put(m, RTA_DST, 4, &r->dst) < 0 ||
+        nla_put(m, RTA_OIF, 4, &ifindex) < 0 ||
+        nla_put(m, RTA_PRIORITY, 4, &metric) < 0) {
+        nlmsg_free(m);
+        return -1;
+    }
+    return nl_send_sync(g_rs.sk, m);
+}
+
+static void apply_local_routes(const char *reason)
+{
+    /* withdraw routes no longer desired */
+    for (size_t i = 0; i < g_rs.n_applied_routes; i++) {
+        bool keep = false;
+        for (size_t j = 0; j < g_rs.n_want_routes; j++) {
+            if (route_eq(&g_rs.applied_routes[i], &g_rs.want_routes[j])) {
+                keep = true;
+                break;
+            }
+        }
+        if (keep)
+            continue;
+        char dst[INET_ADDRSTRLEN] = "0.0.0.0";
+        inet_ntop(AF_INET, &g_rs.applied_routes[i].dst, dst, sizeof(dst));
+        int rc = nl_route_change(&g_rs.applied_routes[i], false);
+        if (rc < 0 && rc != -NLE_OBJ_NOTFOUND && rc != -NLE_NOADDR)
+            hadc_dbg("routing: route withdraw %s/%u dev %s failed: %s (%s)", dst,
+                     g_rs.applied_routes[i].prefixlen, g_rs.applied_routes[i].ifname,
+                     nl_geterror(rc), reason);
+        else
+            hadc_info("routing: route withdraw %s/%u dev %s (%s)", dst,
+                      g_rs.applied_routes[i].prefixlen, g_rs.applied_routes[i].ifname, reason);
+    }
+
+    /* add desired routes */
+    size_t applied = 0;
+    for (size_t i = 0; i < g_rs.n_want_routes; i++) {
+        char dst[INET_ADDRSTRLEN] = "0.0.0.0";
+        inet_ntop(AF_INET, &g_rs.want_routes[i].dst, dst, sizeof(dst));
+        int rc = nl_route_change(&g_rs.want_routes[i], true);
+        if (rc < 0 && rc != -NLE_EXIST) {
+            hadc_warn("routing: route add %s/%u dev %s failed: %s (%s)", dst,
+                      g_rs.want_routes[i].prefixlen, g_rs.want_routes[i].ifname,
+                      nl_geterror(rc), reason);
+            continue;
+        }
+        bool existed = false;
+        for (size_t j = 0; j < g_rs.n_applied_routes; j++)
+            if (route_eq(&g_rs.applied_routes[j], &g_rs.want_routes[i])) { existed = true; break; }
+        if (!existed)
+            hadc_info("routing: route add %s/%u dev %s (%s)", dst,
+                      g_rs.want_routes[i].prefixlen, g_rs.want_routes[i].ifname, reason);
+        if (applied < HADC_ROUTING_MAX_ROUTES)
+            g_rs.applied_routes[applied++] = g_rs.want_routes[i];
+    }
+    g_rs.n_applied_routes = applied;
+}
+
 static void backend_apply_local(hadc_ctx_t *ctx, bool want_pub, bool want_def,
                                   struct in_addr prev_bgw, const char *reason)
 {
     /* Local backend: apply routing effects on this node. Effective backup
      * gateway is consumed by executor desired state; reapply when it changes so
      * fabric-learned/local-cluster defaults take effect without waiting for an
-     * external event. Advertised-prefix origination to OSPF is not performed by
-     * the local backend (requires external daemon integration). */
+     * external event. Populate local routing table from local state/config:
+     * DHCP/public IP as /32, VIP subnets as calculated network routes. */
     g_rs.advertised_public_ip32 = want_pub;
     g_rs.advertised_default_route = want_def;
+    apply_local_routes(reason ? reason : "routing");
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         hadc_desired_t desired;
         hadc_executor_desired(ctx, &ctx->lease, &desired);
@@ -204,6 +370,12 @@ int hadc_routing_init(hadc_ctx_t *ctx)
     snprintf(g_rs.backend, sizeof(g_rs.backend), "%s",
              ctx->conf.routing.backend[0] ? ctx->conf.routing.backend : "local");
     snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
+    g_rs.sk = nl_socket_alloc();
+    if (g_rs.sk && nl_connect(g_rs.sk, NETLINK_ROUTE) != 0) {
+        nl_socket_free(g_rs.sk);
+        g_rs.sk = NULL;
+        hadc_warn("routing: netlink route socket unavailable; local routes disabled");
+    }
     hadc_routing_reconcile(ctx, "init");
     return 0;
 }
@@ -211,6 +383,12 @@ int hadc_routing_init(hadc_ctx_t *ctx)
 void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
     hadc_routing_reconcile(ctx, "shutdown");
+    g_rs.n_want_routes = 0;
+    apply_local_routes("shutdown");
+    if (g_rs.sk) {
+        nl_socket_free(g_rs.sk);
+        g_rs.sk = NULL;
+    }
     g_rs.advertised_public_ip32 = false;
     g_rs.advertised_default_route = false;
     g_rs.public_ip32.s_addr = 0;
@@ -285,17 +463,19 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
         want_def = false;
     }
 
-    if (want_pub != g_rs.want_advertised_public_ip32) {
+    g_rs.want_advertised_public_ip32 = want_pub;
+    g_rs.want_advertised_default_route = want_def;
+    compute_want_routes(ctx, enabled, master_owner);
+
+    if (want_pub != g_rs.advertised_public_ip32) {
         hadc_info("routing: %s public /32 %s (router-id %s, %s)", want_pub ? "advertise" : "withdraw",
                   ctx->lease.address.s_addr ? inet_ntoa(ctx->lease.address) : "0.0.0.0",
                   g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
-        g_rs.want_advertised_public_ip32 = want_pub;
     }
-    if (want_def != g_rs.want_advertised_default_route) {
+    if (want_def != g_rs.advertised_default_route) {
         hadc_info("routing: %s default route 0.0.0.0/0 (router-id %s, %s)",
                   want_def ? "advertise" : "withdraw",
                   g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
-        g_rs.want_advertised_default_route = want_def;
     }
 
     struct in_addr prev_bgw = g_rs.backup_gw;
@@ -351,8 +531,17 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
     }
 
     int cand_count = g_rs.n_remote_cands + ((g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr) ? 1 : 0);
+    json_t *routes = json_array();
+    for (size_t i = 0; i < g_rs.n_want_routes; i++) {
+        char dst[INET_ADDRSTRLEN] = "0.0.0.0";
+        inet_ntop(AF_INET, &g_rs.want_routes[i].dst, dst, sizeof(dst));
+        json_array_append_new(routes, json_pack("{s:s,s:i,s:s}", "dst", dst, "prefixlen",
+                                                (int)g_rs.want_routes[i].prefixlen, "interface",
+                                                g_rs.want_routes[i].ifname));
+    }
+
     json_t *o = json_pack(
-        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o}, s:{s:s,s:s}, s:o}",
+        "{s:b, s:{s:b,s:b,s:b}, s:{s:b}, s:{s:b,s:b,s:b,s:b,s:b,s:s,s:s,s:s,s:s,s:s,s:i,s:o,s:i,s:o}, s:{s:s,s:s}, s:o}",
         "enabled", ctx->conf.routing.enabled,
         "advertise",
             "public_ip32", ctx->conf.routing.advertise.public_ip32,
@@ -373,6 +562,8 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
             "reason", g_rs.reason,
             "candidate_count", cand_count,
             "candidates", cands ? cands : json_array(),
+            "local_route_count", (int)g_rs.n_want_routes,
+            "local_routes", routes ? routes : json_array(),
         "backend",
             "name", g_rs.backend,
             "router_id", g_rs.router_id,
