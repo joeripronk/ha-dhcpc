@@ -60,7 +60,7 @@ typedef enum {
 } nbr_state_t;
 
 typedef struct {
-    uint32_t router_id; /* network byte order stored as host in comparisons? keep host */
+    uint32_t router_id; /* host order */
     struct in_addr ip;
     struct in_addr netmask;
     uint32_t area;
@@ -71,6 +71,8 @@ typedef struct {
     time_t last_hello;
     time_t dead_at;
     bool in_use;
+    bool lsa_sync_sent;
+    unsigned ifindex;
 } ospf_neighbor_t;
 
 typedef struct {
@@ -301,6 +303,191 @@ typedef struct {
     /* followed by neighbor router IDs */
 } __attribute__((packed)) ospf_hello_t;
 
+static void send_to(struct in_addr dst, unsigned ifindex, const uint8_t *pkt, size_t len)
+{
+    if (g_ospf.fd < 0 || len == 0)
+        return;
+    struct sockaddr_in da;
+    memset(&da, 0, sizeof(da));
+    da.sin_family = AF_INET;
+    da.sin_addr = dst;
+
+    if (ifindex) {
+        /* prefer interface addr as multicast source when possible */
+        for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
+            if (g_ospf.ifaces[i].ifindex == ifindex && g_ospf.ifaces[i].up) {
+                struct ip_mreqn mreq;
+                memset(&mreq, 0, sizeof(mreq));
+                mreq.imr_address = g_ospf.ifaces[i].addr;
+                mreq.imr_ifindex = (int)ifindex;
+                setsockopt(g_ospf.fd, IPPROTO_IP, IP_MULTICAST_IF, &mreq, sizeof(mreq));
+                break;
+            }
+        }
+    }
+    ssize_t n = sendto(g_ospf.fd, pkt, len, 0, (struct sockaddr *)&da, sizeof(da));
+    if (n < 0)
+        hadc_dbg("ospf: send to %s failed: %s", inet_ntoa(dst), strerror(errno));
+}
+
+static void send_allspfrouters(const uint8_t *pkt, size_t len)
+{
+    struct in_addr dst;
+    if (inet_pton(AF_INET, OSPF_ALLSPFROUTERS, &dst) != 1)
+        return;
+    for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
+        if (g_ospf.ifaces[i].up && g_ospf.ifaces[i].ifindex)
+            send_to(dst, g_ospf.ifaces[i].ifindex, pkt, len);
+    }
+}
+
+static bool lsa_same(const ospf_lsa_hdr_t *a, const ospf_lsa_hdr_t *b)
+{
+    return a->type == b->type && a->id == b->id && a->adv_router == b->adv_router;
+}
+
+static bool lsa_more_recent(const ospf_lsa_hdr_t *a, const ospf_lsa_hdr_t *b)
+{
+    int32_t sa = (int32_t)ntohl(a->seq);
+    int32_t sb = (int32_t)ntohl(b->seq);
+    if (sa != sb)
+        return sa > sb;
+    if (a->checksum != b->checksum)
+        return ntohs(a->checksum) > ntohs(b->checksum);
+    uint16_t aa = ntohs(a->age) == OSPF_LSA_MAXAGE ? OSPF_LSA_MAXAGE : 0;
+    uint16_t ab = ntohs(b->age) == OSPF_LSA_MAXAGE ? OSPF_LSA_MAXAGE : 0;
+    if (aa != ab)
+        return aa > ab;
+    return false;
+}
+
+static ospf_lsa_t *find_lsa(const ospf_lsa_hdr_t *h)
+{
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        if (g_ospf.lsdb[i].valid && lsa_same(&g_ospf.lsdb[i].hdr, h))
+            return &g_ospf.lsdb[i];
+    }
+    return NULL;
+}
+
+static void remove_lsa_at(size_t i)
+{
+    free(g_ospf.lsdb[i].body);
+    g_ospf.lsdb[i] = g_ospf.lsdb[--g_ospf.n_lsas];
+}
+
+static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
+{
+    if (lsalen < sizeof(ospf_lsa_hdr_t))
+        return false;
+    const ospf_lsa_hdr_t *h = (const ospf_lsa_hdr_t *)lsapkt;
+    uint16_t len = ntohs(h->length);
+    if (len < sizeof(*h) || len > lsalen)
+        return false;
+
+    /* Never learn/redistribute non-local routes as transit; accept LSAs into LSDB
+     * for reachability computation/fabric knowledge, but self-originated ones are
+     * maintained by originate path. */
+    ospf_lsa_t *old = find_lsa(h);
+    if (old) {
+        if (!lsa_more_recent(h, &old->hdr) && ntohl(h->seq) == ntohl(old->hdr.seq) &&
+            h->checksum == old->hdr.checksum)
+            return false; /* duplicate */
+        if (old->self && ntohl(h->seq) <= ntohl(old->hdr.seq))
+            return false; /* keep our self LSA unless peer has newer (shouldn't) */
+        free(old->body);
+        old->body = NULL;
+        old->valid = false;
+    } else {
+        if (g_ospf.n_lsas >= OSPF_MAX_LSAS)
+            return false;
+        old = &g_ospf.lsdb[g_ospf.n_lsas++];
+        memset(old, 0, sizeof(*old));
+    }
+
+    size_t body_len = len - sizeof(*h);
+    old->hdr = *h;
+    old->body = body_len ? malloc(body_len) : NULL;
+    if (body_len && old->body)
+        memcpy(old->body, lsapkt + sizeof(*h), body_len);
+    old->body_len = body_len;
+    old->originated = time(NULL);
+    old->self = (ntohl(h->adv_router) == g_ospf.router_id);
+    old->valid = true;
+
+    char rid[INET_ADDRSTRLEN]; u32_to_rid(ntohl(h->adv_router), rid, sizeof(rid));
+    hadc_dbg("ospf: LSDB install type=%u id=%08x adv=%s seq=0x%08x", h->type,
+             ntohl(h->id), rid, ntohl(h->seq));
+    return true;
+}
+
+static void build_lsack(const ospf_lsa_hdr_t *hdrs, size_t count, uint8_t *buf, size_t *outlen)
+{
+    memset(buf, 0, OSPF_MTU);
+    ospf_hdr_t *h = (ospf_hdr_t *)buf;
+    h->version = OSPF_VERSION;
+    h->type = OSPF_LSACK;
+    h->router_id = htonl(g_ospf.router_id);
+    h->area_id = htonl(OSPF_AREA_BACKBONE);
+    h->autype = 0; h->auth = 0;
+    size_t off = sizeof(*h);
+    for (size_t i = 0; i < count && off + sizeof(ospf_lsa_hdr_t) <= OSPF_MTU; i++) {
+        memcpy(buf + off, &hdrs[i], sizeof(ospf_lsa_hdr_t));
+        off += sizeof(ospf_lsa_hdr_t);
+    }
+    h->length = htons((uint16_t)off);
+    h->checksum = 0;
+    h->checksum = ip_checksum(buf, off);
+    *outlen = off;
+}
+
+static void build_lsupdate_self(uint8_t *buf, size_t *outlen)
+{
+    memset(buf, 0, OSPF_MTU);
+    ospf_hdr_t *h = (ospf_hdr_t *)buf;
+    h->version = OSPF_VERSION;
+    h->type = OSPF_LSUPDATE;
+    h->router_id = htonl(g_ospf.router_id);
+    h->area_id = htonl(OSPF_AREA_BACKBONE);
+    h->autype = 0; h->auth = 0;
+    size_t off = sizeof(*h) + 4; /* + #lsas */
+    uint32_t nlsas = 0;
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || !e->self)
+            continue;
+        size_t l = sizeof(ospf_lsa_hdr_t) + e->body_len;
+        if (off + l > OSPF_MTU)
+            break;
+        memcpy(buf + off, &e->hdr, sizeof(e->hdr));
+        if (e->body_len && e->body)
+            memcpy(buf + off + sizeof(e->hdr), e->body, e->body_len);
+        /* ensure checksum/length in packet copy consistent */
+        lsa_checksum(buf + off, l);
+        off += l;
+        nlsas++;
+    }
+    uint32_t nl = htonl(nlsas);
+    memcpy(buf + sizeof(*h), &nl, 4);
+    h->length = htons((uint16_t)off);
+    h->checksum = 0;
+    h->checksum = ip_checksum(buf, off);
+    *outlen = off;
+}
+
+static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
+{
+    uint8_t pkt[OSPF_MTU];
+    size_t len = 0;
+    build_lsupdate_self(pkt, &len);
+    if (len <= sizeof(ospf_hdr_t) + 4)
+        return; /* no self lsas */
+    send_to(n->ip, n->ifindex, pkt, len);
+    hadc_dbg("ospf: sent LS Update (self LSAs) to %s", inet_ntoa(n->ip));
+}
+
+
+
 static void build_hello(uint8_t *buf, size_t *outlen, ospf_if_t *iface)
 {
     memset(buf, 0, OSPF_MTU);
@@ -421,6 +608,7 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
     n->priority = hello->priority;
     n->dr = ntohl(hello->dr);
     n->bdr = ntohl(hello->bdr);
+    n->ifindex = iface ? iface->ifindex : n->ifindex;
     n->last_hello = time(NULL);
     uint32_t dead = ntohl(hello->dead_interval);
     if (dead == 0) dead = OSPF_DEAD_INTERVAL;
@@ -434,6 +622,13 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
     } else {
         n->state = NSTATE_INIT;
     }
+
+    if (n->state >= NSTATE_2WAY && !n->lsa_sync_sent) {
+        flood_self_lsas_to_neighbor(n);
+        n->lsa_sync_sent = true;
+    }
+    if (n->state < NSTATE_2WAY)
+        n->lsa_sync_sent = false;
 
     if (n->state != old) {
         char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(rid, ridbuf, sizeof(ridbuf));
@@ -457,6 +652,66 @@ static ospf_if_t *iface_for_src(struct in_addr src)
     return g_ospf.n_ifaces ? &g_ospf.ifaces[0] : NULL;
 }
 
+static void handle_lsupdate(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
+{
+    if (len < sizeof(ospf_hdr_t) + 4)
+        return;
+    const ospf_hdr_t *h = (const ospf_hdr_t *)pkt;
+    (void)h;
+    uint32_t nlsas = 0;
+    memcpy(&nlsas, pkt + sizeof(ospf_hdr_t), 4);
+    nlsas = ntohl(nlsas);
+    size_t off = sizeof(ospf_hdr_t) + 4;
+    ospf_lsa_hdr_t acks[32];
+    size_t nack = 0;
+    bool changed = false;
+    for (uint32_t i = 0; i < nlsas && off + sizeof(ospf_lsa_hdr_t) <= len; i++) {
+        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+        uint16_t llen = ntohs(lh->length);
+        if (llen < sizeof(*lh) || off + llen > len)
+            break;
+        if (ntohl(lh->adv_router) != g_ospf.router_id) {
+            if (install_lsa(pkt + off, llen))
+                changed = true;
+        }
+        if (nack < 32)
+            acks[nack++] = *lh;
+        off += llen;
+    }
+    if (nack) {
+        uint8_t ackpkt[OSPF_MTU];
+        size_t alen = 0;
+        build_lsack(acks, nack, ackpkt, &alen);
+        /* direct ack to sender if possible, else multicast */
+        if (iface && iface->ifindex)
+            send_to(src, iface->ifindex, ackpkt, alen);
+        else
+            send_allspfrouters(ackpkt, alen);
+    }
+    if (changed)
+        hadc_dbg("ospf: LSDB updated from %s (%u lsas)", inet_ntoa(src), nlsas);
+}
+
+static void handle_lsack(const uint8_t *pkt, size_t len)
+{
+    (void)pkt; (void)len;
+    /* acknowledgements accepted; no retransmission queue in minimal implementation */
+}
+
+static void handle_dbd_lsreq(const uint8_t *pkt, size_t len, struct in_addr src)
+{
+    (void)pkt; (void)len;
+    /* Minimal: on adjacency attempt, proactively flood our self LSAs; full DBD/LSR
+     * exchange can be added for stricter interop. */
+    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+        if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].ip.s_addr == src.s_addr &&
+            g_ospf.nbrs[i].state >= NSTATE_2WAY) {
+            flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
+            break;
+        }
+    }
+}
+
 static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
 {
     (void)ctx;
@@ -472,21 +727,28 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
         }
         if (n < (ssize_t)sizeof(ospf_hdr_t))
             continue;
-        /* Kernel delivers payload (OSPF packet) for raw IPPROTO_OSPF on Linux? Usually yes. */
         const ospf_hdr_t *h = (const ospf_hdr_t *)buf;
         if (h->version != OSPF_VERSION)
             continue;
+        uint16_t plen = ntohs(h->length);
+        if (plen > (size_t)n)
+            plen = (uint16_t)n;
         ospf_if_t *iface = iface_for_src(src.sin_addr);
         switch (h->type) {
         case OSPF_HELLO:
-            handle_hello(buf, (size_t)n, src.sin_addr, iface);
+            handle_hello(buf, (size_t)plen, src.sin_addr, iface);
             break;
         case OSPF_LSUPDATE:
+            handle_lsupdate(buf, (size_t)plen, src.sin_addr, iface);
+            break;
         case OSPF_LSACK:
+            handle_lsack(buf, (size_t)plen);
+            break;
         case OSPF_DBDESC:
         case OSPF_LSREQ:
-            hadc_dbg("ospf: rx type %u from %s on %s (len %zd)", h->type,
-                     inet_ntoa(src.sin_addr), iface ? iface->name : "?", n);
+            handle_dbd_lsreq(buf, (size_t)plen, src.sin_addr);
+            hadc_dbg("ospf: rx type %u from %s on %s (len %u)", h->type,
+                     inet_ntoa(src.sin_addr), iface ? iface->name : "?", plen);
             break;
         default:
             break;
@@ -634,6 +896,11 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(g_ospf.router_id, ridbuf, sizeof(ridbuf));
     hadc_dbg("ospf: originated Router-LSA (rid %s, seq 0x%08x, %zu stub links)",
              ridbuf, ntohl(lh->seq), nlinks);
+
+    for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+        if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
+            flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
+    }
 }
 
 void hadc_ospf_tick(hadc_ctx_t *ctx)
@@ -651,12 +918,27 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
         g_ospf.last_hello_sent = now;
     }
 
-    /* Refresh self-originated LSAs periodically */
-    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
-        if (g_ospf.lsdb[i].self && g_ospf.lsdb[i].valid &&
-            now - g_ospf.lsdb[i].originated >= OSPF_LSA_REFRESH) {
-            /* routing/originate path will rebuild on reconcile; mark age via refresh time */
-            g_ospf.lsdb[i].originated = now;
+    /* Age out LSAs and refresh self-originated ones */
+    for (size_t i = 0; i < g_ospf.n_lsas; ) {
+        if (!g_ospf.lsdb[i].valid) { remove_lsa_at(i); continue; }
+        uint16_t age = ntohs(g_ospf.lsdb[i].hdr.age);
+        unsigned adv = (unsigned)(now - g_ospf.lsdb[i].originated);
+        if (age + adv >= OSPF_LSA_MAXAGE && !g_ospf.lsdb[i].self) {
+            remove_lsa_at(i);
+            continue;
         }
+        if (g_ospf.lsdb[i].self && adv >= OSPF_LSA_REFRESH)
+            g_ospf.lsdb[i].originated = now; /* rebuilt by originate on reconcile */
+        i++;
+    }
+
+    /* Periodically reflood self LSAs to 2-Way neighbors for simple interop */
+    static time_t last_flood;
+    if (now - last_flood >= 30) {
+        for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
+            if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
+                flood_self_lsas_to_neighbor(&g_ospf.nbrs[i]);
+        }
+        last_flood = now;
     }
 }
