@@ -432,24 +432,46 @@ static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
     if (len < sizeof(*h) || len > lsalen)
         return false;
 
-    /* Never learn/redistribute non-local routes as transit; accept LSAs into LSDB
-     * for reachability computation/fabric knowledge, but self-originated ones are
-     * maintained by originate path. */
+    bool is_self = (ntohl(h->adv_router) == g_ospf.router_id);
+    bool maxage = (ntohs(h->age) == OSPF_LSA_MAXAGE);
     ospf_lsa_t *old = find_lsa(h);
+
+    /* If we receive a newer instance of our own LSA, advance seq on next originate */
+    if (is_self) {
+        if (!old)
+            return false;
+        if (lsa_more_recent(h, &old->hdr)) {
+            uint32_t seq = ntohl(h->seq);
+            if (seq >= g_ospf.lsa_seq)
+                g_ospf.lsa_seq = seq + 1;
+            /* force reoriginate soon */
+            g_ospf.last_orig_hash = 0;
+        }
+        return false;
+    }
+
     if (old) {
         if (!lsa_more_recent(h, &old->hdr) && ntohl(h->seq) == ntohl(old->hdr.seq) &&
-            h->checksum == old->hdr.checksum)
+            h->checksum == old->hdr.checksum && ntohs(h->age) == ntohs(old->hdr.age))
             return false; /* duplicate */
-        if (old->self && ntohl(h->seq) <= ntohl(old->hdr.seq))
-            return false; /* keep our self LSA unless peer has newer (shouldn't) */
         free(old->body);
         old->body = NULL;
         old->valid = false;
     } else {
+        if (maxage)
+            return false; /* do not install unknown MaxAge */
         if (g_ospf.n_lsas >= OSPF_MAX_LSAS)
             return false;
         old = &g_ospf.lsdb[g_ospf.n_lsas++];
         memset(old, 0, sizeof(*old));
+    }
+
+    if (maxage) {
+        /* remove learned MaxAge LSA */
+        for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+            if (&g_ospf.lsdb[i] == old) { remove_lsa_at(i); break; }
+        }
+        return true;
     }
 
     size_t body_len = len - sizeof(*h);
@@ -459,7 +481,7 @@ static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
         memcpy(old->body, lsapkt + sizeof(*h), body_len);
     old->body_len = body_len;
     old->originated = time(NULL);
-    old->self = (ntohl(h->adv_router) == g_ospf.router_id);
+    old->self = false;
     old->valid = true;
 
     char rid[INET_ADDRSTRLEN]; u32_to_rid(ntohl(h->adv_router), rid, sizeof(rid));
