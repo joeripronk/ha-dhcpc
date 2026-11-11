@@ -3,8 +3,6 @@
  * select fabric-learned backup defaults from attributed candidates, apply through
  * a backend interface (stub/no-op here), and expose status. Backup routes and
  * fabric-learned defaults are never published. */
-#define _GNU_SOURCE
-
 #include <arpa/inet.h>
 #include <string.h>
 
@@ -13,6 +11,7 @@
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
+#include "ospf.h"
 
 #define HADC_ROUTING_MAX_PREFIXES 64
 
@@ -270,6 +269,7 @@ int hadc_routing_init(hadc_ctx_t *ctx)
     snprintf(g_rs.backend, sizeof(g_rs.backend), "%s",
              ctx->conf.routing.backend[0] ? ctx->conf.routing.backend : "local");
     snprintf(g_rs.router_id, sizeof(g_rs.router_id), "%s", ctx->conf.ospf.router_id);
+    hadc_ospf_init(ctx);
     hadc_routing_reconcile(ctx, "init");
     return 0;
 }
@@ -277,6 +277,7 @@ int hadc_routing_init(hadc_ctx_t *ctx)
 void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
     hadc_routing_reconcile(ctx, "shutdown");
+    hadc_ospf_shutdown(ctx);
     g_rs.n_want_prefixes = 0;
     g_rs.advertised_public_ip32 = false;
     g_rs.advertised_default_route = false;
@@ -371,6 +372,8 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     select_backup_gateway(ctx);
 
     backend_apply(ctx, want_pub, want_def, prev_bgw, g_rs.reason);
+    hadc_ospf_originate(ctx, &g_rs.public_ip32, want_pub, want_def, NULL, 0);
+    hadc_ospf_tick(ctx);
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         char oldgw[INET_ADDRSTRLEN] = "0.0.0.0", cur[INET_ADDRSTRLEN] = "0.0.0.0";
         if (prev_bgw.s_addr)
