@@ -1214,8 +1214,7 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         n->dd_master = false;
         n->dd_seq = seq;
         send_lsreq_missing(n, pkt, len);
-        uint8_t sflags = (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0;
-        nbr_send_dbdesc(n, sflags, seq, true);
+        nbr_send_dbdesc(n, 0, seq, true);
         if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
             n->state = NSTATE_FULL;
             n->lsa_sync_sent = true;
@@ -1237,8 +1236,7 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
             n->state = NSTATE_EXCHANGE;
             n->dd_last_recv_seq = seq;
             send_lsreq_missing(n, pkt, len);
-            nbr_send_dbdesc(n, OSPF_DD_FLAG_MS | ((flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0),
-                            n->dd_seq, true);
+            nbr_send_dbdesc(n, OSPF_DD_FLAG_MS, n->dd_seq, true);
             if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
                 n->state = NSTATE_FULL;
                 n->lsa_sync_sent = true;
@@ -1286,20 +1284,18 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
                 }
             } else {
                 n->dd_seq++;
-                nbr_send_dbdesc(n, OSPF_DD_FLAG_MS | OSPF_DD_FLAG_M, n->dd_seq, true);
+                nbr_send_dbdesc(n, OSPF_DD_FLAG_MS, n->dd_seq, true);
                 n->state = nbr_has_lsreq(n) ? NSTATE_LOADING : NSTATE_EXCHANGE;
             }
         } else {
-            /* slave: reply echoing peer seq */
+            /* slave: reply echoing peer seq; we send our full summary in one DBD (M=0) */
+            nbr_send_dbdesc(n, 0, seq, true);
             if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
-                nbr_send_dbdesc(n, 0, seq, true);
                 n->state = NSTATE_FULL;
                 n->lsa_sync_sent = true;
             } else if (!(flags & OSPF_DD_FLAG_M)) {
-                nbr_send_dbdesc(n, 0, seq, true);
                 n->state = NSTATE_LOADING;
             } else {
-                nbr_send_dbdesc(n, OSPF_DD_FLAG_M, seq, true);
                 n->state = nbr_has_lsreq(n) ? NSTATE_LOADING : NSTATE_EXCHANGE;
             }
         }
