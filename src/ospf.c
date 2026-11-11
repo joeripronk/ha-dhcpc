@@ -1125,9 +1125,21 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
         if (fwd != 0) {
             gw.s_addr = fwd;
         } else {
-            /* forwarding addr 0.0.0.0 => ASBR; nexthop unknown without SPF.
-             * Do not fabricate a gateway. */
-            continue;
+            /* forwarding addr 0.0.0.0 => traffic to ASBR; use known neighbor IP
+             * of the advertising router as nexthop when directly adjacent. */
+            bool found = false;
+            for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
+                ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
+                if (!nb->in_use || nb->state < NSTATE_2WAY)
+                    continue;
+                if (nb->router_id == ntohl(e->hdr.adv_router)) {
+                    gw = nb->ip;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                continue; /* nexthop unknown without SPF/topology resolution */
         }
 
         hadc_routing_default_candidate_t *c = &out[n++];
@@ -1137,7 +1149,6 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
         c->valid = true;
         char rid[INET_ADDRSTRLEN];
         u32_to_rid(ntohl(e->hdr.adv_router), rid, sizeof(rid));
-        /* attribute origin; if matches a known cluster member, record id */
         snprintf(c->origin, sizeof(c->origin), "%s", rid);
         if (ctx) {
             for (size_t m = 0; m < ctx->conf.n_members; m++) {
@@ -1148,6 +1159,8 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
                     break;
                 }
             }
+            /* remote cluster masters may be external OSPF peers; keep scope remote
+             * here (local-master attribution is cluster/heartbeat-derived). */
         }
     }
     return n;
