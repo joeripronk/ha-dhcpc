@@ -49,6 +49,9 @@
 #define OSPF_MAX_NEIGHBORS 64
 #define OSPF_MAX_LSAS 128
 #define OSPF_MTU 1500
+#define OSPF_MAX_LSRX 64
+#define OSPF_MAX_LSREQ 64
+#define OSPF_RXMT_INTERVAL 5
 
 typedef enum {
     NSTATE_DOWN = 0,
@@ -59,28 +62,6 @@ typedef enum {
     NSTATE_LOADING,
     NSTATE_FULL,
 } nbr_state_t;
-
-typedef struct {
-    uint32_t router_id; /* host order */
-    struct in_addr ip;
-    struct in_addr netmask;
-    uint32_t area;
-    uint8_t priority;
-    uint32_t dr;
-    uint32_t bdr;
-    nbr_state_t state;
-    time_t last_hello;
-    time_t dead_at;
-    bool in_use;
-    bool lsa_sync_sent;
-    unsigned ifindex;
-    /* minimal DBD/LSR state for interop */
-    uint32_t dd_seq;
-    bool dd_master;
-    bool dd_last_sent_init;
-    time_t last_dbdesc_sent;
-    time_t last_lsreq_sent;
-} ospf_neighbor_t;
 
 typedef struct {
     char name[HADC_IFNAME_MAX];
@@ -101,6 +82,53 @@ typedef struct {
     uint16_t checksum;
     uint16_t length;
 } __attribute__((packed)) ospf_lsa_hdr_t;
+
+typedef struct {
+    ospf_lsa_hdr_t hdr;
+    time_t last_sent;
+    bool in_use;
+} ospf_lsrx_t;
+
+typedef struct {
+    uint8_t type;
+    uint32_t id;
+    uint32_t adv_router;
+    time_t last_sent;
+    bool in_use;
+} ospf_lsreq_t;
+
+
+typedef struct {
+    uint32_t router_id; /* host order */
+    struct in_addr ip;
+    struct in_addr netmask;
+    uint32_t area;
+    uint8_t priority;
+    uint32_t dr;
+    uint32_t bdr;
+    nbr_state_t state;
+    time_t last_hello;
+    time_t dead_at;
+    bool in_use;
+    bool lsa_sync_sent;
+    unsigned ifindex;
+    /* DBD/LSR/LSA exchange state */
+    uint32_t dd_seq;
+    uint32_t dd_last_recv_seq;
+    bool dd_master;
+    bool dd_last_sent_init;
+    time_t last_dbdesc_sent;
+    time_t last_lsreq_sent;
+    uint8_t last_dbd[OSPF_MTU];
+    size_t last_dbd_len;
+    uint8_t last_dbd_flags;
+    bool last_dbd_has_headers;
+    ospf_lsrx_t ls_rxmt[OSPF_MAX_LSRX];
+    size_t n_ls_rxmt;
+    ospf_lsreq_t ls_req[OSPF_MAX_LSREQ];
+    size_t n_ls_req;
+} ospf_neighbor_t;
+
 
 typedef struct {
     ospf_lsa_hdr_t hdr;
@@ -506,6 +534,108 @@ static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
     return true;
 }
 
+
+static bool lsrx_same(const ospf_lsa_hdr_t *a, const ospf_lsa_hdr_t *b)
+{
+    return lsa_same(a, b);
+}
+
+static void nbr_clear_lsreq(ospf_neighbor_t *n)
+{
+    n->n_ls_req = 0;
+    memset(n->ls_req, 0, sizeof(n->ls_req));
+}
+
+static void nbr_clear_lsrx(ospf_neighbor_t *n)
+{
+    n->n_ls_rxmt = 0;
+    memset(n->ls_rxmt, 0, sizeof(n->ls_rxmt));
+}
+
+static void nbr_reset_exchange(ospf_neighbor_t *n)
+{
+    nbr_clear_lsreq(n);
+    nbr_clear_lsrx(n);
+    n->last_dbd_len = 0;
+    n->last_dbd_has_headers = false;
+    n->dd_last_recv_seq = 0;
+}
+
+static void nbr_lsrx_add(ospf_neighbor_t *n, const ospf_lsa_hdr_t *h)
+{
+    for (size_t i = 0; i < OSPF_MAX_LSRX; i++) {
+        if (n->ls_rxmt[i].in_use && lsrx_same(&n->ls_rxmt[i].hdr, h)) {
+            n->ls_rxmt[i].hdr = *h;
+            n->ls_rxmt[i].last_sent = time(NULL);
+            return;
+        }
+    }
+    for (size_t i = 0; i < OSPF_MAX_LSRX; i++) {
+        if (!n->ls_rxmt[i].in_use) {
+            n->ls_rxmt[i].in_use = true;
+            n->ls_rxmt[i].hdr = *h;
+            n->ls_rxmt[i].last_sent = time(NULL);
+            n->n_ls_rxmt++;
+            return;
+        }
+    }
+}
+
+static void nbr_lsrx_ack(ospf_neighbor_t *n, const ospf_lsa_hdr_t *ack)
+{
+    for (size_t i = 0; i < OSPF_MAX_LSRX; i++) {
+        if (!n->ls_rxmt[i].in_use) continue;
+        if (!lsrx_same(&n->ls_rxmt[i].hdr, ack)) continue;
+        /* ack is sufficient if not older than what we have on rxmt list */
+        if (!lsa_more_recent(&n->ls_rxmt[i].hdr, ack)) {
+            n->ls_rxmt[i].in_use = false;
+            if (n->n_ls_rxmt) n->n_ls_rxmt--;
+        }
+        return;
+    }
+}
+
+static void nbr_lsreq_add(ospf_neighbor_t *n, const ospf_lsa_hdr_t *h)
+{
+    for (size_t i = 0; i < OSPF_MAX_LSREQ; i++) {
+        if (n->ls_req[i].in_use && n->ls_req[i].type == h->type &&
+            n->ls_req[i].id == h->id && n->ls_req[i].adv_router == h->adv_router)
+            return;
+    }
+    for (size_t i = 0; i < OSPF_MAX_LSREQ; i++) {
+        if (!n->ls_req[i].in_use) {
+            n->ls_req[i].in_use = true;
+            n->ls_req[i].type = h->type;
+            n->ls_req[i].id = h->id;
+            n->ls_req[i].adv_router = h->adv_router;
+            n->ls_req[i].last_sent = 0;
+            n->n_ls_req++;
+            return;
+        }
+    }
+}
+
+static void nbr_lsreq_remove(ospf_neighbor_t *n, const ospf_lsa_hdr_t *h)
+{
+    for (size_t i = 0; i < OSPF_MAX_LSREQ; i++) {
+        if (!n->ls_req[i].in_use) continue;
+        if (n->ls_req[i].type == h->type && n->ls_req[i].id == h->id &&
+            n->ls_req[i].adv_router == h->adv_router) {
+            n->ls_req[i].in_use = false;
+            if (n->n_ls_req) n->n_ls_req--;
+            return;
+        }
+    }
+}
+
+static bool nbr_has_lsreq(ospf_neighbor_t *n)
+{
+    for (size_t i = 0; i < OSPF_MAX_LSREQ; i++)
+        if (n->ls_req[i].in_use) return true;
+    return false;
+}
+
+
 static void build_lsack(const ospf_lsa_hdr_t *hdrs, size_t count, uint8_t *buf, size_t *outlen)
 {
     memset(buf, 0, OSPF_MTU);
@@ -580,9 +710,21 @@ static void flood_lsas_to_neighbor(ospf_neighbor_t *n, bool self_only)
     build_lsupdate(pkt, &len, self_only);
     if (len <= sizeof(ospf_hdr_t) + 4)
         return; /* no lsas */
+    /* add sent LSAs to retransmission list */
+    uint32_t nlsas = 0;
+    memcpy(&nlsas, pkt + sizeof(ospf_hdr_t), 4);
+    nlsas = ntohl(nlsas);
+    size_t off = sizeof(ospf_hdr_t) + 4;
+    for (uint32_t i = 0; i < nlsas && off + sizeof(ospf_lsa_hdr_t) <= len; i++) {
+        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+        uint16_t llen = ntohs(lh->length);
+        if (llen < sizeof(*lh) || off + llen > len) break;
+        nbr_lsrx_add(n, lh);
+        off += llen;
+    }
     send_to(n->ip, n->ifindex, pkt, len);
     hadc_dbg("ospf: sent LS Update (%s, %u lsas) to %s", self_only ? "self" : "lsdb",
-             (unsigned)ntohl(*(uint32_t *)(pkt + sizeof(ospf_hdr_t))), inet_ntoa(n->ip));
+             nlsas, inet_ntoa(n->ip));
 }
 
 static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
@@ -625,6 +767,7 @@ static void build_hello(uint8_t *buf, size_t *outlen, ospf_if_t *iface)
         off += 4;
     }
     h->length = htons((uint16_t)off);
+    apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
     h->checksum = ip_checksum(buf, off);
     *outlen = off;
@@ -718,12 +861,23 @@ static void build_dbdesc(uint8_t *buf, size_t *outlen, uint8_t flags, uint32_t s
     *outlen = off;
 }
 
-static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t len)
+
+static void nbr_send_dbdesc(ospf_neighbor_t *n, uint8_t flags, uint32_t seq, bool include_headers)
 {
-    /* pkt is DBD; request any listed LSA headers we don't have or that are newer */
-    if (len < sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t))
+    uint8_t out[OSPF_MTU]; size_t olen = 0;
+    build_dbdesc(out, &olen, flags, seq, include_headers);
+    send_to(n->ip, n->ifindex, out, olen);
+    n->last_dbdesc_sent = time(NULL);
+    n->last_dbd_flags = flags;
+    n->last_dbd_has_headers = include_headers;
+    n->last_dbd_len = olen;
+    memcpy(n->last_dbd, out, olen);
+}
+
+static void nbr_send_lsreq(ospf_neighbor_t *n)
+{
+    if (!nbr_has_lsreq(n))
         return;
-    size_t off = sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t);
     uint8_t out[OSPF_MTU];
     memset(out, 0, sizeof(out));
     ospf_hdr_t *oh = (ospf_hdr_t *)out;
@@ -731,17 +885,13 @@ static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t le
     oh->router_id = htonl(g_ospf.router_id); oh->area_id = htonl(OSPF_AREA_BACKBONE);
     size_t ooff = sizeof(*oh);
     size_t nreq = 0;
-    while (off + sizeof(ospf_lsa_hdr_t) <= len && ooff + 12 <= OSPF_MTU) {
-        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
-        off += sizeof(ospf_lsa_hdr_t);
-        if (ntohl(lh->adv_router) == g_ospf.router_id)
-            continue;
-        ospf_lsa_t *have = find_lsa(lh);
-        if (have && have->valid && !lsa_more_recent(lh, &have->hdr))
-            continue;
-        uint32_t t = htonl(lh->type), id = lh->id, adv = lh->adv_router;
+    time_t now = time(NULL);
+    for (size_t i = 0; i < OSPF_MAX_LSREQ && ooff + 12 <= OSPF_MTU; i++) {
+        if (!n->ls_req[i].in_use) continue;
+        uint32_t t = htonl(n->ls_req[i].type), id = n->ls_req[i].id, adv = n->ls_req[i].adv_router;
         memcpy(out + ooff, &t, 4); memcpy(out + ooff + 4, &id, 4); memcpy(out + ooff + 8, &adv, 4);
         ooff += 12; nreq++;
+        n->ls_req[i].last_sent = now;
     }
     if (!nreq)
         return;
@@ -749,10 +899,34 @@ static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t le
     apply_auth(oh, g_ospf.ctx, out, ooff);
     oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
     send_to(n->ip, n->ifindex, out, ooff);
-    n->last_lsreq_sent = time(NULL);
-    if (n->state == NSTATE_EXCHANGE)
-        n->state = NSTATE_LOADING;
+    n->last_lsreq_sent = now;
     hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, inet_ntoa(n->ip));
+}
+
+
+static void send_lsreq_missing(ospf_neighbor_t *n, const uint8_t *pkt, size_t len)
+{
+    /* pkt is DBD; request any listed LSA headers we don't have or that are newer */
+    if (len < sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t))
+        return;
+    size_t off = sizeof(ospf_hdr_t) + sizeof(ospf_dbdesc_t);
+    bool added = false;
+    while (off + sizeof(ospf_lsa_hdr_t) <= len) {
+        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+        off += sizeof(ospf_lsa_hdr_t);
+        if (ntohl(lh->adv_router) == g_ospf.router_id)
+            continue;
+        ospf_lsa_t *have = find_lsa(lh);
+        if (have && have->valid && !lsa_more_recent(lh, &have->hdr))
+            continue;
+        nbr_lsreq_add(n, lh);
+        added = true;
+    }
+    if (added) {
+        if (n->state == NSTATE_EXCHANGE)
+            n->state = NSTATE_LOADING;
+        nbr_send_lsreq(n);
+    }
 }
 
 static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
@@ -805,17 +979,25 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
 
     if (see_self) {
         if (n->state < NSTATE_2WAY) {
+            nbr_reset_exchange(n);
             n->state = NSTATE_EXSTART;
             n->dd_seq = (uint32_t)time(NULL);
             n->dd_master = (g_ospf.router_id > n->router_id);
             uint8_t out[OSPF_MTU]; size_t olen = 0;
-            build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
+            uint8_t flags = OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS;
+            build_dbdesc(out, &olen, flags, n->dd_seq, false);
             send_to(n->ip, n->ifindex, out, olen);
             n->last_dbdesc_sent = time(NULL);
+            n->last_dbd_flags = flags;
+            n->last_dbd_has_headers = false;
+            n->last_dbd_len = olen;
+            memcpy(n->last_dbd, out, olen);
         }
     } else {
+        nbr_reset_exchange(n);
         n->state = NSTATE_INIT;
         n->dd_seq = 0;
+        n->lsa_sync_sent = false;
     }
 
     if (n->state >= NSTATE_2WAY && !n->lsa_sync_sent && n->state != NSTATE_EXSTART) {
@@ -890,24 +1072,65 @@ static void handle_lsupdate(const uint8_t *pkt, size_t len, struct in_addr src, 
         else
             send_allspfrouters(ackpkt, alen);
     }
+    /* remove satisfied requests from sender and advance Loading->Full */
+    ospf_neighbor_t *sender = NULL;
+    for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
+        if (g_ospf.nbrs[ni].in_use && g_ospf.nbrs[ni].ip.s_addr == src.s_addr) { sender = &g_ospf.nbrs[ni]; break; }
+    }
+    if (sender) {
+        size_t off2 = sizeof(ospf_hdr_t) + 4;
+        for (uint32_t i = 0; i < nlsas && off2 + sizeof(ospf_lsa_hdr_t) <= len; i++) {
+            const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off2);
+            uint16_t llen = ntohs(lh->length);
+            if (llen < sizeof(*lh) || off2 + llen > len) break;
+            nbr_lsreq_remove(sender, lh);
+            off2 += llen;
+        }
+        if (sender->state == NSTATE_LOADING && !nbr_has_lsreq(sender)) {
+            sender->state = NSTATE_FULL;
+            sender->lsa_sync_sent = true;
+        }
+    }
+
     if (changed) {
-        /* Basic flooding: forward received update to other 2-Way neighbors */
+        /* Flood received/newer LSAs to other neighbors and track retransmissions */
         for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
             ospf_neighbor_t *nb = &g_ospf.nbrs[ni];
             if (!nb->in_use || nb->state < NSTATE_2WAY)
                 continue;
             if (nb->ip.s_addr == src.s_addr)
                 continue;
+            /* forward full update (simple) and add LSAs to rxmt */
+            size_t off3 = sizeof(ospf_hdr_t) + 4;
+            for (uint32_t i = 0; i < nlsas && off3 + sizeof(ospf_lsa_hdr_t) <= len; i++) {
+                const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off3);
+                uint16_t llen = ntohs(lh->length);
+                if (llen < sizeof(*lh) || off3 + llen > len) break;
+                nbr_lsrx_add(nb, lh);
+                off3 += llen;
+            }
             send_to(nb->ip, nb->ifindex, pkt, len);
         }
         hadc_dbg("ospf: LSDB updated/flooded from %s (%u lsas)", inet_ntoa(src), nlsas);
     }
 }
 
-static void handle_lsack(const uint8_t *pkt, size_t len)
+static void handle_lsack(const uint8_t *pkt, size_t len, struct in_addr src)
 {
-    (void)pkt; (void)len;
-    /* acknowledgements accepted; no retransmission queue in minimal implementation */
+    if (len < sizeof(ospf_hdr_t) + sizeof(ospf_lsa_hdr_t))
+        return;
+    ospf_neighbor_t *sender = NULL;
+    for (size_t ni = 0; ni < OSPF_MAX_NEIGHBORS; ni++) {
+        if (g_ospf.nbrs[ni].in_use && g_ospf.nbrs[ni].ip.s_addr == src.s_addr) { sender = &g_ospf.nbrs[ni]; break; }
+    }
+    if (!sender)
+        return;
+    size_t off = sizeof(ospf_hdr_t);
+    while (off + sizeof(ospf_lsa_hdr_t) <= len) {
+        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+        nbr_lsrx_ack(sender, lh);
+        off += sizeof(ospf_lsa_hdr_t);
+    }
 }
 
 static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, ospf_if_t *iface)
@@ -982,25 +1205,20 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         return;
     }
 
-    /* Simplified exchange for interop: if peer is master (I,M,MS) we act as slave */
+    /* Initial DBD from peer claiming master -> we become slave for exchange */
     if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS)) {
+        nbr_reset_exchange(n);
         n->state = NSTATE_EXCHANGE;
         n->dd_master = false;
         n->dd_seq = seq;
         send_lsreq_missing(n, pkt, len);
-        uint8_t out[OSPF_MTU]; size_t olen = 0;
-        build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, seq, true);
-        send_to(n->ip, n->ifindex, out, olen);
-        n->last_dbdesc_sent = time(NULL);
-        if (!(flags & OSPF_DD_FLAG_M)) {
-            /* if we requested LSAs we stay/loading until updates arrive; simple:
-             * promote to Full when no outstanding request recently */
-            if (time(NULL) - n->last_lsreq_sent > 2 || n->last_lsreq_sent == 0) {
-                n->state = NSTATE_FULL;
-                n->lsa_sync_sent = true;
-            } else {
-                n->state = NSTATE_LOADING;
-            }
+        uint8_t sflags = (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0;
+        nbr_send_dbdesc(n, sflags, seq, true);
+        if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
+            n->state = NSTATE_FULL;
+            n->lsa_sync_sent = true;
+        } else if (!(flags & OSPF_DD_FLAG_M)) {
+            n->state = NSTATE_LOADING;
         } else {
             n->state = NSTATE_EXCHANGE;
         }
@@ -1008,33 +1226,82 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         return;
     }
 
-    /* If we initiated as master/slave or mid-exchange, advance */
+    /* ExStart negotiation: determine master/slave when both sent initial */
     if (n->state == NSTATE_EXSTART) {
-        n->dd_master = (g_ospf.router_id > n->router_id);
-        if (!n->dd_master) {
+        if (!(flags & OSPF_DD_FLAG_I) && !(flags & OSPF_DD_FLAG_MS) && seq == n->dd_seq &&
+            g_ospf.router_id > n->router_id) {
+            /* peer accepted us as master */
+            n->dd_master = true;
+            n->state = NSTATE_EXCHANGE;
+        } else if (!(flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_MS) &&
+                   g_ospf.router_id < n->router_id) {
+            /* peer is master */
+            n->dd_master = false;
             n->dd_seq = seq;
             n->state = NSTATE_EXCHANGE;
-        }
-    }
-    if (n->state == NSTATE_EXCHANGE || n->state == NSTATE_LOADING) {
-        send_lsreq_missing(n, pkt, len);
-        if (!(flags & OSPF_DD_FLAG_M)) {
-            n->state = NSTATE_FULL;
-            n->lsa_sync_sent = true;
         } else {
-            n->state = NSTATE_EXCHANGE;
-            uint32_t nseq = n->dd_master ? (n->dd_seq + 1) : seq;
-            n->dd_seq = nseq;
-            uint8_t out[OSPF_MTU]; size_t olen = 0;
-            build_dbdesc(out, &olen, (flags & OSPF_DD_FLAG_M) ? OSPF_DD_FLAG_M : 0, nseq, true);
-            send_to(n->ip, n->ifindex, out, olen);
-            n->last_dbdesc_sent = time(NULL);
+            /* negotiation mismatch/duplicate; retransmit handled by timer */
+            return;
         }
-    } else if (n->state == NSTATE_FULL) {
-        flood_lsas_to_neighbor(n, false);
-    } else {
-        flood_self_lsas_to_neighbor(n);
     }
+
+    if (n->state == NSTATE_EXCHANGE || n->state == NSTATE_LOADING) {
+        /* duplicate: retransmit last DBD */
+        if (seq == n->dd_last_recv_seq) {
+            if (n->last_dbd_len)
+                send_to(n->ip, n->ifindex, n->last_dbd, n->last_dbd_len);
+            return;
+        }
+
+        send_lsreq_missing(n, pkt, len);
+        n->dd_last_recv_seq = seq;
+
+        if (n->dd_master) {
+            /* master expects slave ack with our seq */
+            if (seq != n->dd_seq) {
+                /* sequence mismatch; ignore for simplicity */
+                return;
+            }
+            if (!(flags & OSPF_DD_FLAG_M)) {
+                if (!nbr_has_lsreq(n)) {
+                    n->state = NSTATE_FULL;
+                    n->lsa_sync_sent = true;
+                } else {
+                    n->state = NSTATE_LOADING;
+                }
+            } else {
+                n->dd_seq++;
+                nbr_send_dbdesc(n, OSPF_DD_FLAG_MS | OSPF_DD_FLAG_M, n->dd_seq, true);
+                n->state = nbr_has_lsreq(n) ? NSTATE_LOADING : NSTATE_EXCHANGE;
+            }
+        } else {
+            /* slave: reply echoing peer seq */
+            if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
+                nbr_send_dbdesc(n, 0, seq, true);
+                n->state = NSTATE_FULL;
+                n->lsa_sync_sent = true;
+            } else if (!(flags & OSPF_DD_FLAG_M)) {
+                nbr_send_dbdesc(n, 0, seq, true);
+                n->state = NSTATE_LOADING;
+            } else {
+                nbr_send_dbdesc(n, OSPF_DD_FLAG_M, seq, true);
+                n->state = nbr_has_lsreq(n) ? NSTATE_LOADING : NSTATE_EXCHANGE;
+            }
+        }
+        flood_lsas_to_neighbor(n, false);
+        return;
+    }
+
+    if (n->state == NSTATE_FULL) {
+        /* in full state, duplicates are possible; if master DBD maybe retransmit ack */
+        if (seq == n->dd_last_recv_seq && n->last_dbd_len)
+            send_to(n->ip, n->ifindex, n->last_dbd, n->last_dbd_len);
+        n->dd_last_recv_seq = seq;
+        flood_lsas_to_neighbor(n, false);
+        return;
+    }
+
+    flood_self_lsas_to_neighbor(n);
 }
 
 static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
@@ -1073,7 +1340,7 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
             handle_lsupdate(buf, (size_t)plen, src.sin_addr, iface);
             break;
         case OSPF_LSACK:
-            handle_lsack(buf, (size_t)plen);
+            handle_lsack(buf, (size_t)plen, src.sin_addr);
             break;
         case OSPF_LSREQ:
             handle_lsreq(buf, (size_t)plen, src.sin_addr, iface);
@@ -1099,6 +1366,7 @@ static void expire_neighbors(void)
         if (n->dead_at > 0 && now >= n->dead_at) {
             char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(n->router_id, ridbuf, sizeof(ridbuf));
             hadc_info("ospf: neighbor %s (%s) dead -> Down", ridbuf, inet_ntoa(n->ip));
+            nbr_reset_exchange(n);
             n->in_use = false;
             n->state = NSTATE_DOWN;
         }
@@ -1304,6 +1572,7 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
                 lsa_checksum(lp, l);
                 size_t plen = sizeof(ospf_hdr_t) + 4 + l;
                 oh->length = htons((uint16_t)plen);
+                apply_auth(oh, g_ospf.ctx, pkt, plen);
                 oh->checksum = 0; oh->checksum = ip_checksum(pkt, plen);
                 for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
                     if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY)
@@ -1358,24 +1627,69 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
         i++;
     }
 
-    /* Periodically reflood LSAs and retransmit adjacency packets for interop */
-    static time_t last_flood, last_full_flood;
-    if (now - last_flood >= 5) {
+    /* Periodically reflood LSAs and retransmit adjacency/LSA packets */
+    static time_t last_flood, last_full_flood, last_rxmt;
+    if (now - last_rxmt >= OSPF_RXMT_INTERVAL) {
         for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
             ospf_neighbor_t *n = &g_ospf.nbrs[i];
             if (!n->in_use) continue;
-            if (n->state == NSTATE_LOADING && n->last_lsreq_sent != 0 && now - n->last_lsreq_sent >= 5) {
+
+            /* retransmit last DBD if waiting */
+            if ((n->state == NSTATE_EXSTART || n->state == NSTATE_EXCHANGE) &&
+                n->last_dbd_len > 0 && now - n->last_dbdesc_sent >= OSPF_RXMT_INTERVAL) {
+                send_to(n->ip, n->ifindex, n->last_dbd, n->last_dbd_len);
+                n->last_dbdesc_sent = now;
+            }
+
+            /* retransmit pending LS requests */
+            if ((n->state == NSTATE_EXCHANGE || n->state == NSTATE_LOADING) && nbr_has_lsreq(n) &&
+                now - n->last_lsreq_sent >= OSPF_RXMT_INTERVAL) {
+                nbr_send_lsreq(n);
+                if (n->state == NSTATE_EXCHANGE)
+                    n->state = NSTATE_LOADING;
+            }
+
+            /* retransmit unacked LSAs (simple: resend individual updates) */
+            for (size_t r = 0; r < OSPF_MAX_LSRX; r++) {
+                if (!n->ls_rxmt[r].in_use) continue;
+                if (now - n->ls_rxmt[r].last_sent < OSPF_RXMT_INTERVAL) continue;
+                ospf_lsa_t *e = find_lsa(&n->ls_rxmt[r].hdr);
+                if (!e || !e->valid) { n->ls_rxmt[r].in_use = false; if (n->n_ls_rxmt) n->n_ls_rxmt--; continue; }
+                /* if DB copy is newer than rxmt, update rxmt header */
+                n->ls_rxmt[r].hdr = e->hdr;
+                uint8_t pkt[OSPF_MTU];
+                memset(pkt, 0, sizeof(pkt));
+                ospf_hdr_t *oh = (ospf_hdr_t *)pkt;
+                oh->version = OSPF_VERSION; oh->type = OSPF_LSUPDATE;
+                oh->router_id = htonl(g_ospf.router_id); oh->area_id = htonl(OSPF_AREA_BACKBONE);
+                uint32_t nl = htonl(1);
+                memcpy(pkt + sizeof(*oh), &nl, 4);
+                size_t l = lsa_wire_len(e);
+                if (sizeof(*oh) + 4 + l > OSPF_MTU) continue;
+                memcpy(pkt + sizeof(*oh) + 4, &e->hdr, sizeof(e->hdr));
+                if (e->body_len && e->body)
+                    memcpy(pkt + sizeof(*oh) + 4 + sizeof(e->hdr), e->body, e->body_len);
+                if (e->self) ((ospf_lsa_hdr_t *)(pkt + sizeof(*oh) + 4))->age = htons(0);
+                lsa_checksum(pkt + sizeof(*oh) + 4, l);
+                size_t plen = sizeof(*oh) + 4 + l;
+                oh->length = htons((uint16_t)plen);
+                apply_auth(oh, g_ospf.ctx, pkt, plen);
+                oh->checksum = 0; oh->checksum = ip_checksum(pkt, plen);
+                send_to(n->ip, n->ifindex, pkt, plen);
+                n->ls_rxmt[r].last_sent = now;
+            }
+
+            if (n->state == NSTATE_LOADING && !nbr_has_lsreq(n)) {
                 n->state = NSTATE_FULL;
                 n->lsa_sync_sent = true;
             }
-            if (n->state == NSTATE_EXSTART && now - n->last_dbdesc_sent >= 5) {
-                uint8_t out[OSPF_MTU]; size_t olen = 0;
-                build_dbdesc(out, &olen, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
-                send_to(n->ip, n->ifindex, out, olen);
-                n->last_dbdesc_sent = now;
+            if (n->state == NSTATE_EXSTART && now - n->last_dbdesc_sent >= OSPF_RXMT_INTERVAL && n->last_dbd_len == 0) {
+                nbr_send_dbdesc(n, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
             }
         }
+        last_rxmt = now;
     }
+
     if (now - last_flood >= 30) {
         for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
             if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
