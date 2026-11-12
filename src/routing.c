@@ -481,6 +481,15 @@ int hadc_routing_init(hadc_ctx_t *ctx)
 
 void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
+    bool standalone = ctx && ctx->conf.n_members == 0;
+
+    if (standalone) {
+        /* Keep installed routes/addresses in place for single-node setups. */
+        hadc_ospf_shutdown(ctx);
+        snprintf(g_rs.reason, sizeof(g_rs.reason), "shutdown");
+        return;
+    }
+
     hadc_routing_reconcile(ctx, "shutdown");
     /* remove routes we installed */
     for (size_t i = 0; i < g_rs.n_installed; i++) {

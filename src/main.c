@@ -128,7 +128,10 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
     } else if (ctx->role == HADC_ROLE_MASTER && hadc_cluster_handoff(ctx)) {
         hadc_info("signal %u received; handed off before shutdown", si.ssi_signo);
     } else {
-        hadc_info("signal %u received; shutting down", si.ssi_signo);
+        if (ctx->conf.n_members == 0)
+            hadc_info("signal %u received; standalone shutdown, leaving service intact", si.ssi_signo);
+        else
+            hadc_info("signal %u received; shutting down", si.ssi_signo);
     }
     ctx->shutting_down = true;
     ctx->running = false;
@@ -687,10 +690,13 @@ int main(int argc, char **argv)
                   hadc_lease_state_name(rl.state),
                   rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
     }
-    hadc_info("running (heartbeat %ums, cluster port %u; roles are automatic "
-              "(priority %d), ctl promote/demote still override)",
-              ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
-              ctx->conf.priority);
+    if (ctx->conf.n_members == 0)
+        hadc_info("running standalone (no cluster members; heartbeat transport disabled, role master)");
+    else
+        hadc_info("running (heartbeat %ums, cluster port %u; roles are automatic "
+                  "(priority %d), ctl promote/demote still override)",
+                  ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
+                  ctx->conf.priority);
     struct epoll_event evs[MAX_FDS];
     while (ctx->running) {
         int n = epoll_wait(ctx->epfd, evs, MAX_FDS, 1000);

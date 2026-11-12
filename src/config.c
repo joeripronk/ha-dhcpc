@@ -471,7 +471,11 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         goto derr;
     }
     json_t *members = json_object_get(root, "members");
-    if (members && json_is_array(members)) {
+    if (members) {
+        if (!json_is_array(members)) {
+            snprintf(err, errlen, "config: members must be a list");
+            goto derr;
+        }
         json_t *m;
         size_t idx;
         json_array_foreach(members, idx, m) {

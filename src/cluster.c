@@ -631,6 +631,15 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
             self = &ctx->conf.members[i];
     if (!self) {
+        if (ctx->conf.n_members == 0) {
+            if (ctx->udp_fd >= 0) {
+                hadc_loop_del(ctx, ctx->udp_fd);
+                close(ctx->udp_fd);
+                ctx->udp_fd = -1;
+            }
+            memset(&g_bound, 0, sizeof(g_bound));
+            return 0;
+        }
         hadc_warn("cluster: this node (%s) is not in the shared config members", ctx->conf.self);
         return -1;
     }
@@ -922,6 +931,13 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     g_ctx = ctx;
     g_cluster_start_ms = (uint64_t)hadc_now_ms();
 
+    ctx->udp_fd = -1;
+    memset(&g_bound, 0, sizeof(g_bound));
+    if (ctx->conf.n_members == 0) {
+        hadc_info("cluster: standalone mode (no members configured); heartbeat transport disabled");
+        return 0;
+    }
+
     const hadc_member_t *self = NULL;
     for (size_t i = 0; i < ctx->conf.n_members; i++)
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
@@ -941,6 +957,8 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     if (bind(ctx->udp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         hadc_err("cluster: bind %s:%u: %s", inet_ntoa(addr.sin_addr),
                  (unsigned)ctx->conf.cluster.port, strerror(errno));
+        close(ctx->udp_fd);
+        ctx->udp_fd = -1;
         return -1;
     }
     fcntl(ctx->udp_fd, F_SETFL, O_NONBLOCK);
@@ -1163,12 +1181,14 @@ static void preempt_check(hadc_ctx_t *ctx)
 /* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 {
+    bool standalone = (ctx->conf.n_members == 0);
+
     if (ctx->graceful_restart_until_ms && !hadc_cluster_graceful_active(ctx)) {
         /* expired: persist cleared state once */
         hadc_info("cluster: graceful restart window expired");
         hadc_persist_save(ctx);
     }
-    if (hadc_cluster_graceful_active(ctx))
+    if (!standalone && hadc_cluster_graceful_active(ctx))
         hadc_cluster_broadcast_graceful(ctx);
 
     /* Master-side gateway MAC cache: pick up the gateway lladdr from our own
@@ -1181,13 +1201,18 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
             (!ctx->lease.gw_mac_valid || !hadc_mac_equal(ctx->lease.gw_mac, mac))) {
             memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
             ctx->lease.gw_mac_valid = true;
-            hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached; "
-                      "pushing state",
+            hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached%s",
                       inet_ntoa(ctx->lease.gateway), mac[0], mac[1], mac[2], mac[3],
-                      mac[4], mac[5]);
+                      mac[4], mac[5], standalone ? "" : "; pushing state");
             hadc_persist_save(ctx);
-            hadc_cluster_push_state(ctx, &ctx->lease);
+            if (!standalone)
+                hadc_cluster_push_state(ctx, &ctx->lease);
         }
+    }
+
+    if (standalone) {
+        hadc_cluster_elect_check(ctx);
+        return;
     }
 
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
@@ -1224,6 +1249,11 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
 
     if (hadc_cluster_graceful_active(ctx))
         return;
+    if (ctx->conf.n_members == 0) {
+        if (ctx->role != HADC_ROLE_MASTER)
+            hadc_cluster_promote(ctx, ctx->conf.self);
+        return;
+    }
     if (!ctx->conf.default_role_master)
         return;
     if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
