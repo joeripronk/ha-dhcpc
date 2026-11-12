@@ -2,6 +2,9 @@ build/
 /tests_sha256
 /tests_persist
 /tests_config
+/tests_lease
+/tests_executor
+/tests_dhcp
 *.d
 !etc/init.d/
 !production/routers/sysctl.d/

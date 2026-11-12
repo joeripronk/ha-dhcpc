@@ -277,25 +277,24 @@ static int rtmsg_send(int type, unsigned flags, struct in_addr prefix, unsigned 
     return rc;
 }
 
-static bool nexthop_reachable_on_fabric(struct in_addr nh)
+static bool nexthop_reachable_on_fabric(struct in_addr nh, struct ifaddrs *ifas)
 {
-    if (nh.s_addr == 0) return false;
-    struct ifaddrs *ifas = NULL;
-    bool ok = false;
-    if (getifaddrs(&ifas) != 0) return false;
+    if (nh.s_addr == 0 || !ifas) return false;
     for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
         if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
         if (!ifa->ifa_netmask) continue;
         struct in_addr a = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
         struct in_addr m = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
-        if ((a.s_addr & m.s_addr) == (nh.s_addr & m.s_addr)) { ok = true; break; }
+        if ((a.s_addr & m.s_addr) == (nh.s_addr & m.s_addr))
+            return true;
     }
-    freeifaddrs(ifas);
-    return ok;
+    return false;
 }
 
 static void apply_learned_routes(hadc_ctx_t *ctx)
 {
+    struct ifaddrs *ifas = NULL;
+
     (void)ctx;
     if (!g_rs.accept_default_route && strcmp(g_rs.backend, "stub") == 0) {
         /* even if not accepting default, still allow non-default prefix install? accept flag
@@ -306,18 +305,23 @@ static void apply_learned_routes(hadc_ctx_t *ctx)
     hadc_ospf_learned_route_t learned[HADC_ROUTING_MAX_INSTALLED];
     size_t nlearn = hadc_ospf_learned_routes(ctx, learned, HADC_ROUTING_MAX_INSTALLED);
 
+    if (nlearn > 0 && getifaddrs(&ifas) != 0)
+        ifas = NULL;
+
     hadc_routing_installed_t want[HADC_ROUTING_MAX_INSTALLED];
     size_t nwant = 0;
     for (size_t i = 0; i < nlearn && nwant < HADC_ROUTING_MAX_INSTALLED; i++) {
         if (!learned[i].valid) continue;
         if (learned[i].nexthop.s_addr == 0) continue;
-        if (!nexthop_reachable_on_fabric(learned[i].nexthop)) continue;
+        if (!nexthop_reachable_on_fabric(learned[i].nexthop, ifas)) continue;
         want[nwant].prefix = learned[i].prefix;
         want[nwant].prefixlen = learned[i].prefixlen;
         want[nwant].nexthop = learned[i].nexthop;
         want[nwant].valid = true;
         nwant++;
     }
+    if (ifas)
+        freeifaddrs(ifas);
 
     /* remove stale installed routes not desired (or changed nexthop) */
     for (size_t i = 0; i < g_rs.n_installed; ) {

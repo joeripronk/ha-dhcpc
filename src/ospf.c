@@ -221,45 +221,47 @@ static void u32_to_rid(uint32_t v, char *out, size_t outlen)
     inet_ntop(AF_INET, &a, out, outlen);
 }
 
-static bool iface_primary_v4(const char *ifname, struct in_addr *addr, struct in_addr *mask)
-{
-    struct ifaddrs *ifas = NULL, *ifa;
-    bool ok = false;
-    if (getifaddrs(&ifas) != 0)
-        return false;
-    for (ifa = ifas; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
-            continue;
-        if (strcmp(ifa->ifa_name, ifname) != 0)
-            continue;
-        *addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
-        if (ifa->ifa_netmask)
-            *mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
-        else
-            mask->s_addr = 0;
-        ok = true;
-        break;
-    }
-    freeifaddrs(ifas);
-    return ok;
-}
-
 static void ospf_fd_ready(hadc_ctx_t *ctx, int fd);
 
 static void refresh_ifaces(hadc_ctx_t *ctx)
 {
+    struct ifaddrs *ifas = NULL, *ifa;
+
     g_ospf.n_ifaces = 0;
     for (size_t i = 0; i < ctx->conf.ospf.n_interfaces && g_ospf.n_ifaces < OSPF_MAX_IFACES; i++) {
         ospf_if_t *oi = &g_ospf.ifaces[g_ospf.n_ifaces];
         memset(oi, 0, sizeof(*oi));
         snprintf(oi->name, sizeof(oi->name), "%s", ctx->conf.ospf.interfaces[i]);
         oi->ifindex = if_nametoindex(oi->name);
-        oi->up = iface_primary_v4(oi->name, &oi->addr, &oi->mask);
-        if (oi->up)
-            oi->network.s_addr = oi->addr.s_addr & oi->mask.s_addr;
         if (oi->ifindex)
             g_ospf.n_ifaces++;
     }
+
+    if (g_ospf.n_ifaces == 0)
+        return;
+    if (getifaddrs(&ifas) != 0)
+        return;
+
+    for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
+        ospf_if_t *oi = &g_ospf.ifaces[i];
+        oi->up = false;
+        oi->addr.s_addr = 0;
+        oi->mask.s_addr = 0;
+        oi->network.s_addr = 0;
+        for (ifa = ifas; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+                continue;
+            if (strcmp(ifa->ifa_name, oi->name) != 0)
+                continue;
+            oi->addr = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+            if (ifa->ifa_netmask)
+                oi->mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr;
+            oi->up = true;
+            oi->network.s_addr = oi->addr.s_addr & oi->mask.s_addr;
+            break;
+        }
+    }
+    freeifaddrs(ifas);
 }
 
 static int join_multicast(int fd, unsigned ifindex)

@@ -19,7 +19,10 @@ run() {
 	if [ "$APPLY" = 1 ]; then sh -c "$1"; else echo "DRY-RUN: $1"; fi
 }
 
-[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+if [ "$(id -u)" -ne 0 ]; then
+	exec sudo -- "$0" "$@"
+fi
+
 for f in ha-dhcpc.conf ha-dhcpc-local.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done

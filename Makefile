@@ -49,8 +49,8 @@ tests_config: tests/config_test.c src/config.c src/sha256.c src/log.c
 tests_lease: tests/lease_test.c src/lease.c
 	$(CC) $(CFLAGS) -o $@ tests/lease_test.c src/lease.c $(LDLIBS)
 
-tests_executor: tests/executor_test.c src/executor.c src/sha256.c src/log.c src/lease.c
-	$(CC) $(CFLAGS) -o $@ tests/executor_test.c src/executor.c src/sha256.c src/log.c src/lease.c $(LDLIBS)
+tests_executor: tests/executor_test.c tests/stubs_routing.c src/executor.c src/sha256.c src/log.c src/lease.c
+	$(CC) $(CFLAGS) -o $@ tests/executor_test.c tests/stubs_routing.c src/executor.c src/sha256.c src/log.c src/lease.c $(LDLIBS)
 
 tests_dhcp: tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c $(LDLIBS)
