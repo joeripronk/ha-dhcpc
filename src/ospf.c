@@ -1255,18 +1255,22 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         return;
     }
 
-    /* Initial DBD from peer claiming master -> we become slave for exchange */
-    if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS)) {
+    /* Initial DBD from peer claiming master. The election is decided by
+     * router-ID: only the loser adopts the peer as master here; the winner
+     * stays master and drives the exchange from the negotiation below, so
+     * both sides can never end up adopting each other and looping. */
+    if ((flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_M) && (flags & OSPF_DD_FLAG_MS) &&
+        g_ospf.router_id < n->router_id) {
         nbr_reset_exchange(n);
         n->state = NSTATE_EXCHANGE;
         n->dd_master = false;
         n->dd_seq = seq;
         send_lsreq_missing(n, pkt, len);
         nbr_send_dbdesc(n, 0, seq, true);
-        if (!(flags & OSPF_DD_FLAG_M) && !nbr_has_lsreq(n)) {
+        if (!nbr_has_lsreq(n)) {
             n->state = NSTATE_FULL;
             n->lsa_sync_sent = true;
-        } else if (!(flags & OSPF_DD_FLAG_M)) {
+        } else {
             n->state = NSTATE_LOADING;
         }
         flood_lsas_to_neighbor(n, false);
