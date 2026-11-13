@@ -1288,6 +1288,19 @@ static void failover_check(hadc_ctx_t *ctx)
     hadc_cluster_promote(ctx, ctx->conf.self);
 }
 
+/* Edge-triggered refusal logging (main loop only): the preempt path retries every
+ * heartbeat tick, so a persistent refusal must not log per tick — the line fires
+ * when the refusal reason changes, and once more when it clears. */
+static void log_refusal_once(hadc_log_level_t level, const char *msg)
+{
+    static char last[256];
+
+    if (strcmp(last, msg) == 0)
+        return;
+    snprintf(last, sizeof(last), "%s", msg);
+    hadc_log(level, "%s", msg);
+}
+
 /* Preemption (cluster.preempt, plan §4): when enabled, the cluster converges
  * on the highest-priority live member: a live slave that outranks the current
  * master promotes itself. Only acts when the current master is alive and
@@ -1327,8 +1340,10 @@ static void preempt_check(hadc_ctx_t *ctx)
         if (pp->alive && strcmp(pp->role_view, "slave") != 0)
             return;
     }
-    hadc_info("cluster: preempt: promoting self (priority %d outranks live master %s (%d))",
-              self->priority, cur->id, cur->priority);
+    char m[256];
+    snprintf(m, sizeof(m), "cluster: preempt: promoting self (priority %d outranks live master %s (%d))",
+             self->priority, cur->id, cur->priority);
+    log_refusal_once(HADC_LOG_INFO, m);
     hadc_cluster_promote(ctx, ctx->conf.self);
 }
 
@@ -1530,14 +1545,18 @@ static bool cluster_all_others_demoted(hadc_ctx_t *ctx)
         if (!p || !p->alive)
             continue;
         if (!strcmp(p->role_view, "master") || !strcmp(p->master_view, m->id)) {
-            hadc_info("cluster: cannot promote: %s is not demoted (role=%s master_view=%s)",
-                      m->id, p->role_view[0] ? p->role_view : "unknown",
-                      p->master_view[0] ? p->master_view : "(none)");
+            char m2[256];
+            snprintf(m2, sizeof(m2), "cluster: cannot promote: %s is not demoted (role=%s master_view=%s)",
+                     m->id, p->role_view[0] ? p->role_view : "unknown",
+                     p->master_view[0] ? p->master_view : "(none)");
+            log_refusal_once(HADC_LOG_INFO, m2);
             return false;
         }
         if (strcmp(p->role_view, "slave") != 0) {
-            hadc_info("cluster: cannot promote: %s role not confirmed slave yet (role=%s)",
-                      m->id, p->role_view[0] ? p->role_view : "unknown");
+            char m2[256];
+            snprintf(m2, sizeof(m2), "cluster: cannot promote: %s role not confirmed slave yet (role=%s)",
+                     m->id, p->role_view[0] ? p->role_view : "unknown");
+            log_refusal_once(HADC_LOG_INFO, m2);
             return false;
         }
     }
@@ -1561,8 +1580,10 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
      * only promote once every alive peer is confirmed slave and no peer asserts
      * master. Handoffs make this node a slave and are not a self-promotion. */
     if (!handoff && !cluster_all_others_demoted(ctx)) {
-        hadc_warn("cluster: promote(%s) refused: not all cluster members are demoted slaves",
-                  target);
+        char m[256];
+        snprintf(m, sizeof(m), "cluster: promote(%s) refused: not all cluster members are demoted slaves",
+                 target);
+        log_refusal_once(HADC_LOG_WARN, m);
         return -1;
     }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
