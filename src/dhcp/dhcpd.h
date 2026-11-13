@@ -486,6 +486,7 @@ void dhcp_core_run_timeouts(void);
 long dhcp_core_next_timeout_ms(void);
 int  dhcp_core_get_fds(int *fds, int max);
 int  dhcp_core_restart(const char *interface, const char *lease_db);
+int  dhcp_core_resume(const char *interface, long t1_s, long t2_s, long t3_s);
 int  dhcp_core_force_discover(const char *interface);
 int  dhcp_core_force_renew(const char *interface);
 int  dhcp_core_drop_interface(struct interface_info *);

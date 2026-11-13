@@ -414,7 +414,6 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                       hadc_lease_state_name(rl.state),
                       rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
         }
-        hadc_dhcpcore_start(ctx);
     } else {
         if (old_role == HADC_ROLE_MASTER)
             hadc_dhcpcore_stop(ctx);
@@ -431,6 +430,7 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
     if (new_role == HADC_ROLE_MASTER) {
+        hadc_dhcpcore_start(ctx); /* resume after the dataplane (pin/neigh/route) is applied */
         hadc_executor_announce_cluster(ctx);
         hadc_gwping_start(ctx); /* verify the gateway after a promote */
     } else if (old_role == HADC_ROLE_MASTER)

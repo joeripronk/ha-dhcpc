@@ -47,6 +47,12 @@ typedef struct {
         uint16_t port;                 /* UDP cluster transport, shared link */
         uint32_t heartbeat_ms;
         uint32_t election_deadline_ms; /* dead-master detection before failover */
+        uint32_t self_demote_gap_ms;   /* master self-monitor: step down when a heartbeat
+                                        * tick is late by more than heartbeat_ms + this gap
+                                        * (a missed beat already means an unhealthy master,
+                                        * so step down before a peer steals the role).
+                                        * Measured above the cadence so a small gap can't
+                                        * fire on a healthy tick. 0 = off */
         hadc_quorum_mode_t quorum;     /* majority (default) or none */
         uint32_t cluster_timeout_ms;   /* default-role bootstrap deadline, 0=off */
         bool preempt; /* true (default): the cluster converges on the

@@ -134,18 +134,20 @@ int hadc_executor_init(hadc_ctx_t *ctx)
 static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
 {
     char addr[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN], backup[INET_ADDRSTRLEN];
-    char via[INET_ADDRSTRLEN];
+    char via[INET_ADDRSTRLEN], sid[INET_ADDRSTRLEN];
 
     inet_ntop(AF_INET, &d->address, addr, sizeof(addr));
     inet_ntop(AF_INET, &d->gateway, gw, sizeof(gw));
     inet_ntop(AF_INET, &d->backup_gateway, backup, sizeof(backup));
     inet_ntop(AF_INET, &d->default_via, via, sizeof(via));
+    inet_ntop(AF_INET, &d->server_id, sid, sizeof(sid));
     json_t *o = json_pack(
-        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b}", "interface", d->interface,
-        "present", d->present, "address", addr, "prefixlen", (json_int_t)d->prefixlen,
-        "gateway", gw, "backup_gateway", backup, "backup_route", d->backup_route, "dns", "",
-        "routes", d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state,
-        "default_via", via, "slave_nft_block", d->slave_nft_block);
+        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b, s:s}",
+        "interface", d->interface, "present", d->present, "address", addr,
+        "prefixlen", (json_int_t)d->prefixlen, "gateway", gw, "backup_gateway",
+        backup, "backup_route", d->backup_route, "dns", "", "routes",
+        d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state,
+        "default_via", via, "slave_nft_block", d->slave_nft_block, "server_id", sid);
     json_t *dns = json_array();
     for (size_t i = 0; i < d->n_dns; i++)
         json_array_append_new(dns, json_string(inet_ntoa(d->dns[i])));
@@ -178,6 +180,24 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
 static const struct in_addr *default_nexthop(const hadc_desired_t *d)
 {
     return d->default_via.s_addr ? &d->default_via : &d->gateway;
+}
+
+/* True when the DHCP server-id is only reachable through the lease gateway,
+ * so a /32 pin is what keeps unicast DHCPREQUESTs alive while the gateway
+ * probe has moved the default route to the backup router. On-link servers and
+ * the gateway itself are already covered by the connected route. */
+static bool server_needs_pin(const hadc_desired_t *d)
+{
+    uint32_t mask;
+
+    if (!d->present || d->server_id.s_addr == 0 || d->gateway.s_addr == 0)
+        return false;
+    if (d->server_id.s_addr == d->gateway.s_addr)
+        return false;
+    if (d->prefixlen >= 32)
+        return true;
+    mask = htonl(~(0xffffffffu >> d->prefixlen));
+    return (d->server_id.s_addr & mask) != (d->address.s_addr & mask);
 }
 
 void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desired_t *out)
@@ -213,6 +233,7 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         out->n_dns = lease->n_dns;
         for (size_t i = 0; i < lease->n_dns; i++)
             out->dns[i] = lease->dns[i];
+        out->server_id = lease->server_id;
     }
     /* Slaves do not own the DHCP default route: they reach the network through
      * the master's VIP via the configured backup gateway. */
@@ -459,6 +480,46 @@ static struct rtnl_route *find_default(struct nl_cache *cache, const struct in_a
 	return m.found;
 }
 
+struct host_match {
+	const struct in_addr *dst;
+	const struct in_addr *gw;
+	struct rtnl_route *found;
+};
+
+static void host_route_match_cb(struct nl_object *obj, void *p)
+{
+	struct host_match *m = p;
+	struct rtnl_route *r = (struct rtnl_route *)obj;
+	struct nl_addr *dst = rtnl_route_get_dst(r);
+	int i;
+
+	if (rtnl_route_get_type(r) != RTN_UNICAST)
+		return;
+	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
+		return;
+	if (nl_addr_get_prefixlen(dst) != 32 ||
+	    memcmp(nl_addr_get_binary_addr(dst), m->dst, 4) != 0)
+		return;
+	for (i = 0; i < rtnl_route_get_nnexthops(r); i++) {
+		struct nl_addr *gw = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
+
+		if (gw && nl_addr_get_len(gw) == 4 &&
+		    memcmp(nl_addr_get_binary_addr(gw), m->gw, 4) == 0) {
+			m->found = r;
+			return;
+		}
+	}
+}
+
+static struct rtnl_route *find_host_route(struct nl_cache *cache, const struct in_addr *dst,
+    const struct in_addr *gw)
+{
+	struct host_match m = { dst, gw, NULL };
+
+	nl_cache_foreach(cache, host_route_match_cb, &m);
+	return m.found;
+}
+
 /* dhclient-script compatible hook environment. */
 static void run_hook(char *const argv[], const hadc_desired_t *prev,
     const hadc_desired_t *d, const char *reason)
@@ -575,6 +636,38 @@ static int nl_route_add_default(struct nl_sock *sk, int ifindex, const struct in
 	nla_put(m, RTA_GATEWAY, 4, gw);
 	if (ifindex)
 		nla_put(m, RTA_OIF, 4, &ifindex);
+	return nl_send_sync(sk, m); /* consumes m */
+}
+
+/* Pinned /32 host route to the DHCP server-id via the on-link lease gateway.
+ * It survives a gateway-probe failover that moves the default route, so
+ * unicast DHCPREQUESTs keep reaching the server that owns the lease. */
+static int nl_route_add_host(struct nl_sock *sk, int ifindex, const struct in_addr *dst,
+    const struct in_addr *gw)
+{
+	struct nl_msg *m = nlmsg_alloc_simple(RTM_NEWROUTE,
+	    NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK);
+	struct rtmsg *rt;
+
+	if (!m)
+		return -1;
+	rt = (struct rtmsg *) nlmsg_reserve(m, sizeof(*rt), NLA_ALIGNTO);
+	if (!rt) {
+		nlmsg_free(m);
+		return -1;
+	}
+	rt->rtm_family = AF_INET;
+	rt->rtm_dst_len = 32;
+	rt->rtm_src_len = 0;
+	rt->rtm_tos = 0;
+	rt->rtm_table = RT_TABLE_MAIN;
+	rt->rtm_protocol = RTPROT_BOOT;
+	rt->rtm_scope = RT_SCOPE_UNIVERSE;
+	rt->rtm_type = RTN_UNICAST;
+	rt->rtm_flags = RTNH_F_ONLINK; /* the lease gateway is on-link on the DHCP link */
+	nla_put(m, RTA_DST, 4, dst);
+	nla_put(m, RTA_GATEWAY, 4, gw);
+	nla_put(m, RTA_OIF, 4, &ifindex);
 	return nl_send_sync(sk, m); /* consumes m */
 }
 
@@ -798,6 +891,9 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 				drift++;
 			if (d->gw_mac_valid && d->gateway.s_addr &&
 			    !neigh_holds(ncache, ifindex, &d->gateway, d->gw_mac))
+				drift++;
+			if (server_needs_pin(d) &&
+			    !find_host_route(rcache, &d->server_id, &d->gateway))
 				drift++;
 		}
 	}
@@ -1045,6 +1141,49 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 
 		if (desired->gateway.s_addr && desired->gw_mac_valid)
 			apply_gw_neigh(ifindex, &desired->gateway, desired->gw_mac, reason);
+
+		/* Pin the DHCP server-id with a /32 via the on-link lease gateway so a
+		 * gateway-probe failover that moves the default route cannot blackhole
+		 * unicast DHCPREQUESTs. Idempotent; a stale pin is dropped when the
+		 * server-id or gateway changes or it is no longer needed. */
+		if (server_needs_pin(desired)) {
+			char sidbuf[INET_ADDRSTRLEN], gwbuf[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &desired->server_id, sidbuf, sizeof(sidbuf));
+			inet_ntop(AF_INET, &desired->gateway, gwbuf, sizeof(gwbuf));
+			if (prev && server_needs_pin(prev) &&
+			    (prev->server_id.s_addr != desired->server_id.s_addr ||
+			    prev->gateway.s_addr != desired->gateway.s_addr)) {
+				sroute = find_host_route(rcache, &prev->server_id, &prev->gateway);
+				if (sroute) {
+					if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
+						hadc_warn("executor: deleting stale server pin to %s "
+						    "failed: %s", inet_ntoa(prev->server_id),
+						    nl_geterror(ar));
+					else
+						hadc_info("executor: removed stale server pin to %s "
+						    "(reason=%s)", inet_ntoa(prev->server_id), reason);
+				}
+			}
+			if (!find_host_route(rcache, &desired->server_id, &desired->gateway)) {
+				if ((ar = nl_route_add_host(g_sk, ifindex, &desired->server_id,
+				    &desired->gateway)) < 0)
+					hadc_warn("executor: adding server pin /32 to %s via %s "
+					    "failed: %s", sidbuf, gwbuf, nl_geterror(ar));
+				else
+					hadc_info("executor: pinned server-id %s via %s on %s "
+					    "(reason=%s)", sidbuf, gwbuf, desired->interface, reason);
+			}
+		} else if (prev && server_needs_pin(prev)) {
+			sroute = find_host_route(rcache, &prev->server_id, &prev->gateway);
+			if (sroute) {
+				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
+					hadc_warn("executor: deleting server pin /32 to %s failed: %s",
+					    inet_ntoa(prev->server_id), nl_geterror(ar));
+				else
+					hadc_info("executor: removed server pin /32 to %s (reason=%s)",
+					    inet_ntoa(prev->server_id), reason);
+			}
+		}
 
 		if (via->s_addr) {
 			sroute = find_default(rcache, via);

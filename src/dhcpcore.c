@@ -240,6 +240,16 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
             return -1;
         }
         g_core_live = 1;
+    } else if (!g_running) {
+        /* Re-promotion after a demotion: the core kept its lease but its
+         * timeouts froze while it was not being pumped. Cancel them, advance
+         * the clock to now, and re-enter on the held lease with the daemon's
+         * aged timers so the next action is the renewal that is due now, not a
+         * stale-reboot DISCOVER. */
+        if (dhcp_core_resume(ctx->conf.interface, (long)ctx->lease.t1_remaining_s,
+              (long)ctx->lease.t2_remaining_s, (long)ctx->lease.t3_remaining_s) != 0)
+            hadc_warn("dhcpcore: resume on %s failed; re-registering as-is",
+                      ctx->conf.interface);
     }
 
     if (hadc_loop_add(ctx, ctx->core_timerfd, core_timer_ready, 0) != 0) {

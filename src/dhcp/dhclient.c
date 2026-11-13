@@ -663,6 +663,51 @@ dhcp_core_restart(const char *interface, const char *lease_db)
 	return (0);
 }
 
+/*
+ * Daemon integration (plan §4): re-enter the state machine after a role flip
+ * back to master. The core is inited once and kept across demotions, so its
+ * timeouts froze while the daemon was not pumping it; simply re-registering its
+ * fds would let a stale reboot timer fire and DISCOVER a new address. Cancel
+ * those timeouts, advance the clock to now, and re-enter on the lease we already
+ * hold: the next action is the renewal that is due now (unicast to the pinned
+ * server-id), not a DISCOVER. The daemon passes its aged view of the remaining
+ * timers so the deadlines are relative to now, not the frozen pre-demotion
+ * clock (all three come from the same lease; a negative t3_s means "not pushed"
+ * and the held lease's own times are kept). With no lease held, reboot as usual.
+ */
+int
+dhcp_core_resume(const char *interface, long t1_s, long t2_s, long t3_s)
+{
+	struct interface_info *ip;
+
+	if (interface == NULL)
+		return (-1);
+	for (ip = ifi; ip != NULL; ip = ip->next) {
+		if (strcmp(ip->name, interface) != 0 || ip->client == NULL)
+			continue;
+		clock_gettime(CLOCK_MONOTONIC, &time_now);
+		cur_time = time_now.tv_sec;
+		cancel_timeouts_for(ip);
+		if (ip->client->active != NULL && !ip->client->active->is_bootp) {
+			if (t3_s >= 0) {
+				ip->client->active->renewal = cur_time + (t1_s > 0 ? t1_s : 0);
+				ip->client->active->rebind = cur_time + (t2_s > 0 ? t2_s : 0);
+				ip->client->active->expiry = cur_time + t3_s;
+			}
+			ip->client->state = S_BOUND;
+			note("resuming on the held lease after promotion: %s",
+			    piaddr(ip->client->active->address));
+			state_bound(ip);
+		} else {
+			ip->client->state = S_INIT;
+			note("no lease to resume on after promotion: rebooting");
+			state_reboot(ip);
+		}
+		return (0);
+	}
+	return (-1);
+}
+
 int
 dhcp_core_force_discover(const char *interface)
 {

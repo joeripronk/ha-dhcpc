@@ -134,6 +134,43 @@ int main(void)
             return fail("slave keeps its own default route");
     }
 
+    /* Server-id pin: the field is populated from the lease and participates in
+     * the canonical hash, so a server-id change re-triggers apply and a stable
+     * input yields a stable hash. */
+    {
+        struct in_addr gw, sid1, sid2;
+        hadc_ctx_t ctx;
+        hadc_lease_t lease;
+        hadc_desired_t a, b;
+
+        inet_pton(AF_INET, "143.177.172.1", &gw);
+        inet_pton(AF_INET, "95.99.44.1", &sid1);
+        inet_pton(AF_INET, "95.99.44.2", &sid2);
+
+        memset(&ctx, 0, sizeof(ctx));
+        memset(&lease, 0, sizeof(lease));
+        ctx.role = HADC_ROLE_MASTER;
+        lease.state = HADC_LEASE_BOUND;
+        lease.address.s_addr = inet_addr("143.177.172.194");
+        lease.netmask.s_addr = inet_addr("255.255.255.0");
+        lease.gateway = gw;
+        lease.server_id = sid1;
+
+        hadc_executor_desired(&ctx, &lease, &a);
+        if (a.server_id.s_addr != sid1.s_addr)
+            return fail("server_id populated in desired state");
+
+        lease.server_id = sid2;
+        hadc_executor_desired(&ctx, &lease, &b);
+        if (memcmp(a.config_hash, b.config_hash, sizeof(a.config_hash)) == 0)
+            return fail("server_id change must change the canonical hash");
+
+        lease.server_id = sid1;
+        hadc_executor_desired(&ctx, &lease, &b);
+        if (memcmp(a.config_hash, b.config_hash, sizeof(a.config_hash)) != 0)
+            return fail("canonical hash must be stable for identical input");
+    }
+
     printf("executor_test: OK\n");
     return 0;
 }

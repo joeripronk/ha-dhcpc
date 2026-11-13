@@ -34,6 +34,11 @@ typedef struct {
                                  * is failing or there is no lease IP yet, the
                                  * default route goes here instead of gateway
                                  * (the neighbor entry keeps the lease gateway) */
+    struct in_addr server_id;   /* DHCP server-id from the lease; 0 = none.
+                                 * A /32 route to it via the lease gateway is
+                                 * pinned so a gateway-probe failover that moves
+                                 * the default route cannot blackhole unicast
+                                 * DHCPREQUESTs to the server */
     uint8_t gw_mac[HADC_MAC_LEN]; /* cached gateway lladdr from the lease */
     bool gw_mac_valid;         /* program the gateway neighbor entry */
     struct in_addr backup_gateway; /* apply.backup_gateway; 0 = off */

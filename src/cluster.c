@@ -1228,6 +1228,41 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
             hadc_warn("cluster: send heartbeat to %s failed", m->id);
     }
 
+    /* Self-monitor (P0-3): a master whose own event loop stalled could not send
+     * heartbeats for a full election deadline, which is exactly when its peers
+     * would (or already have) declared it dead. Step down gracefully — hand the
+     * role to the best live peer — instead of letting a peer steal it in a
+     * contested election. The tick cadence is heartbeat_ms, so a gap past the
+     * deadline means several beats were missed, not normal jitter. Only in a real
+     * cluster (>=1 peer); a lone master has nobody to hand to, and a graceful
+     * restart must not be interrupted. */
+    {
+        static uint64_t last_hb_ms;
+        uint64_t now_ms = (uint64_t)hadc_now_ms();
+        uint32_t gap_ms = ctx->conf.cluster.self_demote_gap_ms;
+        uint64_t threshold_ms;
+
+        if (gap_ms == 0) {           /* 0 = off */
+            last_hb_ms = now_ms;
+        } else {
+            /* Threshold is heartbeat_ms + gap_ms so the margin is always measured
+             * above the normal tick cadence: a small gap can't fire on a healthy
+             * tick, and the setting cannot be misconfigured below the cadence. */
+            threshold_ms = (uint64_t)ctx->conf.cluster.heartbeat_ms + gap_ms;
+            if (last_hb_ms != 0 && ctx->role == HADC_ROLE_MASTER &&
+                ctx->conf.n_members >= 2 && !hadc_cluster_graceful_active(ctx) &&
+                now_ms - last_hb_ms > threshold_ms) {
+                hadc_warn("cluster: master heartbeat tick %llu ms late (> heartbeat %u ms + "
+                          "gap %u ms): self-demoting", (unsigned long long)(now_ms - last_hb_ms),
+                          ctx->conf.cluster.heartbeat_ms, gap_ms);
+                last_hb_ms = now_ms;
+                hadc_cluster_demote(ctx);
+                return;
+            }
+            last_hb_ms = now_ms;
+        }
+    }
+
     age_peers(ctx);
     failover_check(ctx);
     if (ctx->conf.cluster.preempt)

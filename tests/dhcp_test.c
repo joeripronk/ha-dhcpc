@@ -241,6 +241,51 @@ int main(void)
     if (client->state != S_SELECTING)
         return fail("nak answering our transaction relinquished");
 
+    /* Role flip back to master (plan §4): the core is re-entered with its clock
+     * advanced to now and stale timeouts cancelled, so the next action on the
+     * held lease is the renewal that is due (unicast to the pinned server-id),
+     * not a DISCOVER driven by a stale reboot timer. */
+    if (dhcp_core_resume("dhcp_test_missing", -1, -1, -1) != -1)
+        return fail("resume missing interface");
+
+    client->state = S_BOUND;
+    client->xid = 0;
+    client->first_sending = 1; /* frozen long before the demotion */
+    client->active = calloc(1, sizeof(*client->active));
+    if (!client->active)
+        return fail("alloc");
+    client->active->address.len = 4;
+    memcpy(client->active->address.iabuf, sid_pinned, 4);
+    client->active->is_bootp = 0;
+    client->active->expiry = time(NULL) + 10000;
+    client->active->renewal = time(NULL) + 100;
+    client->active->rebind = time(NULL) + 200;
+    client->active->options[DHO_DHCP_SERVER_IDENTIFIER].len = 4;
+    client->active->options[DHO_DHCP_SERVER_IDENTIFIER].data = malloc(4);
+    if (!client->active->options[DHO_DHCP_SERVER_IDENTIFIER].data)
+        return fail("alloc");
+    memcpy(client->active->options[DHO_DHCP_SERVER_IDENTIFIER].data, sid_pinned, 4);
+
+    if (dhcp_core_resume("dhcp_test0", 100, 200, 300) != 0)
+        return fail("resume on held lease");
+    if (client->state != S_RENEWING)
+        return fail("resume on held lease must renew, not DISCOVER");
+    if (client->active == NULL)
+        return fail("resume dropped the held lease");
+    if (!(client->active->renewal < client->active->rebind &&
+          client->active->rebind < client->active->expiry))
+        return fail("resume did not re-arm the held lease timers in order");
+
+    /* Nothing to renew when no lease is held: reboot into a fresh select. */
+    free(client->active->options[DHO_DHCP_SERVER_IDENTIFIER].data);
+    free(client->active);
+    client->active = NULL;
+    client->state = S_INIT;
+    if (dhcp_core_resume("dhcp_test0", -1, -1, -1) != 0)
+        return fail("resume with no lease");
+    if (client->state != S_SELECTING)
+        return fail("resume with no lease must reboot to select");
+
     printf("dhcp_test: OK\n");
     return 0;
 }

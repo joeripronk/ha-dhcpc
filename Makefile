@@ -29,13 +29,14 @@ build/%.o: src/%.c | build
 build:
 	mkdir -p build
 
-test: tests_sha256 tests_persist tests_config tests_lease tests_executor tests_dhcp
+test: tests_sha256 tests_persist tests_config tests_lease tests_executor tests_dhcp tests_cluster
 	./tests_sha256
 	./tests_persist
 	./tests_config
 	./tests_lease
 	./tests_executor
 	./tests_dhcp
+	./tests_cluster
 
 tests_sha256: tests/sha256_test.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/sha256_test.c src/sha256.c $(LDLIBS)
@@ -55,8 +56,11 @@ tests_executor: tests/executor_test.c tests/stubs_routing.c src/executor.c src/s
 tests_dhcp: tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c $(LDLIBS)
 
+tests_cluster: tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/log.c src/sha256.c
+	$(CC) $(CFLAGS) -o $@ tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/log.c src/sha256.c $(LDLIBS)
+
 clean:
-	rm -rf build tests_sha256 tests_persist tests_config tests_lease tests_executor tests_dhcp ha-dhcpc
+	rm -rf build tests_sha256 tests_persist tests_config tests_lease tests_executor tests_dhcp tests_cluster ha-dhcpc
 
 -include $(OBJS:.o=.d)
 

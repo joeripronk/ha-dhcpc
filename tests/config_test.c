@@ -472,8 +472,30 @@ int main(void)
         fail("cluster defaults (majority, no addresses)");
     else if (!conf.cluster.preempt)
         fail("cluster default: preempt on");
+    else if (conf.cluster.self_demote_gap_ms != 0)
+        fail("cluster default: self_demote_gap_ms off");
     else
         ok("cluster defaults: majority, no addresses, preempt on");
+
+    /* cluster.self_demote_gap_ms: explicit parse and range guard */
+    {
+        char cbuf[2048];
+        snprintf(cbuf, sizeof(cbuf), "%scluster:\n  self_demote_gap_ms: 250\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("cluster self_demote_gap_ms load");
+        } else if (conf.cluster.self_demote_gap_ms != 250)
+            fail("cluster self_demote_gap_ms parsed");
+        else
+            ok("cluster self_demote_gap_ms parsed");
+        snprintf(cbuf, sizeof(cbuf), "%scluster:\n  self_demote_gap_ms: 60001\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("cluster self_demote_gap_ms out of range refused");
+        else
+            ok("cluster self_demote_gap_ms out of range refused");
+    }
 
     /* cluster.preempt: explicit false parses; non-boolean is refused */
     {

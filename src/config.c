@@ -532,6 +532,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->cluster.heartbeat_ms = (uint32_t)v;
     if (get_int(c ? c : root, "election_deadline_ms", &v, 6000, false, "cluster")) goto derr;
     out->cluster.election_deadline_ms = (uint32_t)v;
+    if (get_int(c ? c : root, "self_demote_gap_ms", &v, 0, false, "cluster")) goto derr;
+    if (v < 0 || v > 60000) {
+        snprintf(err, errlen, "config: cluster.self_demote_gap_ms out of range 0..60000");
+        goto derr;
+    }
+    out->cluster.self_demote_gap_ms = (uint32_t)v;
     const char *q = "majority";
     json_t *qv = c ? json_object_get(c, "quorum") : NULL;
     if (qv && !json_is_string(qv)) {
