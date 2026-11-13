@@ -157,6 +157,7 @@ typedef struct {
     time_t last_hello_sent;
     time_t last_self_orig;
     uint32_t last_orig_hash;
+    time_t start_time; /* for the post-startup LSA grace window */
     hadc_ctx_t *ctx;
     pthread_mutex_t lock; /* guards g_ospf; held across RX/tick/FSM/LSDB/SPF on the
                            * OSPF thread and across the main-loop entry points */
@@ -303,6 +304,65 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
     g_ospf.enabled = ctx->conf.routing.enabled;
     g_ospf.router_id = rid_to_u32(ctx->conf.ospf.router_id);
     g_ospf.lsa_seq = OSPF_INITIAL_SEQ;
+    g_ospf.start_time = time(NULL);
+    /* Startup restore: re-adopt persisted self LSAs exactly (sequence and age
+     * continue); the reconcile grace window then holds them so a daemon
+     * restart never moves the LSDB or the routes learned from it. */
+    if (ctx->persist_ospf_seq)
+        g_ospf.lsa_seq = (uint32_t)ctx->persist_ospf_seq;
+    json_t *saved = (json_t *)ctx->persist_ospf_lsas;
+    if (saved && json_is_array(saved)) {
+        json_t *e;
+        size_t idx;
+        json_array_foreach(saved, idx, e) {
+            if (!json_is_object(e) || g_ospf.n_lsas >= OSPF_MAX_LSAS)
+                break;
+            json_t *jt = json_object_get(e, "type"), *ji = json_object_get(e, "id"),
+                   *js = json_object_get(e, "seq"), *ja = json_object_get(e, "age"),
+                   *jb = json_object_get(e, "body_hex");
+            if (!jt || !ji || !js || !ja || !jb || !json_is_string(jb))
+                continue;
+            const char *hx = json_string_value(jb);
+            size_t blen = strlen(hx) / 2;
+            if (blen > OSPF_MTU)
+                break;
+            ospf_lsa_t *ls = &g_ospf.lsdb[g_ospf.n_lsas];
+            memset(ls, 0, sizeof(*ls));
+            ls->hdr.type = (uint8_t)json_integer_value(jt);
+            ls->hdr.id = htonl((uint32_t)json_integer_value(ji));
+            ls->hdr.seq = htonl((uint32_t)json_integer_value(js));
+            ls->hdr.age = htons((uint16_t)json_integer_value(ja));
+            ls->hdr.options = 0x02; /* E */
+            ls->hdr.adv_router = htonl(g_ospf.router_id);
+            if (blen) {
+                ls->body = malloc(blen);
+                if (!ls->body)
+                    break;
+                for (size_t k = 0; k < blen; k++) {
+                    unsigned b;
+                    if (sscanf(hx + 2 * k, "%2x", &b) != 1) {
+                        free(ls->body);
+                        ls->body = NULL;
+                        blen = 0;
+                        break;
+                    }
+                    ls->body[k] = (uint8_t)b;
+                }
+            }
+            ls->body_len = blen;
+            ls->hdr.length = htons((uint16_t)(sizeof(ospf_lsa_hdr_t) + blen));
+            uint8_t full[OSPF_MTU];
+            memcpy(full, &ls->hdr, sizeof(ls->hdr));
+            if (blen)
+                memcpy(full + sizeof(ls->hdr), ls->body, blen);
+            lsa_checksum(full, sizeof(ls->hdr) + blen);
+            ls->hdr.checksum = (uint16_t)((full[16] << 8) | full[17]);
+            ls->originated = time(NULL) - (time_t)json_integer_value(ja);
+            ls->self = true;
+            ls->valid = true;
+            g_ospf.n_lsas++;
+        }
+    }
     g_ospf.pipe[0] = g_ospf.pipe[1] = -1;
     if (pthread_mutex_init(&g_ospf.lock, NULL) != 0) {
         g_ospf.enabled = false;
@@ -1484,6 +1544,14 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
     if (h == g_ospf.last_orig_hash && !refresh)
         return;
 
+    /* Grace window (startup restore or graceful restart active): hold the LSDB
+     * exactly as restored; no rebuild, no flush of withdrawn self LSAs — a
+     * daemon restart must not move the LSDB or the routes learned from it. */
+    if (ctx && (hadc_cluster_graceful_active(ctx) ||
+                (ctx->conf.ospf.grace_period_s > 0 &&
+                 now - g_ospf.start_time < (time_t)ctx->conf.ospf.grace_period_s)))
+        return;
+
     /* Snapshot current self LSAs to detect withdrawals (flush as MaxAge). */
     ospf_lsa_t old_self[OSPF_MAX_LSAS];
     size_t n_old_self = 0;
@@ -2307,4 +2375,38 @@ void hadc_ospf_lock(void)
 void hadc_ospf_unlock(void)
 {
     pthread_mutex_unlock(&g_ospf.lock);
+}
+
+/* Persist hooks (called by persist.c from the main loop; arr is a json array). */
+void hadc_ospf_collect_self_lsas(void *arr)
+{
+    json_t *a = (json_t *)arr;
+    if (!a || !json_is_array(a))
+        return;
+    pthread_mutex_lock(&g_ospf.lock);
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        if (!g_ospf.lsdb[i].valid || !g_ospf.lsdb[i].self)
+            continue;
+        char hx[2 * OSPF_MTU + 1];
+        size_t n = g_ospf.lsdb[i].body_len;
+        for (size_t k = 0; k < n; k++)
+            sprintf(hx + 2 * k, "%02x", g_ospf.lsdb[i].body[k]);
+        hx[2 * n] = '\0';
+        json_array_append_new(a, json_pack("{s:i, s:i, s:i, s:i, s:s}", "type",
+                                           (json_int_t)g_ospf.lsdb[i].hdr.type, "id",
+                                           (json_int_t)ntohl(g_ospf.lsdb[i].hdr.id), "seq",
+                                           (json_int_t)ntohl(g_ospf.lsdb[i].hdr.seq), "age",
+                                           (json_int_t)ntohs(g_ospf.lsdb[i].hdr.age),
+                                           "body_hex", json_string(hx)));
+    }
+    pthread_mutex_unlock(&g_ospf.lock);
+}
+
+uint64_t hadc_ospf_next_seq(void)
+{
+    uint32_t s;
+    pthread_mutex_lock(&g_ospf.lock);
+    s = g_ospf.lsa_seq;
+    pthread_mutex_unlock(&g_ospf.lock);
+    return (uint64_t)s;
 }

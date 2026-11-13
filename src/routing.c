@@ -483,8 +483,9 @@ void hadc_routing_shutdown(hadc_ctx_t *ctx)
 {
     bool standalone = ctx && ctx->conf.n_members == 0;
 
-    if (standalone) {
-        /* Keep installed routes/addresses in place for single-node setups. */
+    if (standalone || hadc_cluster_graceful_active(ctx)) {
+        /* Keep installed routes/addresses in place for single-node setups and
+         * across graceful restarts; a stop/restart must not delete routes. */
         hadc_ospf_shutdown(ctx);
         snprintf(g_rs.reason, sizeof(g_rs.reason), "shutdown");
         return;

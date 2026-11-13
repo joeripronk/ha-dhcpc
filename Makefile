@@ -41,8 +41,8 @@ test: tests_sha256 tests_persist tests_config tests_lease tests_executor tests_d
 tests_sha256: tests/sha256_test.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/sha256_test.c src/sha256.c $(LDLIBS)
 
-tests_persist: tests/persist_test.c src/persist.c src/log.c src/lease.c
-	$(CC) $(CFLAGS) -o $@ tests/persist_test.c src/persist.c src/log.c src/lease.c $(LDLIBS)
+tests_persist: tests/persist_test.c tests/stubs_routing.c src/persist.c src/log.c src/lease.c
+	$(CC) $(CFLAGS) -o $@ tests/persist_test.c tests/stubs_routing.c src/persist.c src/log.c src/lease.c $(LDLIBS)
 
 tests_config: tests/config_test.c src/config.c src/sha256.c src/log.c
 	$(CC) $(CFLAGS) -o $@ tests/config_test.c src/config.c src/sha256.c src/log.c $(LDLIBS)

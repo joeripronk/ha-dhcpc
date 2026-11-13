@@ -37,6 +37,12 @@ struct hadc_ctx {
     /* graceful cluster restart: wall-clock ms deadline (0 = inactive). */
     uint64_t graceful_restart_until_ms;
 
+    /* Startup restore of self-originated OSPF LSAs (persist load -> OSPF init).
+     * persist_ospf_lsas is a json array [{type,id,seq,age,body_hex}]; NULL if
+     * none. persist_ospf_seq is the next self-LSA sequence (0 = fresh). */
+    void *persist_ospf_lsas;
+    uint64_t persist_ospf_seq;
+
     /* ctl newip: force a fresh DISCOVER and, on success, optionally abort TCP
      * connections that were using the previous lease address. */
     bool newip_pending;
@@ -65,6 +71,11 @@ bool executor_action_is_fatal(int action_rc, bool action_is_fatal);
 void hadc_gwping_start(hadc_ctx_t *ctx);
 void hadc_gwping_stop(hadc_ctx_t *ctx);
 void hadc_gwping_tick(hadc_ctx_t *ctx);
+
+/* OSPF self-LSA persistence hooks (implemented in ospf.c, called by persist.c;
+ * arr is a jansson json_t* array, void* to keep this header dependency-free). */
+void hadc_ospf_collect_self_lsas(void *arr);
+uint64_t hadc_ospf_next_seq(void);
 /* last reported verdict: failover threshold reached and not yet recovered */
 bool hadc_gwping_unreachable(void);
 

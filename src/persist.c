@@ -116,6 +116,12 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         out->acked_version = (uint64_t)json_integer_value(v);
     if ((v = json_object_get(root, "graceful_restart_until_ms")) && json_is_integer(v))
         out->graceful_restart_until_ms = (uint64_t)json_integer_value(v);
+    if ((v = json_object_get(root, "ospf_seq")) && json_is_integer(v))
+        out->ospf_seq = (uint64_t)json_integer_value(v);
+    v = json_object_get(root, "ospf_self_lsas");
+    if (v && json_is_array(v)) {
+        out->ospf_lsas = (void *)json_incref(v); /* owned by the view */
+    }
 
     json_t *lj = json_object_get(root, "lease");
     if (lj && json_is_object(lj)) {
@@ -229,6 +235,15 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     if (!o) {
         json_decref(lj);
         return -1;
+    }
+    /* Self-originated OSPF LSAs: persisted so a restart re-adopts the exact
+     * same LSDB entries (sequence continues, content identical) and the LSDB
+     * never moves; see ospf.c. */
+    {
+        json_t *arr = json_array();
+        hadc_ospf_collect_self_lsas(arr);
+        json_object_set_new(o, "ospf_self_lsas", arr);
+        json_object_set_new(o, "ospf_seq", json_integer((json_int_t)hadc_ospf_next_seq()));
     }
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);

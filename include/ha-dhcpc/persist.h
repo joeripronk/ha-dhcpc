@@ -21,6 +21,8 @@ typedef struct {
     uint64_t acked_version;
     hadc_lease_t lease;          /* last known good (monotonic remainders) */
     uint64_t graceful_restart_until_ms;
+    uint64_t ospf_seq;               /* persisted next self-LSA sequence */
+    void *ospf_lsas;                 /* json_t* array of self LSAs, owned; NULL if none */
 } hadc_persist_view_t;
 
 int hadc_persist_init(hadc_ctx_t *ctx, const char *path);

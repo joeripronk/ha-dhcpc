@@ -588,6 +588,8 @@ int main(int argc, char **argv)
         ctx->lease.version = pv.lease_version;
         ctx->acked_version = pv.acked_version;
         ctx->graceful_restart_until_ms = pv.graceful_restart_until_ms;
+        ctx->persist_ospf_lsas = pv.ospf_lsas; /* ownership moves to ctx/ospf */
+        ctx->persist_ospf_seq = pv.ospf_seq;
         char a[64], nm[64], gw[64];
         inet_ntop(AF_INET, &ctx->lease.address, a, sizeof(a));
         inet_ntop(AF_INET, &ctx->lease.netmask, nm, sizeof(nm));

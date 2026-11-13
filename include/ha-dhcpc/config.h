@@ -121,6 +121,8 @@ typedef struct {
         char interfaces[HADC_CLUSTER_IF_MAX][HADC_IFNAME_MAX];
         size_t n_interfaces;
         char router_id[INET_ADDRSTRLEN]; /* 0/empty = self cluster/sync address */
+        int grace_period_s; /* hold self LSAs (no rebuild/flush) this long after
+                             * startup; 0 = today's behavior */
         struct {
             int type; /* 0 none, 1 plaintext, 2 md5 */
             char key[128];

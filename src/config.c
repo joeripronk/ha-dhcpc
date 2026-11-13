@@ -916,6 +916,19 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 snprintf(err, errlen, "config: ospf.interfaces must be a list or string");
                 goto derr;
             }
+            json_t *gp = json_object_get(o, "grace_period_s");
+            if (gp && !json_is_null(gp)) {
+                if (!json_is_integer(gp)) {
+                    snprintf(err, errlen, "config: ospf.grace_period_s must be an integer");
+                    goto derr;
+                }
+                json_int_t v = json_integer_value(gp);
+                if (v < 0 || v > 86400) {
+                    snprintf(err, errlen, "config: ospf.grace_period_s out of range");
+                    goto derr;
+                }
+                out->ospf.grace_period_s = (int)v;
+            }
             json_t *au = json_object_get(o, "auth");
             if (au && !json_is_null(au)) {
                 if (!json_is_object(au)) {
