@@ -9,6 +9,7 @@
 #include "ha-dhcpc/types.h"
 
 #include <linux/limits.h>
+#include <pthread.h>
 
 struct hadc_ctx {
     hadc_conf_t conf; /* effective merged config: shared doc + local overlay */
@@ -40,6 +41,15 @@ struct hadc_ctx {
      * connections that were using the previous lease address. */
     bool newip_pending;
     struct in_addr newip_old_addr;
+
+    /* Heartbeat thread: the send cadence runs here so it is never blocked by
+     * main-loop work (executor/OSPF/persist); the self-monitor watchdog measures
+     * a real process stall, not loop contention. Guards the fields the thread
+     * reads (role, lease.version, graceful_restart_until_ms). */
+    pthread_mutex_t hb_lock;
+    pthread_t hb_thread;
+    bool hb_thread_started;
+    int hb_selfpipe[2]; /* [0] read by main loop, [1] written by thread */
 };
 
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */

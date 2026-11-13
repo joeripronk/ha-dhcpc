@@ -13,6 +13,7 @@
 #include <linux/sock_diag.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,6 +95,12 @@ static void heartbeat_ready(hadc_ctx_t *ctx, int fd)
     uint64_t exp;
     (void)!read(fd, &exp, sizeof(exp));
     heartbeat_fire(ctx);
+}
+
+static void hb_selfpipe_ready(hadc_ctx_t *ctx, int fd)
+{
+    (void)fd;
+    hadc_cluster_selfpipe_ready(ctx);
 }
 
 static void periodic_ready(hadc_ctx_t *ctx, int fd)
@@ -602,6 +609,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (pthread_mutex_init(&ctx->hb_lock, NULL) != 0) {
+        hadc_err("pthread_mutex_init: %s", strerror(errno));
+        return 1;
+    }
+    if (ctx->conf.n_members != 0 && pipe2(ctx->hb_selfpipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        hadc_err("pipe2: %s", strerror(errno));
+        return 1;
+    }
+
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
@@ -697,6 +713,12 @@ int main(int argc, char **argv)
                   "(priority %d), ctl promote/demote still override)",
                   ctx->conf.cluster.heartbeat_ms, (unsigned)ctx->conf.cluster.port,
                   ctx->conf.priority);
+    if (ctx->conf.n_members != 0) {
+        hadc_loop_add(ctx, ctx->hb_selfpipe[0], hb_selfpipe_ready, 0);
+        if (hadc_cluster_hb_start(ctx) != 0)
+            hadc_err("heartbeat thread: pthread_create failed (watchdog disabled)");
+    }
+
     struct epoll_event evs[MAX_FDS];
     while (ctx->running) {
         int n = epoll_wait(ctx->epfd, evs, MAX_FDS, 1000);

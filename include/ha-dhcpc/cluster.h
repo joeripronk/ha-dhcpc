@@ -116,6 +116,13 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx);
 int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id);
 int hadc_cluster_demote(hadc_ctx_t *ctx);
 
+/* Heartbeat send cadence + self-monitor watchdog run on a dedicated thread (see
+ * cluster.c). hb_start spawns it once transport is up; selfpipe_ready drains the
+ * thread->main-loop wakeup and performs the requested demote on the main loop
+ * (the thread never mutates shared state). */
+int hadc_cluster_hb_start(hadc_ctx_t *ctx);
+void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx);
+
 /* Graceful handoff for shutdown: hands the master role to the best live peer
  * when one exists and returns 1; returns 0 (and leaves service intact) when
  * there is no live peer, so a lone/partitioned master does not withdraw. */

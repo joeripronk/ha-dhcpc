@@ -11,6 +11,7 @@
 #include <jansson.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -26,6 +27,12 @@
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/reload.h"
 #include "internal.h"
+
+/* Guards the fields the heartbeat thread reads (role, lease.version,
+ * graceful_restart_until_ms). Keep critical sections tight: lock only the field
+ * write/read, never across a call that itself locks. */
+#define HB_LOCK(ctx)   pthread_mutex_lock(&(ctx)->hb_lock)
+#define HB_UNLOCK(ctx) pthread_mutex_unlock(&(ctx)->hb_lock)
 
 static hadc_ctx_t *g_ctx;
 
@@ -82,7 +89,9 @@ bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
     uint64_t now = realtime_ms();
     if (now >= ctx->graceful_restart_until_ms) {
         /* expired: clear lazily */
+        HB_LOCK(ctx);
         ctx->graceful_restart_until_ms = 0;
+        HB_UNLOCK(ctx);
         return false;
     }
     return true;
@@ -119,7 +128,9 @@ static void graceful_adopt(hadc_ctx_t *ctx, uint64_t until_ms, const char *from)
     if (until_ms == ctx->graceful_restart_until_ms)
         return;
     /* adopt announced state (enable or cancel/expiry) */
+    HB_LOCK(ctx);
     ctx->graceful_restart_until_ms = until_ms;
+    HB_UNLOCK(ctx);
     if (until_ms == 0)
         hadc_info("cluster: graceful restart cancelled (from %s)", from ? from : "?");
     else
@@ -135,7 +146,9 @@ int hadc_cluster_set_graceful_restart(hadc_ctx_t *ctx, bool enable)
         until = realtime_ms() + HADC_GRACEFUL_WINDOW_MS;
     if (until == ctx->graceful_restart_until_ms && enable == hadc_cluster_graceful_active(ctx))
         return 0;
+    HB_LOCK(ctx);
     ctx->graceful_restart_until_ms = until;
+    HB_UNLOCK(ctx);
     if (enable)
         hadc_info("cluster: graceful restart enabled for %llu ms (no master switches)",
                   (unsigned long long)HADC_GRACEFUL_WINDOW_MS);
@@ -260,10 +273,15 @@ static void send_heartbeats_now(hadc_ctx_t *ctx);
 
 static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
 {
-    hadc_role_t old_role = ctx->role;
-    if (old_role == new_role)
+    hadc_role_t old_role;
+    HB_LOCK(ctx);
+    old_role = ctx->role;
+    if (old_role == new_role) {
+        HB_UNLOCK(ctx);
         return;
+    }
     ctx->role = new_role;
+    HB_UNLOCK(ctx);
     if (g_role_hook != NULL)
         g_role_hook(g_role_hook_arg, old_role, new_role);
     send_heartbeats_now(ctx);
@@ -306,6 +324,108 @@ static void send_heartbeats_now(hadc_ctx_t *ctx)
             hadc_warn("cluster: send heartbeat to %s failed", m->id);
     }
 }
+
+/* Heartbeat send cadence + self-monitor watchdog, on its own thread so its
+ * cadence is never blocked by main-loop work (executor/OSPF/persist/netlink).
+ * The wire packet is built from a lock-protected snapshot; send and watchdog run
+ * outside the lock. The thread never mutates shared state: a genuine stall
+ * (send gap past heartbeat_ms + gap_ms) is handed to the main loop via the
+ * self-pipe, which performs the demote. A lone-master/standalone node has nobody
+ * to hand to, so it runs no cadence here. */
+static void *hb_thread_main(void *arg)
+{
+    hadc_ctx_t *ctx = arg;
+    uint32_t cadence_ms = ctx->conf.cluster.heartbeat_ms;
+    uint32_t gap_ms = ctx->conf.cluster.self_demote_gap_ms;
+    uint64_t last_send_ms = 0;
+
+    for (;;) {
+        struct timespec nap = { .tv_sec = cadence_ms / 1000,
+                                .tv_nsec = (long)(cadence_ms % 1000) * 1000000 };
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &nap, NULL);
+
+        uint8_t role, master_idx, self_idx;
+        uint64_t lease_version;
+        bool graceful;
+        pthread_mutex_lock(&ctx->hb_lock);
+        role = (uint8_t)ctx->role;
+        lease_version = ctx->lease.version;
+        master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
+        self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
+        graceful = (ctx->graceful_restart_until_ms != 0 &&
+                    realtime_ms() < ctx->graceful_restart_until_ms);
+        pthread_mutex_unlock(&ctx->hb_lock);
+
+        uint8_t hb[HADC_WIRE_HB_LEN];
+        memset(hb, 0, sizeof(hb));
+        hb[1] = self_idx;
+        hb[2] = master_idx;
+        hb[3] = role;
+        put_be(hb + 4, lease_version, 8);
+        put_be(hb + 12, (uint64_t)realtime_ms() & 0xffffffffu, 4);
+
+        uint64_t now_ms = (uint64_t)realtime_ms();
+        for (size_t i = 0; i < ctx->conf.n_members; i++) {
+            const hadc_member_t *m = &ctx->conf.members[i];
+            if (!strcmp(m->id, ctx->conf.self))
+                continue;
+            struct sockaddr_in to = { .sin_family = AF_INET,
+                                      .sin_port = htons(ctx->conf.cluster.port),
+                                      .sin_addr = m->sync_address };
+            send_bytes(ctx, &to, hb, sizeof(hb));
+        }
+
+        if (gap_ms == 0) { /* watchdog off */
+            last_send_ms = now_ms;
+            continue;
+        }
+        uint64_t threshold_ms = (uint64_t)cadence_ms + gap_ms;
+        if (last_send_ms != 0 && role == (uint8_t)HADC_ROLE_MASTER &&
+            ctx->conf.n_members >= 2 && !graceful &&
+            now_ms - last_send_ms > threshold_ms) {
+            hadc_warn("cluster: master heartbeat send %llu ms late (> heartbeat %u ms + "
+                      "gap %u ms): real process stall, requesting demote",
+                      (unsigned long long)(now_ms - last_send_ms), cadence_ms, gap_ms);
+            char wake = 1;
+            (void)!write(ctx->hb_selfpipe[1], &wake, 1);
+        }
+        last_send_ms = now_ms;
+    }
+}
+
+/* Drain the self-pipe and perform the demote the heartbeat thread requested. The
+ * main loop owns all role mutation, so the action runs here, not on the thread.
+ * Re-checks the guard against the live state before demoting. */
+void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx)
+{
+    char buf[64];
+    while (read(ctx->hb_selfpipe[0], buf, sizeof(buf)) > 0)
+        ;
+    pthread_mutex_lock(&ctx->hb_lock);
+    bool gactive = (ctx->graceful_restart_until_ms != 0 &&
+                    realtime_ms() < ctx->graceful_restart_until_ms);
+    bool fire = (ctx->role == HADC_ROLE_MASTER && ctx->conf.n_members >= 2 && !gactive);
+    pthread_mutex_unlock(&ctx->hb_lock);
+    if (fire) {
+        hadc_info("cluster: self-monitor requested demote (main loop)");
+        hadc_cluster_demote(ctx);
+    }
+}
+
+int hadc_cluster_hb_start(hadc_ctx_t *ctx)
+{
+    if (ctx->conf.n_members == 0)
+        return 0; /* standalone: no cadence */
+    if (ctx->conf.cluster.heartbeat_ms == 0)
+        return 0;
+    if (ctx->udp_fd < 0)
+        return -1;
+    if (pthread_create(&ctx->hb_thread, NULL, hb_thread_main, ctx) != 0)
+        return -1;
+    ctx->hb_thread_started = true;
+    return 0;
+}
+
 
 static const hadc_member_t *member_by_id(hadc_ctx_t *ctx, const char *id)
 {
@@ -680,8 +800,10 @@ static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_f
     hadc_desired_t desired;
     const hadc_member_t *master = member_by_id(ctx, msg->origin);
 
+    HB_LOCK(ctx);
     ctx->lease = msg->lease;
     ctx->lease.version = msg->lease_version;
+    HB_UNLOCK(ctx);
     if (msg->ts_ms != 0) {
         uint64_t now_ms = realtime_ms();
         long long elapsed_s = now_ms > msg->ts_ms ? (long long)((now_ms - msg->ts_ms) / 1000) : 0;
@@ -1215,54 +1337,9 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
         return;
     }
 
-    for (size_t i = 0; i < ctx->conf.n_members; i++) {
-        const hadc_member_t *m = &ctx->conf.members[i];
-        uint8_t hb[HADC_WIRE_HB_LEN];
-        if (!strcmp(m->id, ctx->conf.self))
-            continue;
-        build_bin_heartbeat(ctx, hb);
-        struct sockaddr_in to = { .sin_family = AF_INET,
-                                   .sin_port = htons(ctx->conf.cluster.port),
-                                   .sin_addr = m->sync_address };
-        if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
-            hadc_warn("cluster: send heartbeat to %s failed", m->id);
-    }
-
-    /* Self-monitor (P0-3): a master whose own event loop stalled could not send
-     * heartbeats for a full election deadline, which is exactly when its peers
-     * would (or already have) declared it dead. Step down gracefully — hand the
-     * role to the best live peer — instead of letting a peer steal it in a
-     * contested election. The tick cadence is heartbeat_ms, so a gap past the
-     * deadline means several beats were missed, not normal jitter. Only in a real
-     * cluster (>=1 peer); a lone master has nobody to hand to, and a graceful
-     * restart must not be interrupted. */
-    {
-        static uint64_t last_hb_ms;
-        uint64_t now_ms = (uint64_t)hadc_now_ms();
-        uint32_t gap_ms = ctx->conf.cluster.self_demote_gap_ms;
-        uint64_t threshold_ms;
-
-        if (gap_ms == 0) {           /* 0 = off */
-            last_hb_ms = now_ms;
-        } else {
-            /* Threshold is heartbeat_ms + gap_ms so the margin is always measured
-             * above the normal tick cadence: a small gap can't fire on a healthy
-             * tick, and the setting cannot be misconfigured below the cadence. */
-            threshold_ms = (uint64_t)ctx->conf.cluster.heartbeat_ms + gap_ms;
-            if (last_hb_ms != 0 && ctx->role == HADC_ROLE_MASTER &&
-                ctx->conf.n_members >= 2 && !hadc_cluster_graceful_active(ctx) &&
-                now_ms - last_hb_ms > threshold_ms) {
-                hadc_warn("cluster: master heartbeat tick %llu ms late (> heartbeat %u ms + "
-                          "gap %u ms): self-demoting", (unsigned long long)(now_ms - last_hb_ms),
-                          ctx->conf.cluster.heartbeat_ms, gap_ms);
-                last_hb_ms = now_ms;
-                hadc_cluster_demote(ctx);
-                return;
-            }
-            last_hb_ms = now_ms;
-        }
-    }
-
+    /* The heartbeat send cadence and the self-monitor watchdog run on their own
+     * thread (hb_thread_main), so they are never blocked by this loop's work.
+     * Here we only do the main-loop maintenance that mutates shared state. */
     age_peers(ctx);
     failover_check(ctx);
     if (ctx->conf.cluster.preempt)

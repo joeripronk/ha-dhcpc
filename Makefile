@@ -13,7 +13,7 @@ endif
 SYSROOT_FLAGS := $(if $(SYSROOT),--sysroot=$(SYSROOT))
 PKGENV := $(if $(SYSROOT),PKG_CONFIG_SYSROOT_DIR=$(SYSROOT) PKG_CONFIG_PATH=$(SYSROOT)/usr/lib/pkgconfig)
 PKG_CONFIG ?= pkg-config
-override CFLAGS += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -O2 -g -Iinclude -Isrc -Isrc/dhcp -MMD -MP $(SYSROOT_FLAGS) $(shell $(PKGENV) $(PKG_CONFIG) --cflags $(PKG))
+override CFLAGS += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -O2 -g -pthread -Iinclude -Isrc -Isrc/dhcp -MMD -MP $(SYSROOT_FLAGS) $(shell $(PKGENV) $(PKG_CONFIG) --cflags $(PKG))
 override LDLIBS += $(shell $(PKGENV) $(PKG_CONFIG) --libs $(PKG)) $(LDFLAGS)
 
 SRCS := $(wildcard src/*.c) $(wildcard src/dhcp/*.c)
