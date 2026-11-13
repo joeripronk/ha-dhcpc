@@ -9,11 +9,14 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/log.h"
@@ -155,9 +158,24 @@ typedef struct {
     time_t last_self_orig;
     uint32_t last_orig_hash;
     hadc_ctx_t *ctx;
+    pthread_mutex_t lock; /* guards g_ospf; held across RX/tick/FSM/LSDB/SPF on the
+                           * OSPF thread and across the main-loop entry points */
+    pthread_t thread;
+    bool thread_started;
+    int pipe[2]; /* [0] read by the poll loop, [1] written by shutdown to wake it */
+    volatile sig_atomic_t stop; /* set by shutdown to end the poll loop */
 } ospf_state_t;
 
 static ospf_state_t g_ospf;
+
+/* Guards g_ospf. The OSPF thread holds it across RX/tick/FSM/LSDB/SPF; the
+ * main-loop entry points (originate/default_candidates/learned_routes/status/
+ * shutdown) hold it across their critical sections. Keep critical sections tight
+ * and never lock across a call that itself locks. */
+#define OSPF_LOCK()   pthread_mutex_lock(&g_ospf.lock)
+#define OSPF_UNLOCK() pthread_mutex_unlock(&g_ospf.lock)
+
+#define OSPF_TICK_MS 1000 /* poll timeout == the tick cadence the main loop used */
 
 static uint16_t ip_checksum(const void *data, size_t len)
 {
@@ -221,7 +239,9 @@ static void u32_to_rid(uint32_t v, char *out, size_t outlen)
     inet_ntop(AF_INET, &a, out, outlen);
 }
 
-static void ospf_fd_ready(hadc_ctx_t *ctx, int fd);
+static void ospf_drain_rx_locked(void);
+static void ospf_tick_locked(void);
+static void *ospf_thread_main(void *arg);
 
 static void refresh_ifaces(hadc_ctx_t *ctx)
 {
@@ -283,6 +303,11 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
     g_ospf.enabled = ctx->conf.routing.enabled;
     g_ospf.router_id = rid_to_u32(ctx->conf.ospf.router_id);
     g_ospf.lsa_seq = OSPF_INITIAL_SEQ;
+    g_ospf.pipe[0] = g_ospf.pipe[1] = -1;
+    if (pthread_mutex_init(&g_ospf.lock, NULL) != 0) {
+        g_ospf.enabled = false;
+        return 0;
+    }
     if (!g_ospf.enabled)
         return 0;
 
@@ -308,8 +333,9 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
                   inet_ntoa(g_ospf.ifaces[i].addr), ctx->conf.ospf.router_id);
     }
 
-    if (hadc_loop_add(ctx, g_ospf.fd, ospf_fd_ready, 0) != 0) {
-        hadc_warn("ospf: failed to register socket in event loop");
+    if (pipe2(g_ospf.pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        hadc_warn("ospf: pipe2 failed: %s", strerror(errno));
+        g_ospf.pipe[0] = g_ospf.pipe[1] = -1;
     }
 
     if (ctx->conf.ospf.auth.type == 2)
@@ -322,18 +348,38 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
 
 void hadc_ospf_shutdown(hadc_ctx_t *ctx)
 {
+    (void)ctx;
+    /* Stop the OSPF thread (set stop, wake its poll, join) before freeing state.
+     * The mutex is left intact so a later init/spawn cycle stays valid. */
+    if (g_ospf.thread_started) {
+        g_ospf.stop = 1;
+        if (g_ospf.pipe[1] >= 0) {
+            char w = 1;
+            ssize_t ignored = write(g_ospf.pipe[1], &w, 1);
+            (void)ignored;
+        }
+        pthread_join(g_ospf.thread, NULL);
+        g_ospf.thread_started = false;
+    }
+    /* Thread joined: sole writer, no lock needed. */
     if (g_ospf.fd >= 0) {
-        hadc_loop_del(ctx, g_ospf.fd);
         close(g_ospf.fd);
         g_ospf.fd = -1;
+    }
+    if (g_ospf.pipe[0] >= 0) {
+        close(g_ospf.pipe[0]);
+        close(g_ospf.pipe[1]);
+        g_ospf.pipe[0] = g_ospf.pipe[1] = -1;
     }
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
         free(g_ospf.lsdb[i].body);
         g_ospf.lsdb[i].body = NULL;
     }
+    pthread_mutex_destroy(&g_ospf.lock);
     memset(&g_ospf, 0, sizeof(g_ospf));
     g_ospf.fd = -1;
-    (void)ctx;
+    g_ospf.pipe[0] = g_ospf.pipe[1] = -1;
+    pthread_mutex_init(&g_ospf.lock, NULL);
 }
 
 /* ---- packet helpers ---- */
@@ -1317,14 +1363,13 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
     flood_self_lsas_to_neighbor(n);
 }
 
-static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
+static void ospf_drain_rx_locked(void)
 {
-    (void)ctx;
     uint8_t buf[2048];
     for (;;) {
         struct sockaddr_in src;
         socklen_t slen = sizeof(src);
-        ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &slen);
+        ssize_t n = recvfrom(g_ospf.fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &slen);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 break;
@@ -1346,7 +1391,7 @@ static void ospf_fd_ready(hadc_ctx_t *ctx, int fd)
             continue;
         if (ntohl(h->area_id) != OSPF_AREA_BACKBONE)
             continue;
-        if (!verify_auth(h, ctx)) {
+        if (!verify_auth(h, g_ospf.ctx)) {
             hadc_dbg("ospf: auth mismatch from %s, dropping", inet_ntoa(src.sin_addr));
             continue;
         }
@@ -1419,10 +1464,10 @@ static uint32_t orig_hash(bool want_pub, struct in_addr pub, bool want_def, hadc
 }
 
 
-void hadc_ospf_originate(hadc_ctx_t *ctx,
-                         const struct in_addr *public_ip32, bool want_pub,
-                         bool want_default_route,
-                         const void *vip_prefixes, size_t vip_prefix_count)
+static void ospf_originate_locked(hadc_ctx_t *ctx,
+                                  const struct in_addr *public_ip32, bool want_pub,
+                                  bool want_default_route,
+                                  const void *vip_prefixes, size_t vip_prefix_count)
 {
     (void)vip_prefixes; (void)vip_prefix_count;
     if (!g_ospf.enabled)
@@ -1627,11 +1672,23 @@ void hadc_ospf_originate(hadc_ctx_t *ctx,
     }
 }
 
-void hadc_ospf_tick(hadc_ctx_t *ctx)
+void hadc_ospf_originate(hadc_ctx_t *ctx,
+                         const struct in_addr *public_ip32, bool want_pub,
+                         bool want_default_route,
+                         const void *vip_prefixes, size_t vip_prefix_count)
 {
+    OSPF_LOCK();
+    g_ospf.ctx = ctx;
+    ospf_originate_locked(ctx, public_ip32, want_pub, want_default_route,
+                          vip_prefixes, vip_prefix_count);
+    OSPF_UNLOCK();
+}
+
+static void ospf_tick_locked(void)
+{
+    hadc_ctx_t *ctx = g_ospf.ctx;
     if (!g_ospf.enabled || g_ospf.fd < 0)
         return;
-    g_ospf.ctx = ctx;
     refresh_ifaces(ctx);
     expire_neighbors();
 
@@ -1735,7 +1792,13 @@ void hadc_ospf_tick(hadc_ctx_t *ctx)
     }
 }
 
-
+void hadc_ospf_tick(hadc_ctx_t *ctx)
+{
+    OSPF_LOCK();
+    g_ospf.ctx = ctx;
+    ospf_tick_locked();
+    OSPF_UNLOCK();
+}
 
 
 static struct in_addr nbr_nexthop_for(uint32_t adv_router)
@@ -1885,7 +1948,7 @@ static bool spf_nexthop_to_router(uint32_t dest_rid, struct in_addr *out_nh)
 }
 
 
-size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max)
+static size_t ospf_default_candidates_locked(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max)
 {
     size_t n = 0;
     if (!g_ospf.enabled || !out || max == 0)
@@ -1944,6 +2007,15 @@ size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candid
     }
     return n;
 }
+
+size_t hadc_ospf_default_candidates(hadc_ctx_t *ctx, hadc_routing_default_candidate_t *out, size_t max)
+{
+    OSPF_LOCK();
+    size_t r = ospf_default_candidates_locked(ctx, out, max);
+    OSPF_UNLOCK();
+    return r;
+}
+
 static bool is_self_originated_prefix(struct in_addr pfx, struct in_addr mask)
 {
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
@@ -1974,7 +2046,7 @@ static bool is_self_originated_prefix(struct in_addr pfx, struct in_addr mask)
     return false;
 }
 
-size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max)
+static size_t ospf_learned_routes_locked(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max)
 {
     (void)ctx;
     size_t n = 0;
@@ -2055,6 +2127,14 @@ size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out,
     return n;
 }
 
+size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max)
+{
+    OSPF_LOCK();
+    size_t r = ospf_learned_routes_locked(ctx, out, max);
+    OSPF_UNLOCK();
+    return r;
+}
+
 
 static void append_learned_prefix(json_t *arr, struct in_addr pfx, struct in_addr mask,
                                   const char *origin, const char *nexthop, const char *source, uint8_t lsa_type)
@@ -2072,7 +2152,7 @@ static void append_learned_prefix(json_t *arr, struct in_addr pfx, struct in_add
                                          "lsa_type", (int)lsa_type));
 }
 
-json_t *hadc_ospf_status(hadc_ctx_t *ctx)
+static json_t *ospf_status_locked(hadc_ctx_t *ctx)
 {
     (void)ctx;
     json_t *nbrs = json_array();
@@ -2151,4 +2231,78 @@ json_t *hadc_ospf_status(hadc_ctx_t *ctx)
                      "lsdb_total", self_lsas + other_lsas,
                      "neighbor_list", nbrs,
                      "learned_prefixes", learned);
+}
+
+json_t *hadc_ospf_status(hadc_ctx_t *ctx)
+{
+    OSPF_LOCK();
+    json_t *r = ospf_status_locked(ctx);
+    OSPF_UNLOCK();
+    return r;
+}
+
+/* OSPF thread: owns the raw socket fd and the protocol cadence (RX processing,
+ * hello send, neighbor FSM/LSDB/SPF) so a stall is a real process-wide stop, not
+ * main-loop contention. poll() wakes promptly on RX and on the shutdown pipe; the
+ * 1 s timeout preserves the old tick cadence. RX/tick run under the g_ospf lock;
+ * the lock is not held across poll(). */
+static void *ospf_thread_main(void *arg)
+{
+    (void)arg;
+    while (!g_ospf.stop) {
+        struct pollfd pfd[2];
+        nfds_t nfd = 0;
+        pfd[nfd].fd = g_ospf.fd;
+        pfd[nfd].events = POLLIN;
+        pfd[nfd].revents = 0;
+        nfd++;
+        if (g_ospf.pipe[0] >= 0) {
+            pfd[nfd].fd = g_ospf.pipe[0];
+            pfd[nfd].events = POLLIN;
+            pfd[nfd].revents = 0;
+            nfd++;
+        }
+        int r = poll(pfd, nfd, OSPF_TICK_MS);
+        if (g_ospf.stop)
+            break;
+        OSPF_LOCK();
+        if (r > 0) {
+            for (nfds_t i = 0; i < nfd; i++) {
+                if (!(pfd[i].revents & POLLIN))
+                    continue;
+                if (pfd[i].fd == g_ospf.fd) {
+                    ospf_drain_rx_locked();
+                } else { /* wake-up pipe: drain it, no packets to process */
+                    char b;
+                    while (read(pfd[i].fd, &b, 1) == 1) {}
+                }
+            }
+        }
+        ospf_tick_locked();
+        OSPF_UNLOCK();
+    }
+    return NULL;
+}
+
+int hadc_ospf_spawn(hadc_ctx_t *ctx)
+{
+    g_ospf.ctx = ctx;
+    if (!g_ospf.enabled || g_ospf.fd < 0 || g_ospf.thread_started)
+        return 0;
+    if (pthread_create(&g_ospf.thread, NULL, ospf_thread_main, NULL) != 0) {
+        hadc_warn("ospf: pthread_create failed (OSPF thread disabled)");
+        return -1;
+    }
+    g_ospf.thread_started = true;
+    return 0;
+}
+
+void hadc_ospf_lock(void)
+{
+    pthread_mutex_lock(&g_ospf.lock);
+}
+
+void hadc_ospf_unlock(void)
+{
+    pthread_mutex_unlock(&g_ospf.lock);
 }

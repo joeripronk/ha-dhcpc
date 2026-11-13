@@ -608,7 +608,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 
     backend_apply(ctx, want_pub, want_def, prev_bgw, g_rs.reason);
     hadc_ospf_originate(ctx, &g_rs.public_ip32, want_pub, want_def, NULL, 0);
-    hadc_ospf_tick(ctx);
+    /* tick (hello/FSM/LSDB/SPF) runs on the OSPF thread, not the main loop */
     g_rs.n_remote_cands = hadc_ospf_default_candidates(ctx, g_rs.remote_cands, HADC_ROUTING_MAX_CANDIDATES);
     if (prev_bgw.s_addr != g_rs.backup_gw.s_addr) {
         char oldgw[INET_ADDRSTRLEN] = "0.0.0.0", cur[INET_ADDRSTRLEN] = "0.0.0.0";

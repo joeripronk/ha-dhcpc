@@ -28,6 +28,7 @@
 #include "ha-dhcpc/reload.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
+#include "ospf.h"
 
 static const struct in_addr *self_sync(hadc_ctx_t *ctx)
 {
@@ -150,7 +151,9 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
                   ctx->conf.seed_master[0] ? ctx->conf.seed_master : "(none)",
                   next.seed_master[0] ? next.seed_master : "(none)");
 
+    hadc_ospf_lock(); /* the OSPF thread reads conf.ospf.* every tick/packet */
     ctx->conf = next;
+    hadc_ospf_unlock();
     hadc_log_set_level(ctx->conf.loglevel);
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);
 

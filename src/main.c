@@ -34,6 +34,7 @@
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
+#include "ospf.h"
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -639,6 +640,7 @@ int main(int argc, char **argv)
     hadc_executor_monitor_start(ctx); /* drift self-heal: re-apply when managed
                                        * resources change underneath us */
     hadc_routing_init(ctx);
+    hadc_ospf_spawn(ctx); /* OSPF RX + tick/FSM/SPF run on their own thread */
     hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
 
     /* Startup desired-state pass from the restored cache: apply the interface
