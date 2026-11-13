@@ -151,8 +151,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
                   ctx->conf.seed_master[0] ? ctx->conf.seed_master : "(none)",
                   next.seed_master[0] ? next.seed_master : "(none)");
 
-    hadc_ospf_lock(); /* the OSPF thread reads conf.ospf.* every tick/packet */
+    hadc_ospf_lock();    /* the OSPF thread reads conf.ospf.* every tick/packet */
+    hadc_cluster_lock(); /* the heartbeat thread snapshots conf every tick     */
     ctx->conf = next;
+    hadc_cluster_unlock();
     hadc_ospf_unlock();
     hadc_log_set_level(ctx->conf.loglevel);
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);

@@ -122,6 +122,8 @@ int hadc_cluster_demote(hadc_ctx_t *ctx);
  * (the thread never mutates shared state). */
 int hadc_cluster_hb_start(hadc_ctx_t *ctx);
 void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx);
+void hadc_cluster_lock(void);   /* guards the fields the heartbeat thread touches */
+void hadc_cluster_unlock(void);
 
 /* Graceful handoff for shutdown: hands the master role to the best live peer
  * when one exists and returns 1; returns 0 (and leaves service intact) when

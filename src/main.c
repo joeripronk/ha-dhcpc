@@ -321,8 +321,10 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         bool pending = ctx->newip_pending;
         bool retention = ctx->lease.retention_active;
 
+        hadc_cluster_lock();
         ctx->lease = *lease;
         ctx->lease.retention_active = retention;
+        hadc_cluster_unlock();
         hadc_info("lease update v%llu state=%s addr=%s t1=%us t3=%us",
                   (unsigned long long)ctx->lease.version,
                   hadc_lease_state_name(ctx->lease.state),
@@ -352,7 +354,9 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         return;
     } else {
         hadc_warn("lease gone (EXPIRE/FAIL); no desired state");
+        hadc_cluster_lock();
         memset(&ctx->lease, 0, sizeof(ctx->lease));
+        hadc_cluster_unlock();
         if (ctx->newip_pending) {
             ctx->newip_pending = false;
             ctx->newip_old_addr.s_addr = 0;
@@ -378,11 +382,13 @@ static void cb_retention(void *arg, bool entered)
     hadc_desired_t desired;
 
     hadc_info("retention %s (plan §5)", entered ? "enter" : "exit");
+    hadc_cluster_lock();
     ctx->lease.retention_active = entered;
     if (entered)
         ctx->lease.state = HADC_LEASE_RETAINED;
     else if (ctx->lease.state == HADC_LEASE_RETAINED)
         ctx->lease.state = HADC_LEASE_BOUND;
+    hadc_cluster_unlock();
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, entered ? "RETAINED-ENTER" : "RETAINED-EXIT");
     hadc_routing_reconcile(ctx, entered ? "retention-enter" : "retention-exit");
@@ -577,6 +583,7 @@ int main(int argc, char **argv)
         else if (pv.master_id[0])
             snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master),
                      "%.*s", (int)sizeof(ctx->conf.designated_master) - 1, pv.master_id);
+        /* startup restore: runs before the heartbeat thread spawns, no lock needed */
         ctx->lease = pv.lease;
         ctx->lease.version = pv.lease_version;
         ctx->acked_version = pv.acked_version;

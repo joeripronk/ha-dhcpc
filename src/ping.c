@@ -78,8 +78,10 @@ static void validate_retained_lease(hadc_ctx_t *ctx)
         return;
 
     hadc_info("gwping: gateway validated; promoting retained lease to BOUND");
+    hadc_cluster_lock();
     ctx->lease.retention_active = false;
     ctx->lease.state = HADC_LEASE_BOUND;
+    hadc_cluster_unlock();
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, "RETAINED-EXIT");
     hadc_routing_reconcile(ctx, "gwping-validated");

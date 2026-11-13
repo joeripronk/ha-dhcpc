@@ -29,12 +29,25 @@
 #include "internal.h"
 
 /* Guards the fields the heartbeat thread reads (role, lease.version,
- * graceful_restart_until_ms). Keep critical sections tight: lock only the field
- * write/read, never across a call that itself locks. */
+ * graceful_restart_until_ms, cadence/gap and the member table). Keep critical
+ * sections tight: lock only the field write/read, never across a call that
+ * itself locks. */
 #define HB_LOCK(ctx)   pthread_mutex_lock(&(ctx)->hb_lock)
 #define HB_UNLOCK(ctx) pthread_mutex_unlock(&(ctx)->hb_lock)
 
 static hadc_ctx_t *g_ctx;
+
+void hadc_cluster_lock(void)
+{
+    if (g_ctx)
+        pthread_mutex_lock(&g_ctx->hb_lock);
+}
+
+void hadc_cluster_unlock(void)
+{
+    if (g_ctx)
+        pthread_mutex_unlock(&g_ctx->hb_lock);
+}
 
 static void (*g_role_hook)(void *arg, hadc_role_t old_role, hadc_role_t new_role);
 static void *g_role_hook_arg;
@@ -327,70 +340,89 @@ static void send_heartbeats_now(hadc_ctx_t *ctx)
 
 /* Heartbeat send cadence + self-monitor watchdog, on its own thread so its
  * cadence is never blocked by main-loop work (executor/OSPF/persist/netlink).
- * The wire packet is built from a lock-protected snapshot; send and watchdog run
- * outside the lock. The thread never mutates shared state: a genuine stall
- * (send gap past heartbeat_ms + gap_ms) is handed to the main loop via the
- * self-pipe, which performs the demote. A lone-master/standalone node has nobody
- * to hand to, so it runs no cadence here. */
+ * Everything the thread uses — role, lease.version, graceful, cadence/gap and the
+ * member table — is copied under hb_lock in one snapshot; the reload conf swap
+ * takes hb_lock too, so the snapshot is race-free. Send, logging and watchdog run
+ * outside the lock. The thread never mutates shared state and calls nothing that
+ * locks (member_index/put_be/send_bytes/write are lock-free). A genuine stall
+ * (send gap past heartbeat_ms + gap_ms, both re-read every tick) is handed to the
+ * main loop via the self-pipe, which performs the demote. A lone-master/standalone
+ * node has nobody to hand to, so it runs no cadence here. */
 static void *hb_thread_main(void *arg)
 {
     hadc_ctx_t *ctx = arg;
-    uint32_t cadence_ms = ctx->conf.cluster.heartbeat_ms;
-    uint32_t gap_ms = ctx->conf.cluster.self_demote_gap_ms;
     uint64_t last_send_ms = 0;
 
     for (;;) {
-        struct timespec nap = { .tv_sec = cadence_ms / 1000,
-                                .tv_nsec = (long)(cadence_ms % 1000) * 1000000 };
+        struct {
+            uint8_t role, master_idx, self_idx, n_members;
+            uint16_t port;
+            uint32_t cadence_ms, gap_ms;
+            uint64_t lease_version;
+            bool graceful;
+            hadc_member_t members[HADC_MEMBERS_MAX];
+        } snap;
+
+        /* sleep first, on the current cadence (re-read every tick) */
+        pthread_mutex_lock(&ctx->hb_lock);
+        struct timespec nap = { .tv_sec = ctx->conf.cluster.heartbeat_ms / 1000,
+                                .tv_nsec = (long)(ctx->conf.cluster.heartbeat_ms % 1000) * 1000000 };
+        pthread_mutex_unlock(&ctx->hb_lock);
         clock_nanosleep(CLOCK_MONOTONIC, 0, &nap, NULL);
 
-        uint8_t role, master_idx, self_idx;
-        uint64_t lease_version;
-        bool graceful;
         pthread_mutex_lock(&ctx->hb_lock);
-        role = (uint8_t)ctx->role;
-        lease_version = ctx->lease.version;
-        master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
-        self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
-        graceful = (ctx->graceful_restart_until_ms != 0 &&
-                    realtime_ms() < ctx->graceful_restart_until_ms);
+        snap.role = (uint8_t)ctx->role;
+        snap.lease_version = ctx->lease.version;
+        snap.master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
+        snap.self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
+        snap.graceful = (ctx->graceful_restart_until_ms != 0 &&
+                          realtime_ms() < ctx->graceful_restart_until_ms);
+        snap.cadence_ms = ctx->conf.cluster.heartbeat_ms;
+        snap.gap_ms = ctx->conf.cluster.self_demote_gap_ms;
+        snap.port = ctx->conf.cluster.port;
+        snap.n_members = (uint8_t)ctx->conf.n_members;
+        memcpy(snap.members, ctx->conf.members, sizeof(snap.members));
         pthread_mutex_unlock(&ctx->hb_lock);
+        if (snap.cadence_ms == 0) /* hot-reload can zero the cadence: idle ticks */
+            continue;
 
         uint8_t hb[HADC_WIRE_HB_LEN];
         memset(hb, 0, sizeof(hb));
-        hb[1] = self_idx;
-        hb[2] = master_idx;
-        hb[3] = role;
-        put_be(hb + 4, lease_version, 8);
+        hb[1] = snap.self_idx;
+        hb[2] = snap.master_idx;
+        hb[3] = snap.role;
+        put_be(hb + 4, snap.lease_version, 8);
         put_be(hb + 12, (uint64_t)realtime_ms() & 0xffffffffu, 4);
 
         uint64_t now_ms = (uint64_t)realtime_ms();
-        for (size_t i = 0; i < ctx->conf.n_members; i++) {
-            const hadc_member_t *m = &ctx->conf.members[i];
+        for (uint8_t i = 0; i < snap.n_members; i++) {
+            const hadc_member_t *m = &snap.members[i];
             if (!strcmp(m->id, ctx->conf.self))
                 continue;
             struct sockaddr_in to = { .sin_family = AF_INET,
-                                      .sin_port = htons(ctx->conf.cluster.port),
+                                      .sin_port = htons(snap.port),
                                       .sin_addr = m->sync_address };
-            send_bytes(ctx, &to, hb, sizeof(hb));
+            if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
+                hadc_warn("cluster: send heartbeat to %s failed", m->id);
         }
 
-        if (gap_ms == 0) { /* watchdog off */
+        if (snap.gap_ms == 0) { /* watchdog off */
             last_send_ms = now_ms;
             continue;
         }
-        uint64_t threshold_ms = (uint64_t)cadence_ms + gap_ms;
-        if (last_send_ms != 0 && role == (uint8_t)HADC_ROLE_MASTER &&
-            ctx->conf.n_members >= 2 && !graceful &&
+        uint64_t threshold_ms = (uint64_t)snap.cadence_ms + snap.gap_ms;
+        if (last_send_ms != 0 && snap.role == (uint8_t)HADC_ROLE_MASTER &&
+            snap.n_members >= 2 && !snap.graceful &&
             now_ms - last_send_ms > threshold_ms) {
             hadc_warn("cluster: master heartbeat send %llu ms late (> heartbeat %u ms + "
                       "gap %u ms): real process stall, requesting demote",
-                      (unsigned long long)(now_ms - last_send_ms), cadence_ms, gap_ms);
+                      (unsigned long long)(now_ms - last_send_ms), snap.cadence_ms, snap.gap_ms);
             char wake = 1;
             (void)!write(ctx->hb_selfpipe[1], &wake, 1);
         }
         last_send_ms = now_ms;
     }
+    return NULL;
 }
 
 /* Drain the self-pipe and perform the demote the heartbeat thread requested. The
