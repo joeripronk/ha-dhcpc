@@ -1268,8 +1268,6 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
             n->lsa_sync_sent = true;
         } else if (!(flags & OSPF_DD_FLAG_M)) {
             n->state = NSTATE_LOADING;
-        } else {
-            n->state = NSTATE_EXCHANGE;
         }
         flood_lsas_to_neighbor(n, false);
         return;
