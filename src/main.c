@@ -769,11 +769,12 @@ int main(int argc, char **argv)
     }
     hadc_dhcpcore_stop(ctx);
     hadc_gwping_stop(ctx);
+    hadc_persist_save(ctx); /* while the OSPF LSDB is still alive: captures the
+                             * self LSAs the next start restores during its grace */
     hadc_routing_shutdown(ctx);
     if (hadc_cluster_graceful_active(ctx))
         hadc_info("graceful restart active: leaving cluster/VIP state applied on exit");
     else
         hadc_executor_clear_slave_isolation(ctx->conf.interface);
-    hadc_persist_save(ctx);
     return 0;
 }
