@@ -1292,6 +1292,15 @@ static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t
     if (p->tx_partial_len > 0) return; /* don't interleave markers while frame pending */
     if (!p->need_resync && !(ct->snapshot_on_connect && p->tx_seq <= 1))
         return;
+    /* Avoid joining a dump mid-stream: wait for idle dump and no active snapshots */
+    if (ct->ctnl_dump_pending) { p->need_resync = true; return; }
+    for (size_t i = 0; i < ct->n_peers; i++) {
+        if (&ct->peers[i] != p && ct->peers[i].connected && ct->peers[i].snapshot_active) {
+            p->need_resync = true;
+            return;
+        }
+    }
+
     txq_clear(p);
     int rc = send_json_msg(ct, p, HADC_CT_MSG_SNAPSHOT_BEGIN, HADC_CT_F_SNAPSHOT | HADC_CT_F_RESYNC,
                            json_pack("{s:i}", "gen", (int)ct->generation));
@@ -1301,10 +1310,9 @@ static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t
     ct->st.resync_count++;
     if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
     if (ct->ctnl_fd >= 0) {
-        if (!ct->ctnl_dump_pending)
-            (void)ctnl_request_dump(ct);
+        if (ctnl_request_dump(ct) < 0)
+            p->need_resync = true;
     } else {
-        /* cannot dump now; retry later */
         p->need_resync = true;
     }
 }
