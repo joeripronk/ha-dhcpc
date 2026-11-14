@@ -597,19 +597,21 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
     return true;
 }
 
-static void master_queue_entry_all(struct hadc_conntrack *ct,uint8_t type,const hadc_ct_entry_v1_t *e){
-    for(size_t i=0;i<ct->n_peers;i++){
-        hadc_ct_peer_t *p=&ct->peers[i];
-        if(!p->connected||!p->hello_ok) continue;
-        if(type == HADC_CT_MSG_SNAPSHOT_ENTRY) {
-            if(!p->snapshot_active) continue;
+static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude)
+{
+    for (size_t i = 0; i < ct->n_peers; i++) {
+        hadc_ct_peer_t *p = &ct->peers[i];
+        if (!p->connected || !p->hello_ok) continue;
+        if (exclude && p == exclude) continue;
+        if (type == HADC_CT_MSG_SNAPSHOT_ENTRY) {
+            if (!p->snapshot_active) continue;
         } else {
-            if(p->need_resync) continue;
+            if (p->need_resync) continue;
         }
-        if(queue_entry(ct,p,type,e)<0) continue;
+        if (queue_entry(ct, p, type, e) < 0) continue;
         uint32_t cap = ct->max_queue_entries ? ct->max_queue_entries : HADC_CT_TXQ_MAX;
-        if(cap > HADC_CT_TXQ_MAX) cap = HADC_CT_TXQ_MAX;
-        if(p->txq_count >= cap) p->need_resync=true;
+        if (cap > HADC_CT_TXQ_MAX) cap = HADC_CT_TXQ_MAX;
+        if (p->txq_count >= cap) p->need_resync = true;
     }
 }
 
@@ -874,7 +876,7 @@ static void drain_ctnl(struct hadc_conntrack *ct){
             if(ct->role==HADC_ROLE_MASTER){
                 uint8_t mtype = in_dump ? HADC_CT_MSG_SNAPSHOT_ENTRY : HADC_CT_MSG_UPSERT;
                 if(del){ mtype=HADC_CT_MSG_DELETE; e.flags|=8; }
-                master_queue_entry_all(ct,mtype,&e);
+                master_queue_entry_all(ct, mtype, &e, NULL);
             }
             /* slaves receive authoritative state over TCP; ignore local ctnl events */
         }
@@ -1423,7 +1425,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                           del ? "delete" : "upsert", p->id, desc);
                 if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
                 (void)ctnl_apply_entry(ct, e, del);
-                master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e);
+                master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e, p);
                 ct->st.rx_entries++;
             } else {
                 ct->st.dropped_entries++;
