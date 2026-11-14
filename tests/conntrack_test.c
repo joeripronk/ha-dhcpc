@@ -128,11 +128,106 @@ static void test_shadow_stage_prune_and_compact(void) {
     TASSERT(ct.n_shadow == 0, "delete compacted");
 }
 
+static void test_shadow_eviction_when_full(void) {
+    struct hadc_conntrack ct;
+    memset(&ct, 0, sizeof(ct));
+    ct.max_entry_age_s = 0;
+    for (size_t i = 0; i < HADC_CT_SHADOW_MAX; i++) {
+        hadc_ct_entry_v1_t e;
+        memset(&e, 0, sizeof(e));
+        e.family = AF_INET; e.addr_len = 4; e.proto = IPPROTO_TCP;
+        e.orig_src = htonl(0x0a000001u); e.orig_dst = htonl(0x0a000002u);
+        e.repl_src = e.orig_dst; e.repl_dst = htonl(0x08080808u);
+        e.orig_sport = htons((uint16_t)(1000 + i)); e.orig_dport = htons(80);
+        e.repl_sport = htons(80); e.repl_dport = htons((uint16_t)(2000 + i));
+        stage_or_apply(&ct, &e, false);
+        ct.shadow[i].updated_ms = (uint64_t)(i + 1); /* oldest = 1 at index 0 */
+    }
+    TASSERT(ct.n_shadow == HADC_CT_SHADOW_MAX, "shadow filled");
+    uint64_t drops_before = ct.st.dropped_entries;
+    hadc_ct_entry_v1_t en;
+    memset(&en, 0, sizeof(en));
+    en.family = AF_INET; en.addr_len = 4; en.proto = IPPROTO_TCP;
+    en.orig_src = htonl(0x0a000099u); en.orig_dst = htonl(0x0a000002u);
+    en.repl_src = en.orig_dst; en.repl_dst = htonl(0x08080808u);
+    en.orig_sport = htons(9999); en.orig_dport = htons(80);
+    en.repl_sport = htons(80); en.repl_dport = htons(8888);
+    stage_or_apply(&ct, &en, false);
+    TASSERT(ct.n_shadow == HADC_CT_SHADOW_MAX, "shadow size stable on eviction");
+    TASSERT(ct.st.dropped_entries == drops_before + 1, "eviction counted as drop pressure");
+    TASSERT(ct.shadow[0].valid, "victim slot reused");
+    TASSERT(ct.shadow[0].e.orig_sport == htons(9999), "oldest entry evicted/replaced");
+}
+
+static void test_apply_pending_alloc_find(void) {
+    struct hadc_conntrack ct;
+    memset(&ct, 0, sizeof(ct));
+    ct.ctnl_fd = -1;
+    ct.ctnl_apply_seq = 10;
+    for (int i = 0; i < HADC_CT_APPLY_PENDING_MAX; i++) {
+        hadc_ct_apply_pending_t *ap = ctnl_alloc_apply(&ct);
+        TASSERT(ap != NULL, "alloc pending slot");
+        ap->in_use = true;
+        ap->seq = (uint32_t)(100 + i);
+    }
+    TASSERT(ctnl_alloc_apply(&ct) == NULL, "no slot when full");
+    hadc_ct_apply_pending_t *f = ctnl_find_apply(&ct, 105);
+    TASSERT(f != NULL && f->seq == 105, "find pending by seq");
+    TASSERT(ctnl_find_apply(&ct, 9999) == NULL, "missing seq not found");
+    TASSERT(ctnl_find_apply(&ct, 0) == NULL, "seq 0 not found");
+    f->in_use = false;
+    hadc_ct_apply_pending_t *r = ctnl_alloc_apply(&ct);
+    TASSERT(r != NULL, "reuse freed slot");
+}
+
+static void test_classify_non_local(void) {
+    struct hadc_conntrack ct;
+    memset(&ct, 0, sizeof(ct));
+    ct.exclude_loopback = true;
+    ct.non_local_only = true;
+    ct.include_related = true;
+    ct.owned_addrs[0].s_addr = inet_addr("203.0.113.10");
+    ct.n_owned = 1;
+    hadc_ct_entry_v1_t e;
+    const char *reason = NULL;
+
+    memset(&e, 0, sizeof(e));
+    e.family = AF_INET; e.addr_len = 4;
+    e.orig_src = inet_addr("127.0.0.1");
+    e.orig_dst = inet_addr("8.8.8.8");
+    e.repl_src = e.orig_dst; e.repl_dst = e.orig_src;
+    TASSERT(!classify_non_local(&ct, &e, &reason), "loopback excluded");
+
+    memset(&e, 0, sizeof(e));
+    e.family = AF_INET; e.addr_len = 4;
+    e.orig_src = inet_addr("10.0.0.5"); e.orig_dst = inet_addr("10.0.0.6");
+    e.repl_src = e.orig_dst; e.repl_dst = e.orig_src; /* plain, unmanaged */
+    TASSERT(!classify_non_local(&ct, &e, &reason), "unmanaged/non-local endpoints excluded");
+
+    memset(&e, 0, sizeof(e));
+    e.family = AF_INET; e.addr_len = 4;
+    e.orig_src = inet_addr("203.0.113.10"); e.orig_dport = htons(1234);
+    e.orig_dst = inet_addr("8.8.8.8");       e.orig_sport = 0; /* irrelevant */
+    e.repl_src = inet_addr("8.8.8.8");       e.repl_dport = htons(1234);
+    e.repl_dst = inet_addr("198.51.100.1");  e.repl_sport = htons(40000); /* NATed/public */
+    e.flags |= 1;
+    TASSERT(classify_non_local(&ct, &e, &reason), "owned NAT classified");
+
+    memset(&e, 0, sizeof(e));
+    e.family = AF_INET; e.addr_len = 4;
+    e.orig_src = inet_addr("203.0.113.10"); e.orig_dst = inet_addr("203.0.113.20");
+    e.repl_src = e.orig_dst; e.repl_dst = e.orig_src; /* local-only */
+    TASSERT(!classify_non_local(&ct, &e, &reason), "local-only excluded");
+}
+
 int main(void) {
     test_ct_entry_tuple_format();
     test_build_apply_msg_create_delete();
     test_hdr_wire();
     test_shadow_stage_prune_and_compact();
+    test_shadow_eviction_when_full();
+    test_apply_pending_alloc_find();
+    test_classify_non_local();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);
         return 1;
