@@ -1412,7 +1412,12 @@ static void *conntrack_thread_main(void *arg)
             if (ct->ctnl_fd >= 0) ctnl_close(ct);
             ct->n_shadow = 0;
             ct->rx_snapshot_active = false;
-            for (size_t i = 0; i < ct->n_peers; i++) ct->peers[i].need_resync = false;
+            ct->slave_resync_requested = false;
+            for (size_t i = 0; i < ct->n_peers; i++) {
+                ct->peers[i].need_resync = false;
+                if (ct->peers[i].fd >= 0 || ct->peers[i].connected)
+                    close_peer(&ct->peers[i]);
+            }
         }
 
         if (ct->apply_shadow_pending && ct->role == HADC_ROLE_MASTER) {
@@ -1649,10 +1654,14 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
     ct->st.replica = ct->enabled && new_role == HADC_ROLE_SLAVE;
     if (new_role == HADC_ROLE_MASTER) {
         ct->generation++;
+        ct->slave_resync_requested = false;
+        ct->rx_snapshot_active = false;
         if (old_role == HADC_ROLE_SLAVE)
             ct->apply_shadow_pending = true; /* deferred to worker */
     } else {
         ct->ctnl_dump_pending = false;
+        for (size_t i = 0; i < ct->n_peers; i++)
+            ct->peers[i].snapshot_active = false;
     }
     pthread_mutex_unlock(&ct->lock);
     hadc_info("conntrack: role %s -> %s", old_role == HADC_ROLE_MASTER ? "master" : "slave",
