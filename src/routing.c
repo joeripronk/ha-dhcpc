@@ -87,7 +87,10 @@ static bool local_working_default_path(hadc_ctx_t *ctx)
      * working default always takes precedence over fabric-learned defaults. */
     if (ctx->role == HADC_ROLE_MASTER) {
         return ctx->lease.address.s_addr != 0 && ctx->lease.gateway.s_addr != 0 &&
-               !hadc_gwping_unreachable() && ctx->lease.state == HADC_LEASE_BOUND;
+               !hadc_gwping_unreachable() &&
+               (ctx->lease.state == HADC_LEASE_BOUND ||
+                ctx->lease.state == HADC_LEASE_RENEW ||
+                ctx->lease.state == HADC_LEASE_REBIND);
     }
     /* Slaves have no primary DHCP default route of their own. */
     return false;
@@ -544,8 +547,11 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 {
     bool enabled = ctx->conf.routing.enabled;
     bool master_owner = (ctx->role == HADC_ROLE_MASTER);
-    bool healthy_bound = master_owner && ctx->lease.state == HADC_LEASE_BOUND &&
-                         ctx->lease.address.s_addr != 0 && !hadc_gwping_unreachable();
+    bool healthy_bound = master_owner && ctx->lease.address.s_addr != 0 &&
+                         !hadc_gwping_unreachable() &&
+                         (ctx->lease.state == HADC_LEASE_BOUND ||
+                          ctx->lease.state == HADC_LEASE_RENEW ||
+                          ctx->lease.state == HADC_LEASE_REBIND);
     bool backup = on_backup_path(ctx);
 
     if (reason && *reason)
