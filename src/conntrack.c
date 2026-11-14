@@ -678,13 +678,18 @@ static void apply_shadow_all(struct hadc_conntrack *ct)
 
 static void prune_shadow(struct hadc_conntrack *ct, uint64_t now)
 {
-    if (!ct || ct->max_entry_age_s == 0) return;
-    uint64_t max_age = (uint64_t)ct->max_entry_age_s * 1000;
-    for (size_t i = 0; i < ct->n_shadow; i++) {
-        hadc_ct_shadow_ent_t *s = &ct->shadow[i];
-        if (s->valid && now - s->updated_ms > max_age)
-            s->valid = false;
+    if (!ct) return;
+    if (ct->max_entry_age_s > 0) {
+        uint64_t max_age = (uint64_t)ct->max_entry_age_s * 1000;
+        for (size_t i = 0; i < ct->n_shadow; i++) {
+            hadc_ct_shadow_ent_t *s = &ct->shadow[i];
+            if (s->valid && now - s->updated_ms > max_age)
+                s->valid = false;
+        }
     }
+    /* compact invalid head/tail slots so n_shadow does not grow unbounded */
+    while (ct->n_shadow > 0 && !ct->shadow[ct->n_shadow - 1].valid)
+        ct->n_shadow--;
 }
 
 static void drain_ctnl(struct hadc_conntrack *ct){
@@ -1026,9 +1031,7 @@ static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b)
 
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del)
 {
-    /* Shadow/staged state kept for slave apply-on-promotion. Immediate kernel
-     * apply via nfnetlink CT create/delete is a follow-up integration point
-     * (libnetfilter_conntrack or raw NFNL_SUBSYS_CTNETLINK). */
+    /* Shadow state kept for staged apply on promotion and as replica cache. */
     for (size_t i = 0; i < ct->n_shadow; i++) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[i];
         if (!s->valid) continue;
@@ -1055,7 +1058,22 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
         s->valid = true;
         ct->st.applied_entries++;
     } else {
-        ct->st.dropped_entries++;
+        /* bounded table full: evict oldest valid entry as best-effort */
+        size_t victim = SIZE_MAX;
+        uint64_t oldest = UINT64_MAX;
+        for (size_t i = 0; i < ct->n_shadow; i++) {
+            if (!ct->shadow[i].valid) { victim = i; break; }
+            if (ct->shadow[i].updated_ms < oldest) { oldest = ct->shadow[i].updated_ms; victim = i; }
+        }
+        if (victim != SIZE_MAX) {
+            ct->shadow[victim].e = *e;
+            ct->shadow[victim].updated_ms = now_ms();
+            ct->shadow[victim].valid = true;
+            ct->st.applied_entries++;
+            ct->st.dropped_entries++; /* indicates churn/eviction pressure */
+        } else {
+            ct->st.dropped_entries++;
+        }
     }
 }
 
