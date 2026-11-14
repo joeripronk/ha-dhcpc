@@ -46,7 +46,7 @@
 #define HADC_CT_MAGIC1 'C'
 #define HADC_CT_MAGIC2 'T'
 #define HADC_CT_MAGIC3 '1'
-#define HADC_CT_VER 2
+#define HADC_CT_VER 3
 #define HADC_CT_MAX_FRAME 65536
 #define HADC_CT_MAX_OWNED 128
 #define HADC_CT_SHADOW_MAX 4096
@@ -107,10 +107,6 @@ typedef struct {
     uint8_t helper_id; /* 0 none, 1 sip */
     uint8_t ct_kind;  /* 0=conntrack, 1=expectation (best-effort v1) */
     uint8_t rsv;
-    uint64_t orig_packets;
-    uint64_t orig_bytes;
-    uint64_t repl_packets;
-    uint64_t repl_bytes;
 } hadc_ct_entry_v1_t;
 #pragma pack(pop)
 
@@ -510,8 +506,6 @@ static struct nlattr *nla_find(struct nlattr *head, int len, int type)
 static uint32_t nla_get_u32(struct nlattr *n){ uint32_t v=0; if(n&&HADC_NLA_DATALEN(n)>=4) memcpy(&v,HADC_NLA_DATA(n),4); return v; }
 static uint16_t nla_get_u16(struct nlattr *n){ uint16_t v=0; if(n&&HADC_NLA_DATALEN(n)>=2) memcpy(&v,HADC_NLA_DATA(n),2); return v; }
 static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATALEN(n)>=1) memcpy(&v,HADC_NLA_DATA(n),1); return v; }
-static uint64_t nla_get_u64(struct nlattr *n){ uint64_t v=0; if(n&&HADC_NLA_DATALEN(n)>=8) memcpy(&v,HADC_NLA_DATA(n),8); return v; }
-static uint64_t nla_get_be64(struct nlattr *n){ return (uint64_t)be64toh(nla_get_u64(n)); }
 
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
