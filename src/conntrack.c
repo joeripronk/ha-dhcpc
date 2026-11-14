@@ -1421,6 +1421,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                           del ? "delete" : "upsert", p->id, desc);
                 if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
                 (void)ctnl_apply_entry(ct, e, del);
+                master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e);
                 ct->st.rx_entries++;
             } else {
                 ct->st.dropped_entries++;
