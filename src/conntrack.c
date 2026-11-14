@@ -812,10 +812,10 @@ static bool probe_cthelper_sip(void)
     return found;
 }
 
-static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
+static void refresh_helper_cache_locked(struct hadc_conntrack *ct, bool nl_helper)
 {
-    /* SIP/VoIP helper status cache: nfnetlink cthelper probe (best-effort) plus
-     * /proc/module heuristics. */
+    /* SIP/VoIP helper status cache; nfnetlink probe result supplied by caller
+     * (probe can block briefly and must not run under ct->lock). */
     ct->last_helper_refresh_ms = now_ms();
     if (ct->sip_mode == HADC_CT_SIP_OFF) {
         ct->st.sip_helper = HADC_CT_HELPER_UNAVAILABLE;
@@ -825,9 +825,6 @@ static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
 
     bool sip_helper_on = false;
     bool helper_mod = false;
-    bool nl_helper = false;
-
-    nl_helper = probe_cthelper_sip();
 
     FILE *f = fopen("/proc/sys/net/netfilter/nf_conntrack_helper", "r");
     if (f) {
@@ -1343,8 +1340,13 @@ static void *conntrack_thread_main(void *arg)
         else if (!ct->enabled && ct->ctnl_fd >= 0)
             ctnl_close(ct);
         if (ct->helper_cache_refresh_s &&
-            now - ct->last_helper_refresh_ms >= (uint64_t)ct->helper_cache_refresh_s * 1000)
-            refresh_helper_cache_locked(ct);
+            now - ct->last_helper_refresh_ms >= (uint64_t)ct->helper_cache_refresh_s * 1000) {
+            int sip_mode = ct->sip_mode;
+            pthread_mutex_unlock(&ct->lock);
+            bool nl_helper = (sip_mode != HADC_CT_SIP_OFF) ? probe_cthelper_sip() : false;
+            pthread_mutex_lock(&ct->lock);
+            refresh_helper_cache_locked(ct, nl_helper);
+        }
         if (now - ct->last_addr_refresh_ms >= 10000)
             refresh_owned_addrs_locked(ct, ct->ctx);
         prune_shadow(ct, now);
@@ -1509,9 +1511,10 @@ int hadc_conntrack_init(hadc_ctx_t *ctx)
     ct->apply_shadow_pending = false;
     ct->generation = 1;
     ct->last_resync_ms = now_ms();
+    bool nl_init = ctx->conf.conntrack_sync.helpers.sip != HADC_CT_SIP_OFF ? probe_cthelper_sip() : false;
     pthread_mutex_lock(&ct->lock);
     snapshot_config_locked(ct, ctx);
-    refresh_helper_cache_locked(ct);
+    refresh_helper_cache_locked(ct, nl_init);
     pthread_mutex_unlock(&ct->lock);
     ctx->conntrack = ct;
     return 0;
@@ -1596,9 +1599,12 @@ void hadc_conntrack_notify_config(hadc_ctx_t *ctx)
     struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
     if (!ct)
         return;
+    bool nl_cfg = false;
+    if (ctx->conf.conntrack_sync.helpers.sip != HADC_CT_SIP_OFF)
+        nl_cfg = probe_cthelper_sip();
     pthread_mutex_lock(&ct->lock);
     snapshot_config_locked(ct, ctx);
-    refresh_helper_cache_locked(ct);
+    refresh_helper_cache_locked(ct, nl_cfg);
     pthread_mutex_unlock(&ct->lock);
     ct_wake(ct);
 }
