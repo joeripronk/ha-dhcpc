@@ -1404,9 +1404,15 @@ static void *conntrack_thread_main(void *arg)
             refresh_owned_addrs_locked(ct, ct->ctx);
         prune_shadow(ct, now);
 
-        if (ct->enabled)
+        if (ct->enabled) {
             (void)ensure_listen(ct);
-        else if (ct->listen_fd >= 0) { close(ct->listen_fd); ct->listen_fd = -1; }
+        } else {
+            if (ct->listen_fd >= 0) { close(ct->listen_fd); ct->listen_fd = -1; }
+            if (ct->ctnl_fd >= 0) ctnl_close(ct);
+            ct->n_shadow = 0;
+            ct->rx_snapshot_active = false;
+            for (size_t i = 0; i < ct->n_peers; i++) ct->peers[i].need_resync = false;
+        }
 
         if (ct->apply_shadow_pending && ct->role == HADC_ROLE_MASTER) {
             ct->apply_shadow_pending = false;
