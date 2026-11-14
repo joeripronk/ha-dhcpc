@@ -147,6 +147,7 @@ typedef struct {
     hadc_ct_entry_v1_t e;
     uint64_t updated_ms;
     bool valid;
+    bool seen_in_snapshot;
 } hadc_ct_shadow_ent_t;
 
 struct hadc_conntrack {
@@ -163,6 +164,7 @@ struct hadc_conntrack {
     uint64_t ctnl_dump_start_ms;
     uint32_t ctnl_dump_seq;
     bool apply_shadow_pending;
+    bool rx_snapshot_active;
     hadc_ctx_t *ctx;
 
     /* config snapshot */
@@ -1129,7 +1131,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
         if (!s->valid) continue;
         if (!same_tuple(&s->e, e)) continue;
         if (del) { s->valid = false; ct->st.applied_entries++; }
-        else { s->e = *e; s->updated_ms = now_ms(); ct->st.applied_entries++; }
+        else { s->e = *e; s->updated_ms = now_ms(); s->seen_in_snapshot = ct->rx_snapshot_active; ct->st.applied_entries++; }
         return;
     }
     if (del)
@@ -1139,6 +1141,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
             ct->shadow[i].e = *e;
             ct->shadow[i].updated_ms = now_ms();
             ct->shadow[i].valid = true;
+            ct->shadow[i].seen_in_snapshot = ct->rx_snapshot_active;
             ct->st.applied_entries++;
             return;
         }
@@ -1148,6 +1151,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
         s->e = *e;
         s->updated_ms = now_ms();
         s->valid = true;
+        s->seen_in_snapshot = ct->rx_snapshot_active;
         ct->st.applied_entries++;
     } else {
         /* bounded table full: evict oldest valid entry as best-effort */
@@ -1161,6 +1165,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
             ct->shadow[victim].e = *e;
             ct->shadow[victim].updated_ms = now_ms();
             ct->shadow[victim].valid = true;
+            ct->shadow[victim].seen_in_snapshot = ct->rx_snapshot_active;
             ct->st.applied_entries++;
             ct->st.dropped_entries++; /* indicates churn/eviction pressure */
         } else {
@@ -1186,8 +1191,24 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     }
     if (h->type == HADC_CT_MSG_HELLO_ACK) { p->hello_ok = true; return; }
     if (h->type == HADC_CT_MSG_KEEPALIVE) return;
-    if (h->type == HADC_CT_MSG_SNAPSHOT_BEGIN) return;
-    if (h->type == HADC_CT_MSG_SNAPSHOT_END) return;
+    if (h->type == HADC_CT_MSG_SNAPSHOT_BEGIN) {
+        if (ct->role == HADC_ROLE_SLAVE) {
+            ct->rx_snapshot_active = true;
+            for (size_t i = 0; i < ct->n_shadow; i++)
+                ct->shadow[i].seen_in_snapshot = false;
+        }
+        return;
+    }
+    if (h->type == HADC_CT_MSG_SNAPSHOT_END) {
+        if (ct->role == HADC_ROLE_SLAVE && ct->rx_snapshot_active) {
+            for (size_t i = 0; i < ct->n_shadow; i++) {
+                if (ct->shadow[i].valid && !ct->shadow[i].seen_in_snapshot)
+                    ct->shadow[i].valid = false;
+            }
+            ct->rx_snapshot_active = false;
+        }
+        return;
+    }
     if (h->type == HADC_CT_MSG_RESYNC_REQ) {
         p->need_resync = true;
         p->resyncs++;
