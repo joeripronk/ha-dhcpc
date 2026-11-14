@@ -1,19 +1,41 @@
 #!/bin/sh
-# Deploy the ha-dhcpc OpenWrt package to the cluster nodes.
-# Usage: ./deploy-openwrt.sh [--dry-run] [apk-path]   (default: newest apk from the SDK)
+# Build (from current source) and deploy the ha-dhcpc OpenWrt package to the cluster nodes.
+# Usage: ./deploy-openwrt.sh [--dry-run] [--no-build] [apk-path]
+#   --no-build  deploy newest existing SDK apk instead of building
+#   apk-path    deploy this specific apk (implies --no-build)
 set -eu
 
 HOSTS="studeerkamer woonkamer meterkast"   # slaves first, master last
 DRY_RUN=0
+BUILD=1
+APK=
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SDK_DEFAULT="$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64"
 
-case "${1:-}" in
---dry-run)
-	DRY_RUN=1
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--dry-run) DRY_RUN=1 ;;
+	--no-build) BUILD=0 ;;
+	-*)
+		echo "unknown option: $1" >&2
+		exit 1
+		;;
+	*)
+		APK=$1
+		BUILD=0
+		;;
+	esac
 	shift
-	;;
-esac
+done
 
-APK=${1:-$(ls -t "$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64/bin/packages/aarch64_cortex-a53/base"/ha-dhcpc-*.apk 2>/dev/null | head -1)}
+if [ "$BUILD" -eq 1 ]; then
+	echo "building OpenWrt package..."
+	"$SCRIPT_DIR/build-openwrt.sh"
+fi
+
+if [ -z "$APK" ]; then
+	APK=$(ls -t "$SDK_DEFAULT/bin/packages/aarch64_cortex-a53/base"/ha-dhcpc-*.apk 2>/dev/null | head -1)
+fi
 
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
 echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}"
