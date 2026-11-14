@@ -79,7 +79,7 @@ static void test_hdr_wire(void) {
     h.len = htonl(sizeof(hadc_ct_entry_v1_t));
     h.seq = htonl(7);
     TASSERT(h.magic[0]=='H' && h.magic[1]=='C' && h.magic[2]=='T' && h.magic[3]=='1', "magic");
-    TASSERT(h.ver == 1, "ver");
+    TASSERT(h.ver == 2, "ver");
 }
 
 static void test_shadow_stage_prune_and_compact(void) {
