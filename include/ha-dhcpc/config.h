@@ -135,6 +135,7 @@ typedef struct {
         uint32_t max_queue_entries;
         bool snapshot_on_connect;
         uint32_t resync_interval_s;
+        uint32_t timer_sync_interval_s; /* master: batch non-state-changing timer updates */
         struct {
             bool non_local_only;
             bool include_related;

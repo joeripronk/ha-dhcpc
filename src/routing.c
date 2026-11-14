@@ -648,7 +648,6 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
         inet_ntop(AF_INET, &g_rs.backup_gw, bgw, sizeof(bgw));
 
     json_t *cands = json_array();
-    if (!cands) cands = json_array();
     if (g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr != 0) {
         char gw[INET_ADDRSTRLEN] = "0.0.0.0";
         inet_ntop(AF_INET, &g_rs.local_cand.gateway, gw, sizeof(gw));
@@ -668,7 +667,6 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
 
     int cand_count = g_rs.n_remote_cands + ((g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr) ? 1 : 0);
     json_t *prefixes = json_array();
-    if (!prefixes) prefixes = json_array();
     for (size_t i = 0; i < g_rs.n_want_prefixes; i++) {
         char dst[INET_ADDRSTRLEN] = "0.0.0.0";
         inet_ntop(AF_INET, &g_rs.want_prefixes[i].prefix, dst, sizeof(dst));
@@ -678,8 +676,11 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
     }
 
     json_t *o = json_object();
-    if (!o)
+    if (!o) {
+        json_decref(cands);
+        json_decref(prefixes);
         return json_object();
+    }
     json_object_set_new(o, "enabled", json_boolean(ctx->conf.routing.enabled));
     {
         const char *pub_mode = "off", *def_mode = "off";

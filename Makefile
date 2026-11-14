@@ -13,7 +13,9 @@ endif
 SYSROOT_FLAGS := $(if $(SYSROOT),--sysroot=$(SYSROOT))
 PKGENV := $(if $(SYSROOT),PKG_CONFIG_SYSROOT_DIR=$(SYSROOT) PKG_CONFIG_PATH=$(SYSROOT)/usr/lib/pkgconfig)
 PKG_CONFIG ?= pkg-config
-override CFLAGS += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -O2 -g -pthread -Iinclude -Isrc -Isrc/dhcp -MMD -MP $(SYSROOT_FLAGS) $(shell $(PKGENV) $(PKG_CONFIG) --cflags $(PKG))
+HADC_VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo dev)
+HADC_BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+override CFLAGS += -std=gnu11 -D_GNU_SOURCE -Wall -Wextra -O2 -g -pthread -Iinclude -Isrc -Isrc/dhcp -MMD -MP $(SYSROOT_FLAGS) $(shell $(PKGENV) $(PKG_CONFIG) --cflags $(PKG)) -DHADC_VERSION=\"$(HADC_VERSION)\" -DHADC_BUILD_TIME=\"$(HADC_BUILD_TIME)\"
 override LDLIBS += $(shell $(PKGENV) $(PKG_CONFIG) --libs $(PKG)) $(LDFLAGS)
 
 SRCS := $(wildcard src/*.c) $(wildcard src/dhcp/*.c)

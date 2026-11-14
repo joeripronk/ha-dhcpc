@@ -40,6 +40,13 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#ifndef HADC_VERSION
+#define HADC_VERSION "dev"
+#endif
+#ifndef HADC_BUILD_TIME
+#define HADC_BUILD_TIME "unknown"
+#endif
+
 #define MAX_FDS 16
 
 typedef struct {
@@ -458,10 +465,11 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "usage: %s [--conf PATH] [--local-conf PATH] [--persist PATH] [--oneshot]\n"
-            "       %s [--conf PATH] [--local-conf PATH] ctl promote|demote|status|update|renew|newip [id]\n"
-            "       %s [--conf PATH] [--local-conf PATH] ctl graceful-restart enable|disable\n"
-            "       (--persist default: state.json next to --conf)\n",
+            "usage: %s [--conf path] [--local-conf path] [--persist path] [--oneshot]\n"
+            "       %s ctl <cmd> [--conf path] [--local-conf path]\n"
+            "       %s -v|--version\n"
+            "ctl cmds: status promote demote reload graceful-restart "
+            "conf-status conf-sync conntrack-status conntrack-resync\n",
             argv0, argv0, argv0);
 }
 
@@ -510,6 +518,12 @@ int main(int argc, char **argv)
     hadc_ctx_t *ctx = &g_ctx;
 
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+            printf("ha-dhcpc %s (built %s)\n", HADC_VERSION, HADC_BUILD_TIME);
+            return 0;
+        }
+    }
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--conf") && i + 1 < argc) {
             conf_path = argv[++i];
             continue;
@@ -530,6 +544,8 @@ int main(int argc, char **argv)
     }
 
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version"))
+            continue;
         if (!strcmp(argv[i], "--conf") && i + 1 < argc)
             conf_path = argv[++i];
         else if (!strcmp(argv[i], "--local-conf") && i + 1 < argc)
@@ -713,6 +729,7 @@ int main(int argc, char **argv)
     }
 
     ctx->running = true;
+    hadc_info("ha-dhcpc %s (built %s)", HADC_VERSION, HADC_BUILD_TIME);
     {
         hadc_lease_t rl = ctx->lease;
         if (rl.observed_at_utc != 0)

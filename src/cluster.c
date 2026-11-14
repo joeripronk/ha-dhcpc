@@ -303,8 +303,10 @@ static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg)
 {
     char *txt = json_dumps(msg, JSON_PRESERVE_ORDER | JSON_COMPACT);
-    if (!txt)
+    if (!txt) {
+        json_decref(msg);
         return -1;
+    }
     ssize_t r = sendto(ctx->udp_fd, txt, strlen(txt), 0, (const struct sockaddr *)to, sizeof(*to));
     free(txt);
     json_decref(msg);

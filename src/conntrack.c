@@ -50,6 +50,7 @@
 #define HADC_CT_MAX_FRAME 65536
 #define HADC_CT_MAX_OWNED 128
 #define HADC_CT_SHADOW_MAX 4096
+#define HADC_CT_SHADOW_HASH 8192
 #define HADC_CT_TXQ_MAX 1024
 #define HADC_CT_BATCH_MAX 32
 #define HADC_CT_APPLY_PENDING_MAX 128
@@ -104,7 +105,8 @@ typedef struct {
     uint16_t repl_dport;
     uint8_t flags; /* 1=nated,2=related/helper,4=assured,8=delete */
     uint8_t helper_id; /* 0 none, 1 sip */
-    uint16_t rsv;
+    uint8_t ct_kind;  /* 0=conntrack, 1=expectation (best-effort v1) */
+    uint8_t rsv;
 } hadc_ct_entry_v1_t;
 #pragma pack(pop)
 
@@ -152,6 +154,8 @@ typedef struct {
     uint64_t updated_ms;
     bool valid;
     bool seen_in_snapshot;
+    bool timer_dirty;
+    int16_t hnext;
 } hadc_ct_shadow_ent_t;
 
 typedef struct {
@@ -179,6 +183,7 @@ struct hadc_conntrack {
     int listen_fd;
     int rtnl_fd; /* NETLINK_ROUTE addr monitor/dump for IPv4 local+VIP discovery */
     int ctnl_fd; /* NFNETLINK conntrack dump/events (raw, best-effort) */
+    bool ctnl_subscribed;
     bool ctnl_dump_pending;
     bool ctnl_dump_aborted;
     uint64_t ctnl_dump_start_ms;
@@ -191,6 +196,7 @@ struct hadc_conntrack {
     bool apply_shadow_pending;
     bool rx_snapshot_active;
     bool slave_resync_requested;
+    bool slave_recent_master_handoff;
     hadc_ctx_t *ctx;
 
     /* config snapshot */
@@ -199,6 +205,7 @@ struct hadc_conntrack {
     uint32_t max_queue_entries;
     bool snapshot_on_connect;
     uint32_t resync_interval_s;
+    uint32_t timer_sync_interval_s;
     bool non_local_only;
     bool include_related;
     bool exclude_loopback;
@@ -222,10 +229,12 @@ struct hadc_conntrack {
 
     hadc_ct_shadow_ent_t shadow[HADC_CT_SHADOW_MAX];
     size_t n_shadow;
+    int16_t shadow_buckets[HADC_CT_SHADOW_HASH];
 
     hadc_ct_status_t st;
     uint64_t last_helper_refresh_ms;
     uint64_t last_resync_ms;
+    uint64_t last_timer_sync_ms;
     uint32_t generation;
 };
 
@@ -446,7 +455,6 @@ static void handle_rtnl_addr_msg(struct hadc_conntrack *ct, hadc_ctx_t *ctx, str
             add_owned_addr_locked(ct, a);
         /* deletions handled by periodic full refresh/getifaddrs rebuild */
         ct->addr_cache_valid = true;
-        ct->last_addr_refresh_ms = now_ms();
         break;
     }
 }
@@ -456,7 +464,6 @@ static void drain_rtnl(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
     if (ct->rtnl_fd < 0)
         return;
     uint8_t buf[8192];
-    bool changed = false;
     for (;;) {
         ssize_t n = recv(ct->rtnl_fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n < 0) {
@@ -464,6 +471,7 @@ static void drain_rtnl(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
                 break;
             close(ct->rtnl_fd);
             ct->rtnl_fd = -1;
+            ct->addr_cache_valid = false;
             break;
         }
         if (n == 0)
@@ -473,14 +481,10 @@ static void drain_rtnl(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
                 break;
             if (nh->nlmsg_type == NLMSG_ERROR)
                 continue;
-            if (nh->nlmsg_type == RTM_NEWADDR || nh->nlmsg_type == RTM_DELADDR) {
+            if (nh->nlmsg_type == RTM_NEWADDR || nh->nlmsg_type == RTM_DELADDR)
                 handle_rtnl_addr_msg(ct, ctx, nh);
-                changed = true;
-            }
         }
     }
-    if (changed || !ct->addr_cache_valid)
-        rtnl_dump_addrs(ct);
 }
 
 #define HADC_NLA_HDRLEN ((int)NLA_ALIGN(sizeof(struct nlattr)))
@@ -492,7 +496,7 @@ static void drain_rtnl(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
 static struct nlattr *nla_find(struct nlattr *head, int len, int type)
 {
     for (struct nlattr *n = head; HADC_NLA_OK(n, len); ) {
-        if (n->nla_type == type) return n;
+        if ((n->nla_type & NLA_TYPE_MASK) == (uint16_t)type) return n;
         int _sz = NLA_ALIGN(n->nla_len);
         len -= _sz;
         n = (struct nlattr *)((char *)n + _sz);
@@ -505,6 +509,9 @@ static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATAL
 
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
+
+static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b);
+static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude);
 
 static void ctnl_abort_dump(struct hadc_conntrack *ct)
 {
@@ -527,6 +534,7 @@ static void ctnl_abort_dump(struct hadc_conntrack *ct)
 static void ctnl_close(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) close(ct->ctnl_fd);
     ct->ctnl_fd=-1;
+    ct->ctnl_subscribed = false;
     ctnl_abort_dump(ct);
     ct->ctnl_dump_aborted = false;
     ct->ctnl_dump_start_ms = 0;
@@ -534,13 +542,29 @@ static void ctnl_close(struct hadc_conntrack *ct){
     ct->dump_event_overflow = false;
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
 }
-static int ctnl_open(struct hadc_conntrack *ct){
-    if(ct->ctnl_fd>=0) return 0;
+static int ctnl_open(struct hadc_conntrack *ct, bool subscribe_events){
+    if(ct->ctnl_fd>=0) {
+        if (ct->ctnl_subscribed == subscribe_events)
+            return 0;
+        ctnl_close(ct);
+    }
     int fd=socket(AF_NETLINK,SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC,NETLINK_NETFILTER);
     if(fd<0) return -1;
-    struct sockaddr_nl sa={.nl_family=AF_NETLINK,.nl_groups=(1u<<(NFNLGRP_CONNTRACK_NEW-1))|(1u<<(NFNLGRP_CONNTRACK_UPDATE-1))|(1u<<(NFNLGRP_CONNTRACK_DESTROY-1))};
+    uint32_t groups = 0;
+    if (subscribe_events) {
+        groups = (1u<<(NFNLGRP_CONNTRACK_NEW-1)) |
+                 (1u<<(NFNLGRP_CONNTRACK_UPDATE-1)) |
+                 (1u<<(NFNLGRP_CONNTRACK_DESTROY-1));
+#ifdef NFNLGRP_CONNTRACK_EXP_NEW
+        groups |= (1u<<(NFNLGRP_CONNTRACK_EXP_NEW-1));
+        groups |= (1u<<(NFNLGRP_CONNTRACK_EXP_UPDATE-1));
+        groups |= (1u<<(NFNLGRP_CONNTRACK_EXP_DESTROY-1));
+#endif
+    }
+    struct sockaddr_nl sa={.nl_family=AF_NETLINK,.nl_groups=groups};
     if(bind(fd,(struct sockaddr*)&sa,sizeof(sa))!=0){close(fd);return -1;}
     ct->ctnl_fd=fd;
+    ct->ctnl_subscribed = subscribe_events;
     ct->ctnl_apply_seq = 1;
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
     return 0;
@@ -561,6 +585,10 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     ct->ctnl_dump_start_ms = now_ms();
     ct->dump_event_count = 0;
     ct->dump_event_overflow = false;
+    hadc_info("conntrack: ct dump requested seq=%u", ct->ctnl_dump_seq);
+    /* best-effort: also request expectation dump on same socket/seq space logic
+     * is complex to multiplex; expectations arrive as events and are treated as
+     * incremental in v1. */
     return 0;
 }
 
@@ -590,13 +618,64 @@ static int parse_tuple_v4(struct nlattr *tuple,uint32_t *sip,uint16_t *sp,uint8_
     return 0;
 }
 
-static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out, bool *is_del){
-    memset(out,0,sizeof(*out)); out->family=AF_INET; out->addr_len=4; if(is_del)*is_del=false;
+static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out, bool *is_del, uint32_t *ct_id){
+    memset(out,0,sizeof(*out)); out->family=AF_INET; out->addr_len=4;
+    if(is_del)*is_del=false;
+    if(ct_id)*ct_id=0;
     if((int)nh->nlmsg_len < (int)NLMSG_LENGTH(sizeof(struct nfgenmsg))) return false;
     struct nfgenmsg *nf=NLMSG_DATA(nh); if(nf->nfgen_family!=AF_INET) return false;
-    uint16_t mtype=nh->nlmsg_type & 0x00ff; if(is_del)*is_del=(mtype==IPCTNL_MSG_CT_DELETE);
+    uint16_t mtype = nh->nlmsg_type & 0x00ff;
+    uint8_t subsys = (uint8_t)(nh->nlmsg_type >> 8);
+    bool is_exp = (subsys == NFNL_SUBSYS_CTNETLINK_EXP);
+    if (is_del) *is_del = is_exp ? (mtype == IPCTNL_MSG_EXP_DELETE) : (mtype == IPCTNL_MSG_CT_DELETE);
+    out->ct_kind = is_exp ? 1 : 0;
     struct nlattr *attr=(struct nlattr*)((char*)nf+NLMSG_ALIGN(sizeof(*nf)));
-    int alen=(int)nh->nlmsg_len-(int)NLMSG_SPACE(sizeof(*nf));
+    int alen=NLMSG_PAYLOAD(nh, sizeof(*nf));
+
+    struct nlattr *idn = nla_find(attr, alen, CTA_ID);
+    if (ct_id && idn) *ct_id = ntohl(nla_get_u32(idn));
+
+    if (out->ct_kind == 1) {
+        /* expectation: master/tuple/mask/timeout/helper/zone/class/flags/nat */
+        struct nlattr *exp_tuple=nla_find(attr,alen,CTA_EXPECT_TUPLE);
+        struct nlattr *exp_mask=nla_find(attr,alen,CTA_EXPECT_MASK);
+        struct nlattr *exp_master=nla_find(attr,alen,CTA_EXPECT_MASTER);
+        struct nlattr *exp_help=nla_find(attr,alen,CTA_EXPECT_HELP_NAME);
+        struct nlattr *exp_timeout=nla_find(attr,alen,CTA_EXPECT_TIMEOUT);
+        struct nlattr *exp_zone=nla_find(attr,alen,CTA_EXPECT_ZONE);
+        struct nlattr *exp_class=nla_find(attr,alen,CTA_EXPECT_CLASS);
+        struct nlattr *exp_flags=nla_find(attr,alen,CTA_EXPECT_FLAGS);
+        struct nlattr *exp_id=nla_find(attr,alen,CTA_EXPECT_ID);
+        if (ct_id && exp_id) *ct_id = ntohl(nla_get_u32(exp_id));
+        /* tuple is the expected flow */
+        if(!exp_tuple && !exp_master) return false;
+        uint8_t proto=0;
+        if(exp_tuple) (void)parse_tuple_v4(exp_tuple,&out->orig_src,&out->orig_sport,&proto,&out->orig_dst,&out->orig_dport);
+        if(proto==0 && exp_master) (void)parse_tuple_v4(exp_master,&out->repl_src,&out->repl_sport,&proto,&out->repl_dst,&out->repl_dport);
+        out->proto = proto;
+        /* preserve master tuple for context where possible */
+        if(exp_master) {
+            uint8_t mp = proto;
+            (void)parse_tuple_v4(exp_master,&out->repl_src,&out->repl_sport,&mp,&out->repl_dst,&out->repl_dport);
+            if(out->proto==0) out->proto = mp;
+        } else if (exp_tuple) {
+            /* no master tuple: mirror expected into reply as best-effort identity */
+            out->repl_src=out->orig_src; out->repl_dst=out->orig_dst;
+            out->repl_sport=out->orig_sport; out->repl_dport=out->orig_dport;
+        }
+        if(exp_mask) {
+            /* mask not fully representable in v1 fixed record; mark helper/related */
+            (void)exp_mask;
+        }
+        if(exp_timeout) out->timeout_s = ntohl(nla_get_u32(exp_timeout));
+        if(exp_zone) out->zone = ntohl(nla_get_u32(exp_zone));
+        if(exp_class) out->helper_id = (uint8_t)nla_get_u32(exp_class); /* best-effort */
+        if(exp_flags) { uint32_t ef = ntohl(nla_get_u32(exp_flags)); if(ef) out->flags |= 2; }
+        out->flags |= 2; /* expectations are related/helper traffic */
+        if(exp_help){ int dl=HADC_NLA_DATALEN(exp_help); if(dl>0){ char nb[32]; int c=dl<31?dl:31; memcpy(nb,HADC_NLA_DATA(exp_help),c); nb[c]='\0'; if(strstr(nb,"sip")){ out->helper_id=1; } } }
+        return true;
+    }
+
     struct nlattr *orig=nla_find(attr,alen,CTA_TUPLE_ORIG), *repl=nla_find(attr,alen,CTA_TUPLE_REPLY);
     if(!orig||!repl) return false;
     uint8_t proto=0;
@@ -604,6 +683,8 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
     out->proto = proto;
     (void)parse_tuple_v4(repl,&out->repl_src,&out->repl_sport,&proto,&out->repl_dst,&out->repl_dport);
     struct nlattr *st=nla_find(attr,alen,CTA_STATUS), *to=nla_find(attr,alen,CTA_TIMEOUT), *mk=nla_find(attr,alen,CTA_MARK), *zn=nla_find(attr,alen,CTA_ZONE), *pi=nla_find(attr,alen,CTA_PROTOINFO), *hp=nla_find(attr,alen,CTA_HELP);
+    struct nlattr *nats=nla_find(attr,alen,CTA_NAT_SRC), *natd=nla_find(attr,alen,CTA_NAT_DST);
+    struct nlattr *sao=nla_find(attr,alen,CTA_SEQ_ADJ_ORIG), *sar=nla_find(attr,alen,CTA_SEQ_ADJ_REPLY);
     if(st) out->status=ntohl(nla_get_u32(st));
     if(to) out->timeout_s=ntohl(nla_get_u32(to));
     if(mk) out->mark=ntohl(nla_get_u32(mk));
@@ -614,12 +695,159 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
             struct nlattr *state=nla_find(ta,tl,CTA_PROTOINFO_TCP_STATE); if(state) out->tcp_state=nla_get_u8(state); }
     }
     if(out->status & IPS_NAT_MASK) out->flags|=1;
+    if(nats || natd || sao || sar) out->flags |= 1; /* explicit NAT/seqadj implies NAT */
     if(out->status & IPS_ASSURED) out->flags|=4;
     if(hp){ struct nlattr *ha=(struct nlattr*)HADC_NLA_DATA(hp); int hl=HADC_NLA_DATALEN(hp);
         struct nlattr *name=nla_find(ha,hl,CTA_HELP_NAME);
         if(name){ int dl=HADC_NLA_DATALEN(name); if(dl>0){ char nb[32]; int c=dl<31?dl:31; memcpy(nb,HADC_NLA_DATA(name),c); nb[c]='\0'; if(strstr(nb,"sip")){ out->helper_id=1; out->flags|=2; } } }
     }
     return true;
+}
+
+static bool ct_entry_significant_change(const hadc_ct_entry_v1_t *o, const hadc_ct_entry_v1_t *n)
+{
+    /* status/protoinfo/mark/helper/NAT flags affect forwarding; timeout is not. */
+    return o->status != n->status ||
+           o->tcp_state != n->tcp_state ||
+           o->mark != n->mark ||
+           o->zone != n->zone ||
+           o->helper_id != n->helper_id ||
+           o->flags != n->flags ||
+           o->ct_kind != n->ct_kind;
+}
+
+
+static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b)
+{
+    return a->proto == b->proto &&
+           a->orig_src == b->orig_src && a->orig_dst == b->orig_dst &&
+           a->orig_sport == b->orig_sport && a->orig_dport == b->orig_dport &&
+           a->repl_src == b->repl_src && a->repl_dst == b->repl_dst &&
+           a->repl_sport == b->repl_sport && a->repl_dport == b->repl_dport &&
+           a->zone == b->zone;
+}
+
+static uint32_t ct_tuple_hash(const hadc_ct_entry_v1_t *e)
+{
+    uint32_t h = 2166136261u;
+#define CT_HASH_MIX(v) do { uint32_t _x = (uint32_t)(v); h ^= _x; h *= 16777619u; } while(0)
+    CT_HASH_MIX(e->proto);
+    CT_HASH_MIX(e->orig_src); CT_HASH_MIX(e->orig_dst);
+    CT_HASH_MIX(e->orig_sport); CT_HASH_MIX(e->orig_dport);
+    CT_HASH_MIX(e->repl_src); CT_HASH_MIX(e->repl_dst);
+    CT_HASH_MIX(e->repl_sport); CT_HASH_MIX(e->repl_dport);
+    CT_HASH_MIX(e->zone);
+#undef CT_HASH_MIX
+    return h & (HADC_CT_SHADOW_HASH - 1);
+}
+
+static void shadow_hash_init(struct hadc_conntrack *ct)
+{
+    for (size_t i = 0; i < HADC_CT_SHADOW_HASH; i++)
+        ct->shadow_buckets[i] = -1;
+    for (size_t i = 0; i < HADC_CT_SHADOW_MAX; i++)
+        ct->shadow[i].hnext = -1;
+}
+
+static hadc_ct_shadow_ent_t *shadow_find(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e)
+{
+    uint32_t b = ct_tuple_hash(e);
+    for (int16_t idx = ct->shadow_buckets[b]; idx >= 0; idx = ct->shadow[idx].hnext) {
+        hadc_ct_shadow_ent_t *s = &ct->shadow[idx];
+        if (s->valid && same_tuple(&s->e, e))
+            return s;
+    }
+    return NULL;
+}
+
+static void shadow_unlink(struct hadc_conntrack *ct, hadc_ct_shadow_ent_t *s)
+{
+    size_t idx = (size_t)(s - ct->shadow);
+    if (idx >= ct->n_shadow) return;
+    uint32_t b = ct_tuple_hash(&s->e);
+    int16_t *pp = &ct->shadow_buckets[b];
+    while (*pp >= 0) {
+        if ((size_t)*pp == idx) {
+            *pp = s->hnext;
+            s->hnext = -1;
+            return;
+        }
+        pp = &ct->shadow[*pp].hnext;
+    }
+    s->hnext = -1;
+}
+
+static void shadow_link(struct hadc_conntrack *ct, hadc_ct_shadow_ent_t *s)
+{
+    size_t idx = (size_t)(s - ct->shadow);
+    uint32_t b = ct_tuple_hash(&s->e);
+    s->hnext = ct->shadow_buckets[b];
+    ct->shadow_buckets[b] = (int16_t)idx;
+}
+
+static hadc_ct_shadow_ent_t *shadow_alloc_slot(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e)
+{
+    (void)e;
+    for (size_t i = 0; i < ct->n_shadow; i++) {
+        if (!ct->shadow[i].valid) {
+            ct->shadow[i].hnext = -1;
+            return &ct->shadow[i];
+        }
+    }
+    if (ct->n_shadow < HADC_CT_SHADOW_MAX) {
+        hadc_ct_shadow_ent_t *s = &ct->shadow[ct->n_shadow++];
+        s->hnext = -1;
+        return s;
+    }
+    /* evict oldest valid */
+    size_t victim = SIZE_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (size_t i = 0; i < ct->n_shadow; i++) {
+        if (!ct->shadow[i].valid) { victim = i; break; }
+        if (ct->shadow[i].updated_ms < oldest) { oldest = ct->shadow[i].updated_ms; victim = i; }
+    }
+    if (victim == SIZE_MAX) return NULL;
+    hadc_ct_shadow_ent_t *s = &ct->shadow[victim];
+    if (s->valid) {
+        shadow_unlink(ct, s);
+        s->valid = false;
+        ct->st.dropped_entries++;
+    }
+    s->hnext = -1;
+    return s;
+}
+
+static void shadow_mark_dirty(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e)
+{
+    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
+    if (s) {
+        s->e = *e;
+        s->timer_dirty = true;
+        s->updated_ms = now_ms();
+        return;
+    }
+    s = shadow_alloc_slot(ct, e);
+    if (!s) return;
+    s->e = *e;
+    s->updated_ms = now_ms();
+    s->valid = true;
+    s->seen_in_snapshot = false;
+    s->timer_dirty = true;
+    shadow_link(ct, s);
+}
+
+static void shadow_flush_timer_dirty(struct hadc_conntrack *ct)
+{
+    if (!ct) return;
+    uint64_t now = now_ms();
+    for (size_t i = 0; i < ct->n_shadow; i++) {
+        hadc_ct_shadow_ent_t *s = &ct->shadow[i];
+        if (!s->valid || !s->timer_dirty) continue;
+        if (ct->max_entry_age_s > 0 && now - s->updated_ms > (uint64_t)ct->max_entry_age_s * 1000)
+            continue;
+        master_queue_entry_all(ct, HADC_CT_MSG_UPSERT, &s->e, NULL);
+        s->timer_dirty = false;
+    }
 }
 
 static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude)
@@ -658,7 +886,7 @@ static bool nla_put_u16(char *buf, size_t buflen, size_t *off, uint16_t type, ui
 static bool nla_put_u8(char *buf, size_t buflen, size_t *off, uint16_t type, uint8_t v){ return nla_put(buf,buflen,off,type,&v,sizeof(v)); }
 static size_t nla_nest_start(char *buf, size_t buflen, size_t *off, uint16_t type){
     size_t start = *off;
-    if (!nla_put(buf, buflen, off, type, NULL, 0)) return (size_t)-1;
+    if (!nla_put(buf, buflen, off, (uint16_t)(type | NLA_F_NESTED), NULL, 0)) return (size_t)-1;
     return start;
 }
 static void nla_nest_end(char *buf, size_t start, size_t off){
@@ -770,6 +998,10 @@ static hadc_ct_apply_pending_t *ctnl_find_apply(struct hadc_conntrack *ct, uint3
 static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool is_del)
 {
     if (!ct || ct->ctnl_fd < 0 || !e) return -1;
+    /* Expectations are not fully representable in v1 wire/apply record; do not
+     * mis-apply them as conntrack entries. Keep replicated/shadowed for
+     * visibility and resync, but skip kernel apply on slave. */
+    if (e->ct_kind == 1) return 0;
     hadc_ct_apply_pending_t *ap = ctnl_alloc_apply(ct);
     if (!ap) {
         /* pending table full: best-effort untracked send */
@@ -813,14 +1045,16 @@ static void ctnl_apply_retry_tick(struct hadc_conntrack *ct, uint64_t now)
 static void apply_shadow_all(struct hadc_conntrack *ct)
 {
     if (!ct) return;
-    if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
     if (ct->ctnl_fd < 0) return;
     uint64_t now = now_ms();
     for (size_t i = 0; i < ct->n_shadow; i++) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[i];
         if (!s->valid) continue;
         if (ct->max_entry_age_s > 0 && now - s->updated_ms > (uint64_t)ct->max_entry_age_s * 1000) {
+            shadow_unlink(ct, s);
             s->valid = false;
+            s->timer_dirty = false;
             continue;
         }
         (void)ctnl_apply_entry(ct, &s->e, false);
@@ -830,17 +1064,23 @@ static void apply_shadow_all(struct hadc_conntrack *ct)
 static void prune_shadow(struct hadc_conntrack *ct, uint64_t now)
 {
     if (!ct) return;
+    bool changed = false;
     if (ct->max_entry_age_s > 0) {
         uint64_t max_age = (uint64_t)ct->max_entry_age_s * 1000;
         for (size_t i = 0; i < ct->n_shadow; i++) {
             hadc_ct_shadow_ent_t *s = &ct->shadow[i];
-            if (s->valid && now - s->updated_ms > max_age)
+            if (s->valid && now - s->updated_ms > max_age) {
+                shadow_unlink(ct, s);
                 s->valid = false;
+                s->timer_dirty = false;
+                changed = true;
+            }
         }
     }
-    /* compact invalid head/tail slots so n_shadow does not grow unbounded */
+    /* compact invalid tail slots */
     while (ct->n_shadow > 0 && !ct->shadow[ct->n_shadow - 1].valid)
         ct->n_shadow--;
+    (void)changed;
 }
 
 static void drain_ctnl(struct hadc_conntrack *ct){
@@ -854,6 +1094,7 @@ static void drain_ctnl(struct hadc_conntrack *ct){
         for(struct nlmsghdr *nh=(struct nlmsghdr*)buf; NLMSG_OK(nh,(unsigned)n); nh=NLMSG_NEXT(nh,n)){
             if(nh->nlmsg_type==NLMSG_DONE){
                 /* dump completed; if not aborted, allow snapshot_end to be sent after flush */
+                hadc_info("conntrack: ct dump done seq=%u pending=%d", nh->nlmsg_seq, (int)ct->ctnl_dump_pending);
                 if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted)
                     ct->ctnl_dump_pending = false;
                 ct->ctnl_dump_aborted = false;
@@ -893,6 +1134,7 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                     if (e != 0) {
                         if (ct->ctnl_dump_pending && (eseq == ct->ctnl_dump_seq || eseq == 0)) {
                             /* dump request failed/aborted: do not send incomplete snapshot */
+                            hadc_warn("conntrack: dump nlerr %d seq=%u dump_seq=%u", e, eseq, ct->ctnl_dump_seq);
                             ctnl_abort_dump(ct);
                             in_dump = false;
                             continue;
@@ -909,8 +1151,9 @@ static void drain_ctnl(struct hadc_conntrack *ct){
             if(NFNL_SUBSYS_ID(nh->nlmsg_type)!=NFNL_SUBSYS_CTNETLINK) continue;
             uint16_t mtype_raw = nh->nlmsg_type & 0x00ff;
             bool event_msg = (mtype_raw == IPCTNL_MSG_CT_NEW || mtype_raw == IPCTNL_MSG_CT_DELETE);
-            hadc_ct_entry_v1_t e; bool del=false;
-            if(!parse_ct_entry_v4(nh,&e,&del)) continue;
+            bool is_ct_new_msg = (mtype_raw == IPCTNL_MSG_CT_NEW);
+            hadc_ct_entry_v1_t e; bool del=false; uint32_t ct_id=0;
+            if(!parse_ct_entry_v4(nh,&e,&del,&ct_id)) continue;
             const char *reason=NULL;
             if(ct->non_local_only && !classify_non_local(ct,&e,&reason)) continue;
             if(!ct->include_related && (e.flags&2)) continue;
@@ -928,19 +1171,60 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                     }
                     continue;
                 }
-                uint8_t mtype;
                 if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && !del) {
-                    mtype = HADC_CT_MSG_SNAPSHOT_ENTRY;
-                } else if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && del) {
-                    /* defensive: treat dump deletions as delete to avoid resurrection */
-                    mtype = HADC_CT_MSG_DELETE;
-                    e.flags |= 8;
-                } else {
-                    mtype = del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT;
-                    if (del) e.flags |= 8;
+                    master_queue_entry_all(ct, HADC_CT_MSG_SNAPSHOT_ENTRY, &e, NULL);
+                    if (ct->timer_sync_interval_s > 0) {
+                        hadc_ct_shadow_ent_t *s = shadow_find(ct, &e);
+                        if (s) { s->e = e; s->timer_dirty = false; s->updated_ms = now_ms(); }
+                        else {
+                            hadc_ct_shadow_ent_t *ns = shadow_alloc_slot(ct, &e);
+                            if (ns) { ns->e = e; ns->updated_ms = now_ms(); ns->valid = true; ns->seen_in_snapshot = false; ns->timer_dirty = false; shadow_link(ct, ns); }
+                        }
+                    }
+                    continue;
                 }
-                if (!(ct->ctnl_dump_pending && ct->ctnl_dump_aborted && mtype == HADC_CT_MSG_SNAPSHOT_ENTRY))
-                    master_queue_entry_all(ct, mtype, &e, NULL);
+                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && del) {
+                    e.flags |= 8;
+                    master_queue_entry_all(ct, HADC_CT_MSG_DELETE, &e, NULL);
+                    {
+                        hadc_ct_shadow_ent_t *s = shadow_find(ct, &e);
+                        if (s) { shadow_unlink(ct, s); s->valid = false; s->timer_dirty = false; }
+                    }
+                    continue;
+                }
+                if (del) {
+                    e.flags |= 8;
+                    master_queue_entry_all(ct, HADC_CT_MSG_DELETE, &e, NULL);
+                    {
+                        hadc_ct_shadow_ent_t *s = shadow_find(ct, &e);
+                        if (s) { shadow_unlink(ct, s); s->valid = false; s->timer_dirty = false; }
+                    }
+                    continue;
+                }
+                if (ct->timer_sync_interval_s > 0 && is_ct_new_msg) {
+                    /* Batch non-state-changing updates (timer refreshes). */
+                    hadc_ct_shadow_ent_t *shadow = shadow_find(ct, &e);
+                    if (shadow && !ct_entry_significant_change(&shadow->e, &e)) {
+                        shadow->e = e;
+                        shadow->timer_dirty = true;
+                        shadow->updated_ms = now_ms();
+                        continue;
+                    }
+                    if (shadow) {
+                        shadow->e = e;
+                        shadow->timer_dirty = false;
+                        shadow->updated_ms = now_ms();
+                    } else {
+                        shadow_mark_dirty(ct, &e);
+                        hadc_ct_shadow_ent_t *s2 = shadow_find(ct, &e);
+                        if (s2) s2->timer_dirty = false;
+                    }
+                    master_queue_entry_all(ct, HADC_CT_MSG_UPSERT, &e, NULL);
+                    continue;
+                }
+                /* timer-sync disabled or non-CT_NEW: send immediately */
+                master_queue_entry_all(ct, HADC_CT_MSG_UPSERT, &e, NULL);
+                continue;
             }
             /* slaves receive authoritative state over TCP; ignore local ctnl events */
         }
@@ -949,11 +1233,10 @@ static void drain_ctnl(struct hadc_conntrack *ct){
 
 static void refresh_owned_addrs_locked(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
 {
-    /* Rebuild base (VIP/lease) + getifaddrs view, and request rtnetlink dump to
-     * keep event-driven cache fresh for managed interfaces. */
+    /* Rebuild base (VIP/lease) + getifaddrs view. Netlink addr events keep this
+     * fresh between periodic refreshes; do not request a dump on every refresh to
+     * avoid rtnetlink request/response churn. */
     refresh_owned_addrs_getifaddrs(ct, ctx);
-    if (ct->rtnl_fd >= 0)
-        rtnl_dump_addrs(ct);
 }
 
 static bool probe_cthelper_sip(void)
@@ -1078,6 +1361,7 @@ static void snapshot_config_locked(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
     ct->max_queue_entries = ctx->conf.conntrack_sync.max_queue_entries;
     ct->snapshot_on_connect = ctx->conf.conntrack_sync.snapshot_on_connect;
     ct->resync_interval_s = ctx->conf.conntrack_sync.resync_interval_s;
+    ct->timer_sync_interval_s = ctx->conf.conntrack_sync.timer_sync_interval_s;
     ct->non_local_only = ctx->conf.conntrack_sync.filter.non_local_only;
     ct->include_related = ctx->conf.conntrack_sync.filter.include_related;
     ct->exclude_loopback = ctx->conf.conntrack_sync.filter.exclude_loopback;
@@ -1318,65 +1602,37 @@ static hadc_ct_peer_t *peer_by_addr(struct hadc_conntrack *ct, struct in_addr a)
     return NULL;
 }
 
-static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b)
-{
-    return a->proto == b->proto &&
-           a->orig_src == b->orig_src && a->orig_dst == b->orig_dst &&
-           a->orig_sport == b->orig_sport && a->orig_dport == b->orig_dport &&
-           a->repl_src == b->repl_src && a->repl_dst == b->repl_dst &&
-           a->repl_sport == b->repl_sport && a->repl_dport == b->repl_dport &&
-           a->zone == b->zone;
-}
 
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del)
 {
     /* Shadow state kept for staged apply on promotion and as replica cache. */
-    for (size_t i = 0; i < ct->n_shadow; i++) {
-        hadc_ct_shadow_ent_t *s = &ct->shadow[i];
-        if (!s->valid) continue;
-        if (!same_tuple(&s->e, e)) continue;
-        if (del) { s->valid = false; ct->st.applied_entries++; }
-        else { s->e = *e; s->updated_ms = now_ms(); s->seen_in_snapshot = ct->rx_snapshot_active; ct->st.applied_entries++; }
+    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
+    if (s) {
+        if (del) {
+            shadow_unlink(ct, s);
+            s->valid = false;
+            s->timer_dirty = false;
+            ct->st.applied_entries++;
+        } else {
+            s->e = *e;
+            s->updated_ms = now_ms();
+            s->seen_in_snapshot = ct->rx_snapshot_active;
+            s->timer_dirty = false;
+            ct->st.applied_entries++;
+        }
         return;
     }
     if (del)
         return;
-    for (size_t i = 0; i < ct->n_shadow; i++) {
-        if (!ct->shadow[i].valid) {
-            ct->shadow[i].e = *e;
-            ct->shadow[i].updated_ms = now_ms();
-            ct->shadow[i].valid = true;
-            ct->shadow[i].seen_in_snapshot = ct->rx_snapshot_active;
-            ct->st.applied_entries++;
-            return;
-        }
-    }
-    if (ct->n_shadow < HADC_CT_SHADOW_MAX) {
-        hadc_ct_shadow_ent_t *s = &ct->shadow[ct->n_shadow++];
-        s->e = *e;
-        s->updated_ms = now_ms();
-        s->valid = true;
-        s->seen_in_snapshot = ct->rx_snapshot_active;
-        ct->st.applied_entries++;
-    } else {
-        /* bounded table full: evict oldest valid entry as best-effort */
-        size_t victim = SIZE_MAX;
-        uint64_t oldest = UINT64_MAX;
-        for (size_t i = 0; i < ct->n_shadow; i++) {
-            if (!ct->shadow[i].valid) { victim = i; break; }
-            if (ct->shadow[i].updated_ms < oldest) { oldest = ct->shadow[i].updated_ms; victim = i; }
-        }
-        if (victim != SIZE_MAX) {
-            ct->shadow[victim].e = *e;
-            ct->shadow[victim].updated_ms = now_ms();
-            ct->shadow[victim].valid = true;
-            ct->shadow[victim].seen_in_snapshot = ct->rx_snapshot_active;
-            ct->st.applied_entries++;
-            ct->st.dropped_entries++; /* indicates churn/eviction pressure */
-        } else {
-            ct->st.dropped_entries++;
-        }
-    }
+    s = shadow_alloc_slot(ct, e);
+    if (!s) { ct->st.dropped_entries++; return; }
+    s->e = *e;
+    s->updated_ms = now_ms();
+    s->valid = true;
+    s->seen_in_snapshot = ct->rx_snapshot_active;
+    s->timer_dirty = false;
+    shadow_link(ct, s);
+    ct->st.applied_entries++;
 }
 
 static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const hadc_ct_hdr_t *h, const uint8_t *payload)
@@ -1426,33 +1682,47 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     }
     if (h->type == HADC_CT_MSG_SNAPSHOT_END) {
         if (ct->role == HADC_ROLE_SLAVE && ct->rx_snapshot_active) {
+            bool recent_handoff = ct->slave_recent_master_handoff;
             for (size_t i = 0; i < ct->n_shadow; i++) {
                 hadc_ct_shadow_ent_t *s = &ct->shadow[i];
                 if (!s->valid || s->seen_in_snapshot)
                     continue;
-                /* master missed this entry: keep/validate and report fix to master */
                 char desc[256];
                 ct_entry_log_tuple(desc, sizeof(desc), &s->e);
-                hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
-                s->seen_in_snapshot = true; /* avoid repeated reports for this snapshot cycle */
-                s->updated_ms = now_ms();
-                if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
-                    if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
-                    (void)ctnl_apply_entry(ct, &s->e, false);
+                if (recent_handoff) {
+                    /* recent master handoff: keep/validate and report fix on first snapshot */
+                    hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
+                    s->seen_in_snapshot = true; /* avoid repeated reports for this snapshot cycle */
+                    s->updated_ms = now_ms();
+                    if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
+                        if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
+                        (void)ctnl_apply_entry(ct, &s->e, false);
+                    }
+                    bool reported = false;
+                    for (size_t pi = 0; pi < ct->n_peers; pi++) {
+                        hadc_ct_peer_t *mp = &ct->peers[pi];
+                        if (!mp->connected || !mp->hello_ok || !mp->peer_is_master)
+                            continue;
+                        int rc = send_frame(ct, mp, HADC_CT_MSG_UPSERT, 0, &s->e, sizeof(s->e));
+                        if (rc >= 0)
+                            reported = true;
+                    }
+                    if (!reported)
+                        ct->st.dropped_entries++;
+                } else {
+                    /* normal snapshot: master is authority, remove stale local/shadow state */
+                    hadc_info("conntrack: master snapshot omits entry, removing stale slave state: %s", desc);
+                    shadow_unlink(ct, s);
+                    s->valid = false;
+                    s->timer_dirty = false;
+                    if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
+                        if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
+                        (void)ctnl_apply_entry(ct, &s->e, true);
+                    }
                 }
-                bool reported = false;
-                for (size_t pi = 0; pi < ct->n_peers; pi++) {
-                    hadc_ct_peer_t *mp = &ct->peers[pi];
-                    if (!mp->connected || !mp->hello_ok || !mp->peer_is_master)
-                        continue;
-                    int rc = send_frame(ct, mp, HADC_CT_MSG_UPSERT, 0, &s->e, sizeof(s->e));
-                    if (rc >= 0)
-                        reported = true;
-                }
-                if (!reported)
-                    ct->st.dropped_entries++;
             }
             ct->rx_snapshot_active = false;
+            ct->slave_recent_master_handoff = false;
         }
         return;
     }
@@ -1471,7 +1741,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             bool ok = classify_non_local(ct, e, &reason) || !ct->non_local_only;
             if (ok || del) {
                 if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
-                    if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+                    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
                     (void)ctnl_apply_entry(ct, e, del);
                 }
                 stage_or_apply(ct, e, del);
@@ -1487,7 +1757,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                 ct_entry_log_tuple(desc, sizeof(desc), e);
                 hadc_info("conntrack: master accepted %s fix from %s: %s",
                           del ? "delete" : "upsert", p->id, desc);
-                if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+                if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
                 (void)ctnl_apply_entry(ct, e, del);
                 master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e, p);
                 ct->st.rx_entries++;
@@ -1608,7 +1878,7 @@ static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t
     p->snapshot_active = true;
     p->need_resync = false;
     ct->st.resync_count++;
-    if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, true);
     if (ct->ctnl_fd >= 0) {
         if (ctnl_request_dump(ct) < 0)
             p->need_resync = true;
@@ -1638,10 +1908,14 @@ static void *conntrack_thread_main(void *arg)
             close(ct->rtnl_fd);
             ct->rtnl_fd = -1;
         }
-        if (ct->enabled && ct->ctnl_fd < 0)
-            (void)ctnl_open(ct);
-        else if (!ct->enabled && ct->ctnl_fd >= 0)
+        bool want_ctnl_events = (ct->enabled && ct->role == HADC_ROLE_MASTER);
+        if (!ct->enabled) {
+            if (ct->ctnl_fd >= 0) ctnl_close(ct);
+        } else if (ct->ctnl_fd >= 0 && ct->ctnl_subscribed != want_ctnl_events && !ct->ctnl_dump_pending) {
             ctnl_close(ct);
+        }
+        if (ct->enabled && ct->ctnl_fd < 0)
+            (void)ctnl_open(ct, want_ctnl_events);
         /* if peers await snapshot but dump is idle, (re)request it */
         if (ct->enabled && ct->role == HADC_ROLE_MASTER && ct->ctnl_fd >= 0 &&
             !ct->ctnl_dump_pending) {
@@ -1679,8 +1953,10 @@ static void *conntrack_thread_main(void *arg)
             if (ct->listen_fd >= 0) { close(ct->listen_fd); ct->listen_fd = -1; }
             if (ct->ctnl_fd >= 0) ctnl_close(ct);
             ct->n_shadow = 0;
+            shadow_hash_init(ct);
             ct->rx_snapshot_active = false;
             ct->slave_resync_requested = false;
+            ct->slave_recent_master_handoff = false;
             for (size_t i = 0; i < ct->n_peers; i++) {
                 ct->peers[i].need_resync = false;
                 if (ct->peers[i].fd >= 0 || ct->peers[i].connected)
@@ -1697,6 +1973,11 @@ static void *conntrack_thread_main(void *arg)
             for (size_t i = 0; i < ct->n_peers; i++) ct->peers[i].need_resync = true;
             ct->last_resync_ms = now;
             ct->st.resync_count++;
+        }
+        if (ct->enabled && ct->role == HADC_ROLE_MASTER && ct->timer_sync_interval_s > 0 &&
+            now - ct->last_timer_sync_ms >= (uint64_t)ct->timer_sync_interval_s * 1000) {
+            shadow_flush_timer_dirty(ct);
+            ct->last_timer_sync_ms = now;
         }
 
         ensure_master_connections(ct);
@@ -1768,55 +2049,49 @@ static void *conntrack_thread_main(void *arg)
 
         struct pollfd pfds[1 + 1 + 1 + 1 + HADC_MEMBERS_MAX];
         nfds_t nfds = 0;
-        pfds[nfds++] = (struct pollfd){ .fd = ct->wakefd, .events = POLLIN };
+        int wake_idx = -1, listen_idx = -1, rtnl_idx = -1, ctnl_idx = -1;
+        int peer_idx[HADC_MEMBERS_MAX];
+        for (size_t i = 0; i < HADC_MEMBERS_MAX; i++) peer_idx[i] = -1;
+
+        pfds[nfds] = (struct pollfd){ .fd = ct->wakefd, .events = POLLIN };
+        wake_idx = (int)nfds++;
         pthread_mutex_lock(&ct->lock);
-        if (ct->listen_fd >= 0)
-            pfds[nfds++] = (struct pollfd){ .fd = ct->listen_fd, .events = POLLIN };
-        if (ct->rtnl_fd >= 0)
-            pfds[nfds++] = (struct pollfd){ .fd = ct->rtnl_fd, .events = POLLIN };
-        if (ct->ctnl_fd >= 0)
-            pfds[nfds++] = (struct pollfd){ .fd = ct->ctnl_fd, .events = POLLIN };
+        if (ct->listen_fd >= 0) { listen_idx = (int)nfds; pfds[nfds++] = (struct pollfd){ .fd = ct->listen_fd, .events = POLLIN }; }
+        if (ct->rtnl_fd >= 0) { rtnl_idx = (int)nfds; pfds[nfds++] = (struct pollfd){ .fd = ct->rtnl_fd, .events = POLLIN }; }
+        if (ct->ctnl_fd >= 0) { ctnl_idx = (int)nfds; pfds[nfds++] = (struct pollfd){ .fd = ct->ctnl_fd, .events = POLLIN }; }
         for (size_t i = 0; i < ct->n_peers; i++) {
             if (ct->peers[i].fd >= 0) {
                 short ev = POLLIN | POLLERR | POLLHUP;
                 if (ct->peers[i].txq_count > 0 || ct->peers[i].tx_partial_len > 0) ev |= POLLOUT;
+                peer_idx[i] = (int)nfds;
                 pfds[nfds++] = (struct pollfd){ .fd = ct->peers[i].fd, .events = ev };
             }
         }
         pthread_mutex_unlock(&ct->lock);
 
-        (void)poll(pfds, nfds, 250);
-        if (pfds[0].revents & POLLIN)
+        int prc = poll(pfds, nfds, 250);
+        if (prc < 0 && errno != EINTR)
+            continue;
+        if (wake_idx >= 0 && (pfds[wake_idx].revents & POLLIN))
             drain_wake(ct->wakefd);
 
         pthread_mutex_lock(&ct->lock);
-        if (ct->rtnl_fd >= 0) {
-            struct pollfd r = { .fd = ct->rtnl_fd, .events = POLLIN };
-            if (poll(&r, 1, 0) > 0 && (r.revents & POLLIN))
-                drain_rtnl(ct, ct->ctx);
-        }
-        if (ct->ctnl_fd >= 0) {
-            struct pollfd r = { .fd = ct->ctnl_fd, .events = POLLIN };
-            if (poll(&r, 1, 0) > 0 && (r.revents & POLLIN))
-                drain_ctnl(ct);
-        }
-        if (ct->listen_fd >= 0) {
-            struct pollfd l = { .fd = ct->listen_fd, .events = POLLIN };
-            if (poll(&l, 1, 0) > 0 && (l.revents & POLLIN))
-                accept_peer(ct);
-        }
+        if (ct->rtnl_fd >= 0 && rtnl_idx >= 0 && (pfds[rtnl_idx].revents & POLLIN))
+            drain_rtnl(ct, ct->ctx);
+        if (ct->ctnl_fd >= 0 && ctnl_idx >= 0 && (pfds[ctnl_idx].revents & POLLIN))
+            drain_ctnl(ct);
+        if (ct->listen_fd >= 0 && listen_idx >= 0 && (pfds[listen_idx].revents & POLLIN))
+            accept_peer(ct);
         for (size_t i = 0; i < ct->n_peers; i++) {
             hadc_ct_peer_t *p = &ct->peers[i];
-            if (p->fd < 0)
+            if (p->fd < 0 || peer_idx[i] < 0)
                 continue;
-            short ev = POLLIN | POLLERR | POLLHUP;
-            if (p->txq_count > 0 || p->tx_partial_len > 0) ev |= POLLOUT;
-            struct pollfd chk = { .fd = p->fd, .events = ev };
-            if (poll(&chk, 1, 0) > 0) {
-                if (chk.revents & (POLLERR | POLLHUP)) { close_peer(p); continue; }
-                if (chk.revents & POLLIN) peer_rx(ct, p);
-                if (p->connected && (chk.revents & POLLOUT)) peer_flush_tx(ct, p);
-            }
+            short rev = pfds[peer_idx[i]].revents;
+            if (!rev)
+                continue;
+            if (rev & (POLLERR | POLLHUP | POLLNVAL)) { close_peer(p); continue; }
+            if (rev & POLLIN) peer_rx(ct, p);
+            if (p->connected && (rev & POLLOUT)) peer_flush_tx(ct, p);
         }
         pthread_mutex_unlock(&ct->lock);
     }
@@ -1857,9 +2132,11 @@ int hadc_conntrack_init(hadc_ctx_t *ctx)
     pthread_mutex_init(&ct->lock, NULL);
     for (size_t i = 0; i < HADC_MEMBERS_MAX; i++)
         ct->peers[i].fd = -1;
+    shadow_hash_init(ct);
     ct->apply_shadow_pending = false;
     ct->generation = 1;
     ct->last_resync_ms = now_ms();
+    ct->last_timer_sync_ms = now_ms();
     bool nl_init = ctx->conf.conntrack_sync.helpers.sip != HADC_CT_SIP_OFF ? probe_cthelper_sip() : false;
     pthread_mutex_lock(&ct->lock);
     snapshot_config_locked(ct, ctx);
@@ -1934,11 +2211,13 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
         ct->generation++;
         ct->slave_resync_requested = false;
         ct->rx_snapshot_active = false;
+        ct->slave_recent_master_handoff = false;
         if (old_role == HADC_ROLE_SLAVE)
             ct->apply_shadow_pending = true; /* deferred to worker */
     } else {
         ct->ctnl_dump_pending = false;
         ct->slave_resync_requested = true; /* validate/fix against new master */
+        ct->slave_recent_master_handoff = true; /* first snapshot after handoff may fix */
         for (size_t i = 0; i < ct->n_peers; i++)
             ct->peers[i].snapshot_active = false;
     }

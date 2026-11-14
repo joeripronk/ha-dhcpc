@@ -222,7 +222,7 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     json_t *lj = lease_json(&snap);
     if (!lj)
         return -1;
-    json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:O}", "role",
+    json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:o}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
                                                          : "unknown",

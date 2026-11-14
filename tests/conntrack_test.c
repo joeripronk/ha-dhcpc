@@ -180,6 +180,52 @@ static void test_apply_pending_alloc_find(void) {
     TASSERT(r != NULL, "reuse freed slot");
 }
 
+
+static void test_parse_ct_nat_and_expectation(void) {
+    /* synthetic conntrack NEW with NAT flag and seqadj markers */
+    char msg[1024]; memset(msg,0,sizeof(msg));
+    struct nlmsghdr *nh = (struct nlmsghdr*)msg;
+    struct nfgenmsg *nf = (struct nfgenmsg*)(msg + NLMSG_ALIGN(sizeof(*nh)));
+    nh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK<<8) | IPCTNL_MSG_CT_NEW;
+    nf->nfgen_family = AF_INET; nf->version = NFNETLINK_V0;
+    size_t off = NLMSG_ALIGN(sizeof(*nh)) + NLMSG_ALIGN(sizeof(*nf));
+    uint32_t os=inet_addr("10.0.0.5"), od=inet_addr("8.8.8.8"), rs=inet_addr("8.8.8.8"), rd=inet_addr("203.0.113.9");
+    TASSERT(build_tuple_nla(msg,sizeof(msg),&off,CTA_TUPLE_ORIG,os,od,IPPROTO_TCP,htons(1111),htons(80)), "orig tuple");
+    TASSERT(build_tuple_nla(msg,sizeof(msg),&off,CTA_TUPLE_REPLY,rs,rd,IPPROTO_TCP,htons(80),htons(2222)), "reply tuple");
+    uint32_t st = htonl(IPS_CONFIRMED|IPS_SEEN_REPLY|IPS_SRC_NAT_DONE);
+    TASSERT(nla_put_u32(msg,sizeof(msg),&off,CTA_STATUS,st), "status");
+    uint32_t corr = htonl(1);
+    size_t sao = nla_nest_start(msg,sizeof(msg),&off,CTA_SEQ_ADJ_ORIG);
+    TASSERT(sao!=(size_t)-1, "seqadj orig nest");
+    TASSERT(nla_put_u32(msg,sizeof(msg),&off,CTA_SEQADJ_CORRECTION_POS,corr), "corr pos");
+    nla_nest_end(msg,sao,off);
+    nh->nlmsg_len = (uint32_t)off;
+    hadc_ct_entry_v1_t e; bool del=false; uint32_t ct_id=0;
+    TASSERT(parse_ct_entry_v4(nh,&e,&del,&ct_id), "parse nat ct");
+    TASSERT(!del && e.ct_kind==0, "ct kind new");
+    TASSERT(e.flags & 1, "nat flag from status/seqadj");
+
+    /* synthetic expectation NEW */
+    memset(msg,0,sizeof(msg)); nh=(struct nlmsghdr*)msg; nf=(struct nfgenmsg*)(msg + NLMSG_ALIGN(sizeof(*nh)));
+    nh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK_EXP<<8) | IPCTNL_MSG_EXP_NEW;
+    nf->nfgen_family = AF_INET; nf->version = NFNETLINK_V0;
+    off = NLMSG_ALIGN(sizeof(*nh)) + NLMSG_ALIGN(sizeof(*nf));
+    uint32_t es=inet_addr("203.0.113.5"), ed=inet_addr("10.0.0.5");
+    TASSERT(build_tuple_nla(msg,sizeof(msg),&off,CTA_EXPECT_TUPLE,es,ed,IPPROTO_UDP,htons(5004),htons(6000)), "expect tuple");
+    TASSERT(nla_put_u32(msg,sizeof(msg),&off,CTA_EXPECT_TIMEOUT,htonl(30)), "expect timeout");
+    TASSERT(nla_put(msg,sizeof(msg),&off,CTA_EXPECT_HELP_NAME,"sip",4), "expect help");
+    nh->nlmsg_len = (uint32_t)off;
+    memset(&e,0,sizeof(e)); del=false; ct_id=0;
+    TASSERT(parse_ct_entry_v4(nh,&e,&del,&ct_id), "parse expectation");
+    TASSERT(e.ct_kind==1, "expect ct_kind");
+    TASSERT(!del, "expect not delete");
+    TASSERT(e.proto==IPPROTO_UDP, "expect proto");
+    TASSERT(e.orig_sport==htons(5004) && e.orig_dport==htons(6000), "expect ports");
+    TASSERT(e.timeout_s==30, "expect timeout parsed");
+    TASSERT(e.helper_id==1, "expect sip helper");
+    TASSERT(e.flags & 2, "expect related flag");
+}
+
 static void test_classify_non_local(void) {
     struct hadc_conntrack ct;
     memset(&ct, 0, sizeof(ct));
@@ -227,6 +273,7 @@ int main(void) {
     test_shadow_stage_prune_and_compact();
     test_shadow_eviction_when_full();
     test_apply_pending_alloc_find();
+    test_parse_ct_nat_and_expectation();
     test_classify_non_local();
     if (failures) {
         fprintf(stderr, "%d test(s) failed\n", failures);

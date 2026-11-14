@@ -15,7 +15,11 @@ start_service() {
 	}
 
 	procd_open_instance ha-dhcpc
-	procd_set_param command /usr/bin/ha-dhcpc
+	if [ -f /etc/ha-dhcpc/valgrind.enabled ] && [ -x /usr/bin/valgrind ]; then
+		procd_set_param command /usr/bin/valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes --log-file=/tmp/ha-dhcpc-valgrind.log /usr/bin/ha-dhcpc
+	else
+		procd_set_param command /usr/bin/ha-dhcpc
+	fi
 	procd_set_param respawn 3600 5 30
 	procd_set_param stdout 1
 	procd_set_param stderr 1

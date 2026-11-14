@@ -806,6 +806,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->conntrack_sync.max_queue_entries = 8192;
     out->conntrack_sync.snapshot_on_connect = true;
     out->conntrack_sync.resync_interval_s = 0;
+    out->conntrack_sync.timer_sync_interval_s = 60;
     out->conntrack_sync.filter.non_local_only = true;
     out->conntrack_sync.filter.include_related = true;
     out->conntrack_sync.filter.exclude_loopback = true;
@@ -1023,6 +1024,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 goto derr;
             }
             out->conntrack_sync.resync_interval_s = (uint32_t)v;
+            if (get_int(ct, "timer_sync_interval_s", &v, 60, false, "conntrack_sync")) goto derr;
+            if (v < 0 || v > 86400) {
+                snprintf(err, errlen, "config: conntrack_sync.timer_sync_interval_s out of range");
+                goto derr;
+            }
+            out->conntrack_sync.timer_sync_interval_s = (uint32_t)v;
 
             json_t *f = json_object_get(ct, "filter");
             if (f) {

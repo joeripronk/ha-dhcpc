@@ -1,13 +1,15 @@
 #!/bin/sh
 # Build (from current source) and deploy the ha-dhcpc OpenWrt package to the cluster nodes.
-# Usage: ./deploy-openwrt.sh [--dry-run] [--no-build] [apk-path]
-#   --no-build  deploy newest existing SDK apk instead of building
-#   apk-path    deploy this specific apk (implies --no-build)
+# Usage: ./deploy-openwrt.sh [--dry-run] [--no-build] [--with-valgrind] [apk-path]
+#   --no-build       deploy newest existing SDK apk instead of building
+#   --with-valgrind  run ha-dhcpc under valgrind (memcheck) logging to /tmp/ha-dhcpc-valgrind.log
+#   apk-path         deploy this specific apk (implies --no-build)
 set -eu
 
 HOSTS="studeerkamer woonkamer meterkast"   # slaves first, master last
 DRY_RUN=0
 BUILD=1
+WITH_VALGRIND=0
 APK=
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SDK_DEFAULT="$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64"
@@ -16,6 +18,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--dry-run) DRY_RUN=1 ;;
 	--no-build) BUILD=0 ;;
+	--with-valgrind) WITH_VALGRIND=1 ;;
 	-*)
 		echo "unknown option: $1" >&2
 		exit 1
@@ -38,7 +41,7 @@ if [ -z "$APK" ]; then
 fi
 
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
-echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}"
+echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}${WITH_VALGRIND:+ (with-valgrind)}"
 
 json_field() {
 	python3 -c 'import json,sys
@@ -143,7 +146,11 @@ if [ -n "$MASTER" ]; then
 	if [ "$DRY_RUN" -eq 1 ]; then
 		echo "dry-run: would enable graceful-restart on $MASTER, wait, deploy to: $HOSTS, then disable graceful-restart"
 		for h in $HOSTS; do
-			echo "dry-run: would scp $APK to root@$h:/tmp/ and run 'apk add --allow-untrusted --force /tmp/$(basename "$APK") && /etc/init.d/ha-dhcpc restart'"
+			if [ "$WITH_VALGRIND" -eq 1 ]; then
+				echo "dry-run: would scp $APK to root@$h:/tmp/ and run 'apk add --allow-untrusted --force /tmp/$(basename "$APK") valgrind && mkdir -p /etc/ha-dhcpc && touch /etc/ha-dhcpc/valgrind.enabled && /etc/init.d/ha-dhcpc restart' (valgrind log: /tmp/ha-dhcpc-valgrind.log)"
+			else
+				echo "dry-run: would scp $APK to root@$h:/tmp/ and run 'apk add --allow-untrusted --force /tmp/$(basename "$APK") && rm -f /etc/ha-dhcpc/valgrind.enabled && /etc/init.d/ha-dhcpc restart'"
+			fi
 		done
 		exit 0
 	fi
@@ -165,8 +172,13 @@ for h in $HOSTS; do
 	# --force is required: apk skips same-version installs, so a rebuild of
 	# the same PKG_VERSION would otherwise leave the old binary in place.
 	# The install does not restart the running service, so restart right after.
-	ssh -q "root@$h" "apk add --allow-untrusted --force '/tmp/$(basename "$APK")' && /etc/init.d/ha-dhcpc restart" \
-		&& echo "$h: ok" || echo "$h: FAILED" >&2
+	if [ "$WITH_VALGRIND" -eq 1 ]; then
+		ssh -q "root@$h" "apk add --allow-untrusted --force '/tmp/$(basename "$APK")' valgrind && mkdir -p /etc/ha-dhcpc && touch /etc/ha-dhcpc/valgrind.enabled && /etc/init.d/ha-dhcpc restart" \
+			&& echo "$h: ok (valgrind)" || echo "$h: FAILED" >&2
+	else
+		ssh -q "root@$h" "apk add --allow-untrusted --force '/tmp/$(basename "$APK")' && rm -f /etc/ha-dhcpc/valgrind.enabled && /etc/init.d/ha-dhcpc restart" \
+			&& echo "$h: ok" || echo "$h: FAILED" >&2
+	fi
 done
 
 # Disable on the master (identity preserved during graceful window); rediscover after restarts.
