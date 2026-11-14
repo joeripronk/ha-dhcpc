@@ -151,6 +151,16 @@ typedef struct {
     bool seen_in_snapshot;
 } hadc_ct_shadow_ent_t;
 
+typedef struct {
+    uint32_t seq;
+    hadc_ct_entry_v1_t e;
+    bool is_del;
+    bool create;
+    uint8_t retries;
+    uint64_t next_retry_ms;
+    bool in_use;
+} hadc_ct_apply_pending_t;
+
 struct hadc_conntrack {
     pthread_mutex_t lock;
     pthread_t thread;
@@ -164,6 +174,8 @@ struct hadc_conntrack {
     bool ctnl_dump_pending;
     uint64_t ctnl_dump_start_ms;
     uint32_t ctnl_dump_seq;
+    uint32_t ctnl_apply_seq;
+    hadc_ct_apply_pending_t apply_pending[HADC_CT_APPLY_PENDING_MAX];
     bool apply_shadow_pending;
     bool rx_snapshot_active;
     bool slave_resync_requested;
