@@ -1000,7 +1000,14 @@ static void nbr_send_lsreq(ospf_neighbor_t *n)
     if (!nbr_has_lsreq(n))
         return;
     time_t now = time(NULL);
-    if (n->last_lsreq_sent != 0 && now - n->last_lsreq_sent < OSPF_RXMT_INTERVAL)
+    bool has_unsent = false;
+    for (size_t i = 0; i < OSPF_MAX_LSREQ; i++) {
+        if (n->ls_req[i].in_use && n->ls_req[i].last_sent == 0) {
+            has_unsent = true;
+            break;
+        }
+    }
+    if (!has_unsent && n->last_lsreq_sent != 0 && now - n->last_lsreq_sent < OSPF_RXMT_INTERVAL)
         return;
     uint8_t out[OSPF_MTU];
     memset(out, 0, sizeof(out));
