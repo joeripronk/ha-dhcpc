@@ -85,6 +85,7 @@ static void test_hdr_wire(void) {
 static void test_shadow_stage_prune_and_compact(void) {
     struct hadc_conntrack ct;
     memset(&ct, 0, sizeof(ct));
+    shadow_hash_init(&ct);
     ct.max_entry_age_s = 10;
     hadc_ct_entry_v1_t e;
     memset(&e, 0, sizeof(e));
@@ -131,6 +132,7 @@ static void test_shadow_stage_prune_and_compact(void) {
 static void test_shadow_eviction_when_full(void) {
     struct hadc_conntrack ct;
     memset(&ct, 0, sizeof(ct));
+    shadow_hash_init(&ct);
     ct.max_entry_age_s = 0;
     for (size_t i = 0; i < HADC_CT_SHADOW_MAX; i++) {
         hadc_ct_entry_v1_t e;
