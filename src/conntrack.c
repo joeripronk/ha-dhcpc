@@ -1202,8 +1202,14 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     if (h->type == HADC_CT_MSG_SNAPSHOT_END) {
         if (ct->role == HADC_ROLE_SLAVE && ct->rx_snapshot_active) {
             for (size_t i = 0; i < ct->n_shadow; i++) {
-                if (ct->shadow[i].valid && !ct->shadow[i].seen_in_snapshot)
-                    ct->shadow[i].valid = false;
+                hadc_ct_shadow_ent_t *s = &ct->shadow[i];
+                if (!s->valid || s->seen_in_snapshot)
+                    continue;
+                s->valid = false;
+                if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
+                    if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+                    (void)ctnl_apply_entry(ct, &s->e, true);
+                }
             }
             ct->rx_snapshot_active = false;
         }
