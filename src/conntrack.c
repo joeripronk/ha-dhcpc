@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <jansson.h>
+#include <limits.h>
+#include <stddef.h>
 #include <linux/netfilter/nf_conntrack_common.h>
 #include <linux/netfilter/nf_conntrack_tcp.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -850,7 +852,7 @@ static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
     if (nl_helper || helper_mod || sip_helper_on) {
         ct->st.sip_helper = HADC_CT_HELPER_AVAILABLE;
         snprintf(ct->st.sip_helper_reason, sizeof(ct->st.sip_helper_reason),
-                 "sip helper detected (nfnetlink=%d module=%d nf_conntrack_helper=%d)",
+                 "sip helper (nl=%d mod=%d sys=%d)",
                  nl_helper ? 1 : 0, helper_mod ? 1 : 0, sip_helper_on ? 1 : 0);
     } else if (access("/proc/net/nf_conntrack", R_OK) == 0) {
         ct->st.sip_helper = ct->sip_mode == HADC_CT_SIP_REQUIRE ? HADC_CT_HELPER_DEGRADED : HADC_CT_HELPER_UNKNOWN;
@@ -1623,6 +1625,10 @@ void hadc_conntrack_get_status(const hadc_ctx_t *ctx, hadc_ct_status_t *out)
         return;
     pthread_mutex_lock((pthread_mutex_t *)&ct->lock);
     *out = ct->st;
+    uint32_t sh = 0;
+    for (size_t i = 0; i < ct->n_shadow; i++)
+        if (ct->shadow[i].valid) sh++;
+    out->shadow_entries = sh;
     pthread_mutex_unlock((pthread_mutex_t *)&ct->lock);
 }
 
@@ -1634,13 +1640,14 @@ char *hadc_conntrack_status_json(const hadc_ctx_t *ctx)
                     : st.sip_helper == HADC_CT_HELPER_UNAVAILABLE ? "unavailable"
                     : st.sip_helper == HADC_CT_HELPER_DEGRADED ? "degraded" : "unknown";
     json_t *o = json_pack(
-        "{s:b,s:b,s:b,s:b,s:i,s:i,s:I,s:I,s:I,s:I,s:I,s:I,s:I,s:I,s:s,s:s}",
+        "{s:b,s:b,s:b,s:b,s:i,s:i,s:I,s:I,s:I,s:I,s:I,s:I,s:I,s:I,s:i,s:s,s:s}",
         "enabled", st.enabled, "running", st.running, "originating", st.originating,
         "replica", st.replica, "peer_count", st.peer_count, "peers_connected", st.peers_connected,
         "tx_frames", (json_int_t)st.tx_frames, "rx_frames", (json_int_t)st.rx_frames,
         "tx_entries", (json_int_t)st.tx_entries, "rx_entries", (json_int_t)st.rx_entries,
         "applied_entries", (json_int_t)st.applied_entries, "dropped_entries", (json_int_t)st.dropped_entries,
         "resync_count", (json_int_t)st.resync_count, "queue_drops", (json_int_t)st.queue_drops,
+        "shadow_entries", (int)st.shadow_entries,
         "sip_helper", sip, "sip_helper_reason", st.sip_helper_reason);
     char *txt = json_dumps(o, JSON_PRESERVE_ORDER | JSON_COMPACT);
     json_decref(o);

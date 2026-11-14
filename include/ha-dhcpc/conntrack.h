@@ -21,7 +21,7 @@ typedef enum {
 typedef struct {
     bool enabled;
     bool running;
-    bool originating; /* current role: master exporting */
+    bool originating; /* master exporting */
     bool replica;     /* slave importing/staging */
     int peer_count;
     int peers_connected;
@@ -33,8 +33,9 @@ typedef struct {
     uint64_t dropped_entries;
     uint64_t resync_count;
     uint64_t queue_drops;
+    uint32_t shadow_entries;
     hadc_ct_helper_state_t sip_helper;
-    char sip_helper_reason[96];
+    char sip_helper_reason[64];
 } hadc_ct_status_t;
 
 int hadc_conntrack_init(hadc_ctx_t *ctx);
