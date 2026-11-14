@@ -737,11 +737,39 @@ static void drain_ctnl(struct hadc_conntrack *ct){
             if(nh->nlmsg_type==NLMSG_DONE){ ct->ctnl_dump_pending=false; in_dump=false; continue; }
             if(nh->nlmsg_type==NLMSG_ERROR){
                 const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
-                if (err && err->error != 0) {
-                    int e = -err->error;
-                    /* benign races for best-effort sync (already exists/gone) */
-                    if (e != EEXIST && e != ENOENT && e != EBUSY)
-                        ct->st.dropped_entries++;
+                int e = err ? -err->error : 0;
+                uint32_t eseq = err ? err->msg.nlmsg_seq : 0;
+                hadc_ct_apply_pending_t *ap = ctnl_find_apply(ct, eseq);
+                if (ap) {
+                    if (e == 0) {
+                        ap->in_use = false;
+                    } else if (ap->is_del && e == ENOENT) {
+                        ap->in_use = false; /* already gone */
+                    } else if (!ap->is_del && e == EEXIST && ap->create) {
+                        /* conflict: exists, retry as replace/update without CREATE */
+                        ap->create = false;
+                        ap->retries++;
+                        ap->next_retry_ms = 0;
+                        if (ctnl_send_apply(ct, ap) < 0) { ap->in_use = false; ct->st.dropped_entries++; }
+                    } else if (!ap->is_del && e == ENOENT && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
+                        /* missing during replace attempt, retry as create */
+                        ap->create = true;
+                        ap->retries++;
+                        ap->next_retry_ms = now_ms() + 100;
+                    } else if ((e == EBUSY || e == EAGAIN) && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
+                        ap->retries++;
+                        ap->next_retry_ms = now_ms() + 200;
+                    } else {
+                        ap->in_use = false;
+                        if (e != EEXIST && e != ENOENT && e != EBUSY)
+                            ct->st.dropped_entries++;
+                    }
+                } else {
+                    if (e != 0) {
+                        /* benign races for best-effort sync (already exists/gone) */
+                        if (e != EEXIST && e != ENOENT && e != EBUSY)
+                            ct->st.dropped_entries++;
+                    }
                 }
                 if (in_dump) { ct->ctnl_dump_pending=false; in_dump=false; }
                 continue;
