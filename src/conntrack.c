@@ -160,6 +160,7 @@ struct hadc_conntrack {
     int rtnl_fd; /* NETLINK_ROUTE addr monitor/dump for IPv4 local+VIP discovery */
     int ctnl_fd; /* NFNETLINK conntrack dump/events (raw, best-effort) */
     bool ctnl_dump_pending;
+    uint64_t ctnl_dump_start_ms;
     uint32_t ctnl_dump_seq;
     bool apply_shadow_pending;
     hadc_ctx_t *ctx;
@@ -481,15 +482,16 @@ static void ctnl_close(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) close(ct->ctnl_fd);
     ct->ctnl_fd=-1;
     if (ct->ctnl_dump_pending) {
-        /* interrupted dump: peers may have incomplete snapshot */
         for (size_t i = 0; i < ct->n_peers; i++) {
             if (ct->peers[i].snapshot_active) {
                 ct->peers[i].snapshot_active = false;
                 ct->peers[i].need_resync = true;
+                ct->st.resync_count++;
             }
         }
     }
     ct->ctnl_dump_pending=false;
+    ct->ctnl_dump_start_ms = 0;
 }
 static int ctnl_open(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) return 0;
@@ -510,7 +512,9 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
         ctnl_close(ct);
         return -1;
     }
-    ct->ctnl_dump_pending=true; return 0;
+    ct->ctnl_dump_pending=true;
+    ct->ctnl_dump_start_ms = now_ms();
+    return 0;
 }
 
 static int parse_tuple_v4(struct nlattr *tuple,uint32_t *sip,uint16_t *sp,uint8_t *proto,uint32_t *dip,uint16_t *dp){
@@ -1356,8 +1360,10 @@ static void *conntrack_thread_main(void *arg)
         else if (!ct->enabled && ct->ctnl_fd >= 0)
             ctnl_close(ct);
         /* if dump stuck without completion for too long, recover (best-effort) */
-        if (ct->ctnl_dump_pending && ct->ctnl_fd >= 0) {
-            /* no explicit start timestamp; rely on peer resync/backpressure paths */
+        if (ct->ctnl_dump_pending && ct->ctnl_fd >= 0 && ct->ctnl_dump_start_ms > 0 &&
+            now - ct->ctnl_dump_start_ms > 30000) {
+            hadc_warn("conntrack: ct dump timeout, recovering");
+            ctnl_close(ct);
         }
         if (ct->helper_cache_refresh_s &&
             now - ct->last_helper_refresh_ms >= (uint64_t)ct->helper_cache_refresh_s * 1000) {
