@@ -174,6 +174,7 @@ struct hadc_conntrack {
     int rtnl_fd; /* NETLINK_ROUTE addr monitor/dump for IPv4 local+VIP discovery */
     int ctnl_fd; /* NFNETLINK conntrack dump/events (raw, best-effort) */
     bool ctnl_dump_pending;
+    bool ctnl_dump_aborted;
     uint64_t ctnl_dump_start_ms;
     uint32_t ctnl_dump_seq;
     uint32_t ctnl_apply_seq;
@@ -496,19 +497,27 @@ static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATAL
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
 
+static void ctnl_abort_dump(struct hadc_conntrack *ct)
+{
+    if (!ct || !ct->ctnl_dump_pending)
+        return;
+    for (size_t i = 0; i < ct->n_peers; i++) {
+        if (ct->peers[i].snapshot_active) {
+            ct->peers[i].snapshot_active = false;
+            ct->peers[i].need_resync = true;
+            ct->st.resync_count++;
+        }
+    }
+    ct->ctnl_dump_pending = false;
+    ct->ctnl_dump_aborted = false;
+    ct->ctnl_dump_start_ms = 0;
+}
+
 static void ctnl_close(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) close(ct->ctnl_fd);
     ct->ctnl_fd=-1;
-    if (ct->ctnl_dump_pending) {
-        for (size_t i = 0; i < ct->n_peers; i++) {
-            if (ct->peers[i].snapshot_active) {
-                ct->peers[i].snapshot_active = false;
-                ct->peers[i].need_resync = true;
-                ct->st.resync_count++;
-            }
-        }
-    }
-    ct->ctnl_dump_pending=false;
+    ctnl_abort_dump(ct);
+    ct->ctnl_dump_aborted = false;
     ct->ctnl_dump_start_ms = 0;
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
 }
@@ -535,6 +544,7 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
         return -1;
     }
     ct->ctnl_dump_pending=true;
+    ct->ctnl_dump_aborted=false;
     ct->ctnl_dump_start_ms = now_ms();
     return 0;
 }
@@ -821,13 +831,20 @@ static void prune_shadow(struct hadc_conntrack *ct, uint64_t now)
 static void drain_ctnl(struct hadc_conntrack *ct){
     if(ct->ctnl_fd<0) return;
     char buf[16384];
-    bool in_dump = ct->ctnl_dump_pending;
+    bool in_dump = ct->ctnl_dump_pending && !ct->ctnl_dump_aborted;
     for(;;){
         ssize_t n=recv(ct->ctnl_fd,buf,sizeof(buf),MSG_DONTWAIT);
         if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR) break; ctnl_close(ct); return; }
         if(n==0) break;
         for(struct nlmsghdr *nh=(struct nlmsghdr*)buf; NLMSG_OK(nh,(unsigned)n); nh=NLMSG_NEXT(nh,n)){
-            if(nh->nlmsg_type==NLMSG_DONE){ ct->ctnl_dump_pending=false; in_dump=false; continue; }
+            if(nh->nlmsg_type==NLMSG_DONE){
+                /* dump completed; if not aborted, allow snapshot_end to be sent after flush */
+                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted)
+                    ct->ctnl_dump_pending = false;
+                ct->ctnl_dump_aborted = false;
+                in_dump = false;
+                continue;
+            }
             if(nh->nlmsg_type==NLMSG_ERROR){
                 const struct nlmsgerr *err = (const struct nlmsgerr *)NLMSG_DATA(nh);
                 int e = err ? -err->error : 0;
@@ -859,12 +876,19 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                     }
                 } else {
                     if (e != 0) {
+                        if (ct->ctnl_dump_pending && (eseq == ct->ctnl_dump_seq || eseq == 0)) {
+                            /* dump request failed/aborted: do not send incomplete snapshot */
+                            ctnl_abort_dump(ct);
+                            in_dump = false;
+                            continue;
+                        }
                         /* benign races for best-effort sync (already exists/gone) */
                         if (e != EEXIST && e != ENOENT && e != EBUSY)
                             ct->st.dropped_entries++;
+                    } else if (ct->ctnl_dump_pending && eseq == ct->ctnl_dump_seq) {
+                        /* ACK for dump request; actual end signaled by NLMSG_DONE */
                     }
                 }
-                if (in_dump) { ct->ctnl_dump_pending=false; in_dump=false; }
                 continue;
             }
             if(NFNL_SUBSYS_ID(nh->nlmsg_type)!=NFNL_SUBSYS_CTNETLINK) continue;
@@ -874,9 +898,25 @@ static void drain_ctnl(struct hadc_conntrack *ct){
             if(ct->non_local_only && !classify_non_local(ct,&e,&reason)) continue;
             if(!ct->include_related && (e.flags&2)) continue;
             if(ct->role==HADC_ROLE_MASTER){
-                uint8_t mtype = in_dump ? HADC_CT_MSG_SNAPSHOT_ENTRY : HADC_CT_MSG_UPSERT;
-                if(del){ mtype=HADC_CT_MSG_DELETE; e.flags|=8; }
-                master_queue_entry_all(ct, mtype, &e, NULL);
+                /* During an active dump, CT_NEW/UPDATE entries are treated as snapshot
+                 * content for peers with snapshot_active. CT_DELETE during dump is
+                 * sent as DELETE to avoid resurrecting flows that ended mid-dump.
+                 * If dump was aborted, skip snapshot fanout from this message. */
+                uint8_t mtype;
+                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !del) {
+                    mtype = HADC_CT_MSG_SNAPSHOT_ENTRY;
+                } else if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && del) {
+                    mtype = HADC_CT_MSG_DELETE;
+                    e.flags |= 8;
+                } else {
+                    mtype = del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT;
+                    if (del) e.flags |= 8;
+                }
+                /* If an aborted dump is still draining, only deliver live incremental
+                 * deletes/updates to snapshot peers as normal ops; snapshot entries
+                 * are meaningless without a complete snapshot. */
+                if (!(ct->ctnl_dump_pending && ct->ctnl_dump_aborted && mtype == HADC_CT_MSG_SNAPSHOT_ENTRY))
+                    master_queue_entry_all(ct, mtype, &e, NULL);
             }
             /* slaves receive authoritative state over TCP; ignore local ctnl events */
         }
@@ -1578,10 +1618,22 @@ static void *conntrack_thread_main(void *arg)
             (void)ctnl_open(ct);
         else if (!ct->enabled && ct->ctnl_fd >= 0)
             ctnl_close(ct);
+        /* if peers await snapshot but dump is idle, (re)request it */
+        if (ct->enabled && ct->role == HADC_ROLE_MASTER && ct->ctnl_fd >= 0 &&
+            !ct->ctnl_dump_pending) {
+            bool any_need = false, any_active = false;
+            for (size_t i = 0; i < ct->n_peers; i++) {
+                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].snapshot_active) any_active = true;
+                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].need_resync) any_need = true;
+            }
+            if (any_need && !any_active)
+                (void)ctnl_request_dump(ct);
+        }
         /* if dump stuck without completion for too long, recover (best-effort) */
         if (ct->ctnl_dump_pending && ct->ctnl_fd >= 0 && ct->ctnl_dump_start_ms > 0 &&
             now - ct->ctnl_dump_start_ms > 30000) {
-            hadc_warn("conntrack: ct dump timeout, recovering");
+            hadc_warn("conntrack: ct dump timeout, aborting snapshot and recovering");
+            ctnl_abort_dump(ct);
             ctnl_close(ct);
         }
         if (ct->helper_cache_refresh_s &&
