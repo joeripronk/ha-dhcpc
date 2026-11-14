@@ -12,6 +12,7 @@
 #include <linux/netfilter/nf_conntrack_tcp.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
+#include <linux/netfilter/nfnetlink_cthelper.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <net/if.h>
@@ -744,10 +745,75 @@ static void refresh_owned_addrs_locked(struct hadc_conntrack *ct, hadc_ctx_t *ct
         rtnl_dump_addrs(ct);
 }
 
+static bool probe_cthelper_sip(void)
+{
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC, NETLINK_NETFILTER);
+    if (fd < 0)
+        return false;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+        close(fd);
+        return false;
+    }
+
+    struct {
+        struct nlmsghdr nh;
+        struct nfgenmsg nf;
+    } req;
+    memset(&req, 0, sizeof(req));
+    req.nh.nlmsg_len = NLMSG_LENGTH(sizeof(req.nf));
+    req.nh.nlmsg_type = (NFNL_SUBSYS_CTHELPER << 8) | NFNL_MSG_CTHELPER_GET;
+    req.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    req.nh.nlmsg_seq = 1;
+    req.nf.nfgen_family = AF_UNSPEC;
+    req.nf.version = NFNETLINK_V0;
+    if (send(fd, &req, req.nh.nlmsg_len, 0) < 0) {
+        close(fd);
+        return false;
+    }
+
+    bool found = false;
+    uint64_t deadline = now_ms() + 150;
+    while (now_ms() < deadline && !found) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 50);
+        if (pr <= 0) continue;
+        char buf[4096];
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0) break;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, (unsigned)n); nh = NLMSG_NEXT(nh, n)) {
+            if (nh->nlmsg_type == NLMSG_DONE) { close(fd); return found; }
+            if (nh->nlmsg_type == NLMSG_ERROR) continue;
+            if (NFNL_SUBSYS_ID(nh->nlmsg_type) != NFNL_SUBSYS_CTHELPER) continue;
+            struct nfgenmsg *nfmsg = NLMSG_DATA(nh);
+            struct nlattr *attr = (struct nlattr *)((char *)nfmsg + NLMSG_ALIGN(sizeof(*nfmsg)));
+            int alen = (int)nh->nlmsg_len - (int)NLMSG_SPACE(sizeof(*nfmsg));
+            for (struct nlattr *a = attr; HADC_NLA_OK(a, alen); ) {
+                if (a->nla_type == NFCTH_NAME) {
+                    int dl = HADC_NLA_DATALEN(a);
+                    if (dl > 0) {
+                        char name[32];
+                        int c = dl < (int)sizeof(name) - 1 ? dl : (int)sizeof(name) - 1;
+                        memcpy(name, HADC_NLA_DATA(a), c);
+                        name[c] = '\0';
+                        if (strstr(name, "sip"))
+                            found = true;
+                    }
+                }
+                int _sz = NLA_ALIGN(a->nla_len);
+                alen -= _sz;
+                a = (struct nlattr *)((char *)a + _sz);
+            }
+        }
+    }
+    close(fd);
+    return found;
+}
+
 static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
 {
-    /* SIP/VoIP helper status cache: best-effort from /proc and module presence.
-     * nfnetlink helper query (CTNL_MSG_HELPER_GET) is an integration point. */
+    /* SIP/VoIP helper status cache: nfnetlink cthelper probe (best-effort) plus
+     * /proc/module heuristics. */
     ct->last_helper_refresh_ms = now_ms();
     if (ct->sip_mode == HADC_CT_SIP_OFF) {
         ct->st.sip_helper = HADC_CT_HELPER_UNAVAILABLE;
@@ -757,6 +823,10 @@ static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
 
     bool sip_helper_on = false;
     bool helper_mod = false;
+    bool nl_helper = false;
+
+    nl_helper = probe_cthelper_sip();
+
     FILE *f = fopen("/proc/sys/net/netfilter/nf_conntrack_helper", "r");
     if (f) {
         int v = 0;
@@ -777,10 +847,11 @@ static void refresh_helper_cache_locked(struct hadc_conntrack *ct)
         fclose(f);
     }
 
-    if (helper_mod || sip_helper_on) {
+    if (nl_helper || helper_mod || sip_helper_on) {
         ct->st.sip_helper = HADC_CT_HELPER_AVAILABLE;
         snprintf(ct->st.sip_helper_reason, sizeof(ct->st.sip_helper_reason),
-                 "sip helper/module detected (nf_conntrack_helper=%d)", sip_helper_on ? 1 : 0);
+                 "sip helper detected (nfnetlink=%d module=%d nf_conntrack_helper=%d)",
+                 nl_helper ? 1 : 0, helper_mod ? 1 : 0, sip_helper_on ? 1 : 0);
     } else if (access("/proc/net/nf_conntrack", R_OK) == 0) {
         ct->st.sip_helper = ct->sip_mode == HADC_CT_SIP_REQUIRE ? HADC_CT_HELPER_DEGRADED : HADC_CT_HELPER_UNKNOWN;
         snprintf(ct->st.sip_helper_reason, sizeof(ct->st.sip_helper_reason),
