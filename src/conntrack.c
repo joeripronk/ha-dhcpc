@@ -1444,15 +1444,15 @@ static void *conntrack_thread_main(void *arg)
                 master_maybe_send_snapshot(ct, p);
             if (p->connected && p->hello_ok && ct->role == HADC_ROLE_SLAVE && ct->slave_resync_requested &&
                 p->tx_partial_len == 0) {
-                (void)send_json_msg(ct, p, HADC_CT_MSG_RESYNC_REQ, HADC_CT_F_RESYNC, json_object());
+                int rc = send_json_msg(ct, p, HADC_CT_MSG_RESYNC_REQ, HADC_CT_F_RESYNC, json_object());
+                if (rc >= 0)
+                    ct->slave_resync_requested = false;
             }
             if (p->connected && p->hello_ok)
                 peer_flush_tx(ct, p);
             if (p->connected && p->hello_ok && p->tx_partial_len == 0 && now - p->last_send_ms > 5000)
                 (void)send_json_msg(ct, p, HADC_CT_MSG_KEEPALIVE, 0, json_pack("{s:i}", "t", (int)now));
         }
-        if (ct->role == HADC_ROLE_SLAVE && ct->slave_resync_requested)
-            ct->slave_resync_requested = false;
 
         /* if a dump finished, close snapshot for peers after queued entries flush */
         if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending) {
