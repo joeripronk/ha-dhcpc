@@ -477,7 +477,20 @@ static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATAL
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
 
-static void ctnl_close(struct hadc_conntrack *ct){ if(ct->ctnl_fd>=0) close(ct->ctnl_fd); ct->ctnl_fd=-1; ct->ctnl_dump_pending=false; }
+static void ctnl_close(struct hadc_conntrack *ct){
+    if(ct->ctnl_fd>=0) close(ct->ctnl_fd);
+    ct->ctnl_fd=-1;
+    if (ct->ctnl_dump_pending) {
+        /* interrupted dump: peers may have incomplete snapshot */
+        for (size_t i = 0; i < ct->n_peers; i++) {
+            if (ct->peers[i].snapshot_active) {
+                ct->peers[i].snapshot_active = false;
+                ct->peers[i].need_resync = true;
+            }
+        }
+    }
+    ct->ctnl_dump_pending=false;
+}
 static int ctnl_open(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) return 0;
     int fd=socket(AF_NETLINK,SOCK_RAW|SOCK_NONBLOCK|SOCK_CLOEXEC,NETLINK_NETFILTER);
@@ -493,7 +506,10 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     req.nh.nlmsg_type=(NFNL_SUBSYS_CTNETLINK<<8)|IPCTNL_MSG_CT_GET;
     req.nh.nlmsg_flags=NLM_F_REQUEST|NLM_F_DUMP; req.nh.nlmsg_seq=++ct->ctnl_dump_seq;
     req.nf.nfgen_family=AF_INET; req.nf.version=NFNETLINK_V0;
-    if(send(ct->ctnl_fd,&req,req.nh.nlmsg_len,0)<0) return -1;
+    if(send(ct->ctnl_fd,&req,req.nh.nlmsg_len,0)<0) {
+        ctnl_close(ct);
+        return -1;
+    }
     ct->ctnl_dump_pending=true; return 0;
 }
 
@@ -1339,6 +1355,10 @@ static void *conntrack_thread_main(void *arg)
             (void)ctnl_open(ct);
         else if (!ct->enabled && ct->ctnl_fd >= 0)
             ctnl_close(ct);
+        /* if dump stuck without completion for too long, recover (best-effort) */
+        if (ct->ctnl_dump_pending && ct->ctnl_fd >= 0) {
+            /* no explicit start timestamp; rely on peer resync/backpressure paths */
+        }
         if (ct->helper_cache_refresh_s &&
             now - ct->last_helper_refresh_ms >= (uint64_t)ct->helper_cache_refresh_s * 1000) {
             int sip_mode = ct->sip_mode;
