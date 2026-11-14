@@ -53,6 +53,8 @@ typedef struct {
     bool advertised_default_route;
     bool want_advertised_public_ip32;
     bool want_advertised_default_route;
+    uint64_t backup_hold_until_ms; /* delay slave backup routes until master promoted + wait */
+    char last_seen_master[HADC_NODE_ID_MAX];
     hadc_routing_default_candidate_t local_cand; /* from cluster/heartbeat info */
     hadc_routing_default_candidate_t remote_cands[HADC_ROUTING_MAX_CANDIDATES];
     size_t n_remote_cands;
@@ -421,12 +423,19 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
     struct in_addr chosen = {0};
     const char *scope = "none";
     const char *origin = "";
+    uint64_t now = (uint64_t)hadc_now_ms();
 
     g_rs.backup_gw.s_addr = 0;
     g_rs.backup_scope[0] = '\0';
     g_rs.backup_origin[0] = '\0';
 
     if (!g_rs.accept_default_route || g_rs.local_working_default)
+        return;
+
+    /* On demote/failover wait until the (new) master has fully promoted and a
+     * 5s settle window before installing backup routes, to avoid routing over
+     * backup and breaking NAT before promotion completes. */
+    if (ctx->role == HADC_ROLE_SLAVE && now < g_rs.backup_hold_until_ms)
         return;
 
     /* Accepted fabric default is backup-path only and never published.
@@ -443,9 +452,32 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
         if (want == HADC_ROUTE_SCOPE_LOCAL_MASTER) {
             const hadc_routing_default_candidate_t *c = &g_rs.local_cand;
             if (c->valid && c->gateway.s_addr != 0) {
-                chosen = c->gateway;
-                scope = scope_name(HADC_ROUTE_SCOPE_LOCAL_MASTER);
-                origin = c->origin;
+                /* Treat the local master as fully promoted once it is the
+                 * elected/alive master and, when it advertises a default route,
+                 * has that advertisement in the fabric LSDB (or after the hold
+                 * window elapsed). */
+                bool master_ready = g_rs.local_master_up;
+                if (master_ready && ctx->conf.routing.advertise.default_route != HADC_ADV_DEF_OFF) {
+                    bool seen_default = false;
+                    for (size_t i = 0; i < g_rs.n_remote_cands; i++) {
+                        const hadc_routing_default_candidate_t *rc = &g_rs.remote_cands[i];
+                        if (!rc->valid) continue;
+                        if (rc->origin[0] && c->origin[0] && !strcmp(rc->origin, c->origin)) {
+                            seen_default = true; /* local master default known in fabric */
+                            break;
+                        }
+                    }
+                    /* During hold window require visibility/settle; after hold,
+                     * allow selection to avoid starving slaves if LSDB lags. */
+                    if (!seen_default && now < g_rs.backup_hold_until_ms)
+                        master_ready = false;
+                    (void)seen_default;
+                }
+                if (master_ready) {
+                    chosen = c->gateway;
+                    scope = scope_name(HADC_ROUTE_SCOPE_LOCAL_MASTER);
+                    origin = c->origin;
+                }
             }
             continue;
         }
@@ -558,6 +590,27 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
         snprintf(g_rs.reason, sizeof(g_rs.reason), "%s", reason);
     else
         snprintf(g_rs.reason, sizeof(g_rs.reason), "reconcile");
+
+    /* Delay slave backup routes until the master has fully promoted and a 5s
+     * settle window, so failover traffic does not take backup/NAT-breaking paths
+     * before the new master is ready. Trigger on demote and on master changes. */
+    {
+        uint64_t now = (uint64_t)hadc_now_ms();
+        const char *dm = ctx->conf.designated_master[0] ? ctx->conf.designated_master : "";
+        bool hold = false;
+        if (ctx->role == HADC_ROLE_SLAVE) {
+            if (!strcmp(g_rs.reason, "demote"))
+                hold = true;
+            if (dm[0] && strcmp(dm, g_rs.last_seen_master) != 0)
+                hold = true;
+        }
+        if (hold) {
+            uint64_t until = now + 5000;
+            if (until > g_rs.backup_hold_until_ms)
+                g_rs.backup_hold_until_ms = until;
+        }
+        snprintf(g_rs.last_seen_master, sizeof(g_rs.last_seen_master), "%s", dm);
+    }
 
     g_rs.local_master_up = local_master_alive(ctx);
     g_rs.local_working_default = local_working_default_path(ctx);

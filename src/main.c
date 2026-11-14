@@ -448,15 +448,34 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                       rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
         }
     }
-    hadc_routing_reconcile(ctx, new_role == HADC_ROLE_MASTER ? "promote" : "demote");
     hadc_executor_desired(ctx, &ctx->lease, &desired);
-    hadc_executor_apply(ctx, &desired, new_role == HADC_ROLE_MASTER ? "PROMOTE" : "DEMOTE");
     if (new_role == HADC_ROLE_MASTER) {
+        /* Promote: apply lease/public address and routes first, set up routing,
+         * then announce VIPs so traffic uses the local WAN path (not backup). */
+        desired.cluster_addrs_present = false;
+        hadc_executor_apply(ctx, &desired, "PROMOTE");
+        hadc_routing_reconcile(ctx, "promote");
+        desired.cluster_addrs_present = true;
+        hadc_executor_apply(ctx, &desired, "PROMOTE-VIPS");
         hadc_dhcpcore_start(ctx); /* resume after the dataplane (pin/neigh/route) is applied */
         hadc_executor_announce_cluster(ctx);
         hadc_gwping_start(ctx); /* verify the gateway after a promote */
-    } else if (old_role == HADC_ROLE_MASTER)
-        hadc_gwping_stop(ctx);
+    } else {
+        /* Demote: remove VIPs first, then remove public IP/routing. */
+        if (old_role == HADC_ROLE_MASTER)
+            hadc_gwping_stop(ctx);
+        desired.cluster_addrs_present = false;
+        if (ctx->lease.address.s_addr != 0 && ctx->lease.state != HADC_LEASE_NONE) {
+            desired.present = true;
+            desired.link_state = 1;
+            desired.slave_nft_block = false;
+            desired.gateway.s_addr = 0; /* slaves do not own DHCP default route */
+        }
+        hadc_executor_apply(ctx, &desired, "DEMOTE-VIPS");
+        hadc_routing_reconcile(ctx, "demote");
+        hadc_executor_desired(ctx, &ctx->lease, &desired);
+        hadc_executor_apply(ctx, &desired, "DEMOTE");
+    }
     hadc_conntrack_notify_role(ctx, old_role, new_role);
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
