@@ -1662,14 +1662,6 @@ static void *conntrack_thread_main(void *arg)
                 if (rc > 0) p->snapshot_active = false;
                 else if (rc < 0) close_peer(p);
             }
-            /* if another peer requested resync while dump was running, start next dump */
-            bool any_need = false, any_active = false;
-            for (size_t i = 0; i < ct->n_peers; i++) {
-                if (ct->peers[i].connected && ct->peers[i].snapshot_active) any_active = true;
-                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].need_resync) any_need = true;
-            }
-            if (any_need && !any_active && ct->ctnl_fd >= 0)
-                (void)ctnl_request_dump(ct);
         }
 
         int peers_connected = 0;
