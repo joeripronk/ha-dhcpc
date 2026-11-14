@@ -53,7 +53,7 @@
 #define HADC_CT_SHADOW_HASH 8192
 #define HADC_CT_TXQ_MAX 1024
 #define HADC_CT_BATCH_MAX 32
-#define HADC_CT_APPLY_PENDING_MAX 128
+#define HADC_CT_APPLY_PENDING_MAX 2048
 #define HADC_CT_APPLY_MAX_RETRIES 3
 #define HADC_CT_DUMP_EVENT_BUF_MAX 2048
 
@@ -1014,13 +1014,19 @@ static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t 
     if (e->ct_kind == 1) return 0;
     hadc_ct_apply_pending_t *ap = ctnl_alloc_apply(ct);
     if (!ap) {
-        /* pending table full: best-effort untracked send */
+        /* pending table full: send untracked replace attempt for existing-entry
+         * timeout/status refresh; avoid create-only send that cannot recover
+         * from EEXIST without tuple context. */
         char buf[1024];
         uint32_t seq = ++ct->ctnl_apply_seq;
-        size_t off = ctnl_build_apply_msg(buf, sizeof(buf), e, is_del, !is_del, seq);
+        bool create = is_del ? false : false;
+        size_t off = ctnl_build_apply_msg(buf, sizeof(buf), e, is_del, create, seq);
         if (!off) return -1;
         struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
-        return sendto(ct->ctnl_fd, buf, off, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0 ? -1 : 0;
+        int rc = sendto(ct->ctnl_fd, buf, off, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0 ? -1 : 0;
+        if (rc < 0) ct->st.dropped_entries++;
+        else ct->st.dropped_entries++; /* untracked: cannot correlate ACK/retry */
+        return rc;
     }
     memset(ap, 0, sizeof(*ap));
     ap->in_use = true;
