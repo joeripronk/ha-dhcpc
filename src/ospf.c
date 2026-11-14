@@ -247,13 +247,24 @@ static void *ospf_thread_main(void *arg);
 static void refresh_ifaces(hadc_ctx_t *ctx)
 {
     struct ifaddrs *ifas = NULL, *ifa;
+    ospf_if_t prev[OSPF_MAX_IFACES];
+    size_t n_prev = g_ospf.n_ifaces;
+
+    memcpy(prev, g_ospf.ifaces, sizeof(prev));
 
     g_ospf.n_ifaces = 0;
     for (size_t i = 0; i < ctx->conf.ospf.n_interfaces && g_ospf.n_ifaces < OSPF_MAX_IFACES; i++) {
         ospf_if_t *oi = &g_ospf.ifaces[g_ospf.n_ifaces];
         memset(oi, 0, sizeof(*oi));
         snprintf(oi->name, sizeof(oi->name), "%s", ctx->conf.ospf.interfaces[i]);
-        oi->ifindex = if_nametoindex(oi->name);
+        for (size_t j = 0; j < n_prev; j++) {
+            if (prev[j].name[0] && strcmp(prev[j].name, oi->name) == 0 && prev[j].ifindex != 0) {
+                oi->ifindex = prev[j].ifindex;
+                break;
+            }
+        }
+        if (!oi->ifindex)
+            oi->ifindex = if_nametoindex(oi->name);
         if (oi->ifindex)
             g_ospf.n_ifaces++;
     }
@@ -988,6 +999,9 @@ static void nbr_send_lsreq(ospf_neighbor_t *n)
 {
     if (!nbr_has_lsreq(n))
         return;
+    time_t now = time(NULL);
+    if (n->last_lsreq_sent != 0 && now - n->last_lsreq_sent < OSPF_RXMT_INTERVAL)
+        return;
     uint8_t out[OSPF_MTU];
     memset(out, 0, sizeof(out));
     ospf_hdr_t *oh = (ospf_hdr_t *)out;
@@ -995,7 +1009,6 @@ static void nbr_send_lsreq(ospf_neighbor_t *n)
     oh->router_id = htonl(g_ospf.router_id); oh->area_id = htonl(OSPF_AREA_BACKBONE);
     size_t ooff = sizeof(*oh);
     size_t nreq = 0;
-    time_t now = time(NULL);
     for (size_t i = 0; i < OSPF_MAX_LSREQ && ooff + 12 <= OSPF_MTU; i++) {
         if (!n->ls_req[i].in_use) continue;
         uint32_t t = htonl(n->ls_req[i].type), id = n->ls_req[i].id, adv = n->ls_req[i].adv_router;
