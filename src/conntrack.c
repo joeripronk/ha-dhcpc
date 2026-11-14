@@ -122,6 +122,7 @@ typedef struct {
     bool hello_ok;
     bool accepted; /* slave accepted inbound from master */
     bool snapshot_active;
+    bool peer_is_master;
     uint32_t tx_seq;
     uint32_t rx_seq;
     uint64_t last_connect_ms;
@@ -1083,6 +1084,24 @@ static int send_json_msg(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t t
     return rc;
 }
 
+static void ct_entry_log_tuple(char *buf, size_t buflen, const hadc_ct_entry_v1_t *e)
+{
+    if (!buf || buflen == 0) return;
+    char os[INET_ADDRSTRLEN] = "", od[INET_ADDRSTRLEN] = "", rs[INET_ADDRSTRLEN] = "", rd[INET_ADDRSTRLEN] = "";
+    struct in_addr a;
+    a.s_addr = e->orig_src; inet_ntop(AF_INET, &a, os, sizeof(os));
+    a.s_addr = e->orig_dst; inet_ntop(AF_INET, &a, od, sizeof(od));
+    a.s_addr = e->repl_src; inet_ntop(AF_INET, &a, rs, sizeof(rs));
+    a.s_addr = e->repl_dst; inet_ntop(AF_INET, &a, rd, sizeof(rd));
+    snprintf(buf, buflen, "proto=%u orig=%s:%u->%s:%u reply=%s:%u->%s:%u zone=%u mark=0x%x",
+             (unsigned)e->proto,
+             os[0]?os:"0.0.0.0", (unsigned)ntohs(e->orig_sport),
+             od[0]?od:"0.0.0.0", (unsigned)ntohs(e->orig_dport),
+             rs[0]?rs:"0.0.0.0", (unsigned)ntohs(e->repl_sport),
+             rd[0]?rd:"0.0.0.0", (unsigned)ntohs(e->repl_dport),
+             (unsigned)e->zone, (unsigned)e->mark);
+}
+
 static void send_hello(struct hadc_conntrack *ct, hadc_ct_peer_t *p)
 {
     if (!p || !p->connected || p->hello_sent)
@@ -1177,11 +1196,20 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
 
 static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const hadc_ct_hdr_t *h, const uint8_t *payload)
 {
+    uint32_t len = ntohl(h->len);
     p->rx_seq = ntohl(h->seq);
     p->last_seen_ms = now_ms();
     ct->st.rx_frames++;
     if (h->type == HADC_CT_MSG_HELLO) {
         p->hello_ok = true;
+        if (payload && len > 0) {
+            json_error_t jerr; json_t *jo = json_loadb((const char *)payload, len, 0, &jerr);
+            if (jo) {
+                const char *pr = json_string_value(json_object_get(jo, "role"));
+                p->peer_is_master = pr && strcmp(pr, "master") == 0;
+                json_decref(jo);
+            }
+        }
         json_t *o = json_pack("{s:s,s:s,s:i,s:s}", "node", ct->self,
                               "role", ct->role == HADC_ROLE_MASTER ? "master" : "slave",
                               "gen", (int)ct->generation, "ack", "ok");
@@ -1190,7 +1218,18 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             (void)send_json_msg(ct, p, HADC_CT_MSG_RESYNC_REQ, HADC_CT_F_RESYNC, json_object());
         return;
     }
-    if (h->type == HADC_CT_MSG_HELLO_ACK) { p->hello_ok = true; return; }
+    if (h->type == HADC_CT_MSG_HELLO_ACK) {
+        p->hello_ok = true;
+        if (payload && len > 0) {
+            json_error_t jerr; json_t *jo = json_loadb((const char *)payload, len, 0, &jerr);
+            if (jo) {
+                const char *pr = json_string_value(json_object_get(jo, "role"));
+                p->peer_is_master = pr && strcmp(pr, "master") == 0;
+                json_decref(jo);
+            }
+        }
+        return;
+    }
     if (h->type == HADC_CT_MSG_KEEPALIVE) return;
     if (h->type == HADC_CT_MSG_SNAPSHOT_BEGIN) {
         if (ct->role == HADC_ROLE_SLAVE) {
@@ -1206,11 +1245,27 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                 hadc_ct_shadow_ent_t *s = &ct->shadow[i];
                 if (!s->valid || s->seen_in_snapshot)
                     continue;
-                s->valid = false;
+                /* master missed this entry: keep/validate and report fix to master */
+                char desc[256];
+                ct_entry_log_tuple(desc, sizeof(desc), &s->e);
+                hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
+                s->seen_in_snapshot = true; /* avoid repeated reports for this snapshot cycle */
+                s->updated_ms = now_ms();
                 if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
                     if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
-                    (void)ctnl_apply_entry(ct, &s->e, true);
+                    (void)ctnl_apply_entry(ct, &s->e, false);
                 }
+                bool reported = false;
+                for (size_t pi = 0; pi < ct->n_peers; pi++) {
+                    hadc_ct_peer_t *mp = &ct->peers[pi];
+                    if (!mp->connected || !mp->hello_ok || !mp->peer_is_master)
+                        continue;
+                    int rc = send_frame(ct, mp, HADC_CT_MSG_UPSERT, 0, &s->e, sizeof(s->e));
+                    if (rc >= 0)
+                        reported = true;
+                }
+                if (!reported)
+                    ct->st.dropped_entries++;
             }
             ct->rx_snapshot_active = false;
         }
@@ -1660,6 +1715,7 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
             ct->apply_shadow_pending = true; /* deferred to worker */
     } else {
         ct->ctnl_dump_pending = false;
+        ct->slave_resync_requested = true; /* validate/fix against new master */
         for (size_t i = 0; i < ct->n_peers; i++)
             ct->peers[i].snapshot_active = false;
     }
