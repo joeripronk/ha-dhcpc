@@ -508,6 +508,7 @@ static void ctnl_close(struct hadc_conntrack *ct){
     }
     ct->ctnl_dump_pending=false;
     ct->ctnl_dump_start_ms = 0;
+    memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
 }
 static int ctnl_open(struct hadc_conntrack *ct){
     if(ct->ctnl_fd>=0) return 0;
@@ -515,7 +516,10 @@ static int ctnl_open(struct hadc_conntrack *ct){
     if(fd<0) return -1;
     struct sockaddr_nl sa={.nl_family=AF_NETLINK,.nl_groups=(1u<<(NFNLGRP_CONNTRACK_NEW-1))|(1u<<(NFNLGRP_CONNTRACK_UPDATE-1))|(1u<<(NFNLGRP_CONNTRACK_DESTROY-1))};
     if(bind(fd,(struct sockaddr*)&sa,sizeof(sa))!=0){close(fd);return -1;}
-    ct->ctnl_fd=fd; return 0;
+    ct->ctnl_fd=fd;
+    ct->ctnl_apply_seq = 1;
+    memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
+    return 0;
 }
 static int ctnl_request_dump(struct hadc_conntrack *ct){
     if(ct->ctnl_fd<0) return -1;
@@ -651,57 +655,130 @@ static bool build_tuple_nla(char *buf, size_t buflen, size_t *off, uint16_t type
         if (!nla_put_u16(buf, buflen, off, CTA_PROTO_SRC_PORT, sport)) return false;
         if (!nla_put_u16(buf, buflen, off, CTA_PROTO_DST_PORT, dport)) return false;
     } else if (proto == IPPROTO_ICMP) {
-        /* best-effort: map ports/id/type/code if encoded; usually 0 */
         if (!nla_put_u16(buf, buflen, off, CTA_PROTO_ICMP_ID, sport)) return false;
-        if (!nla_put_u8(buf, buflen, off, CTA_PROTO_ICMP_TYPE, (uint8_t)(dport >> 8))) return false;
-        if (!nla_put_u8(buf, buflen, off, CTA_PROTO_ICMP_CODE, (uint8_t)(dport & 0xff))) return false;
+        if (!nla_put_u8(buf, buflen, off, CTA_PROTO_ICMP_TYPE, (uint8_t)(ntohs(dport) >> 8))) return false;
+        if (!nla_put_u8(buf, buflen, off, CTA_PROTO_ICMP_CODE, (uint8_t)(ntohs(dport) & 0xff))) return false;
     }
     nla_nest_end(buf, pr, *off);
     nla_nest_end(buf, t, *off);
     return true;
 }
 
-static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del)
+static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry_v1_t *e, bool is_del, bool create, uint32_t seq)
 {
-    if (!ct || !e || ct->ctnl_fd < 0) return -1;
-    char buf[1024];
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, buflen);
     struct nlmsghdr *nh = (struct nlmsghdr *)buf;
     struct nfgenmsg *nf = (struct nfgenmsg *)(buf + NLMSG_ALIGN(sizeof(*nh)));
-    nh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | (del ? IPCTNL_MSG_CT_DELETE : IPCTNL_MSG_CT_NEW);
-    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (del ? 0 : NLM_F_CREATE);
+    nh->nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | (is_del ? IPCTNL_MSG_CT_DELETE : IPCTNL_MSG_CT_NEW);
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | ((!is_del && create) ? NLM_F_CREATE : 0);
+    nh->nlmsg_seq = seq;
     nf->nfgen_family = AF_INET;
     nf->version = NFNETLINK_V0;
     size_t off = NLMSG_ALIGN(sizeof(*nh)) + NLMSG_ALIGN(sizeof(*nf));
 
-    if (!build_tuple_nla(buf, sizeof(buf), &off, CTA_TUPLE_ORIG,
-                         e->orig_src, e->orig_dst, e->proto, e->orig_sport, e->orig_dport)) return -1;
-    if (!build_tuple_nla(buf, sizeof(buf), &off, CTA_TUPLE_REPLY,
-                         e->repl_src, e->repl_dst, e->proto, e->repl_sport, e->repl_dport)) return -1;
+    if (!build_tuple_nla(buf, buflen, &off, CTA_TUPLE_ORIG,
+                         e->orig_src, e->orig_dst, e->proto, e->orig_sport, e->orig_dport)) return 0;
+    if (!build_tuple_nla(buf, buflen, &off, CTA_TUPLE_REPLY,
+                         e->repl_src, e->repl_dst, e->proto, e->repl_sport, e->repl_dport)) return 0;
 
-    if (!del) {
+    if (!is_del) {
         uint32_t timeout = htonl(e->timeout_s ? e->timeout_s : 120);
         uint32_t status = htonl(e->status ? e->status : (IPS_CONFIRMED | IPS_SEEN_REPLY));
-        (void)nla_put_u32(buf, sizeof(buf), &off, CTA_TIMEOUT, timeout);
-        (void)nla_put_u32(buf, sizeof(buf), &off, CTA_STATUS, status);
-        if (e->mark) (void)nla_put_u32(buf, sizeof(buf), &off, CTA_MARK, htonl(e->mark));
-        if (e->zone) (void)nla_put_u16(buf, sizeof(buf), &off, CTA_ZONE, htons((uint16_t)e->zone));
+        (void)nla_put_u32(buf, buflen, &off, CTA_TIMEOUT, timeout);
+        (void)nla_put_u32(buf, buflen, &off, CTA_STATUS, status);
+        if (e->mark) (void)nla_put_u32(buf, buflen, &off, CTA_MARK, htonl(e->mark));
+        if (e->zone) (void)nla_put_u16(buf, buflen, &off, CTA_ZONE, htons((uint16_t)e->zone));
         if (e->proto == IPPROTO_TCP && e->tcp_state) {
-            size_t pi = nla_nest_start(buf, sizeof(buf), &off, CTA_PROTOINFO);
+            size_t pi = nla_nest_start(buf, buflen, &off, CTA_PROTOINFO);
             if (pi != (size_t)-1) {
-                size_t ti = nla_nest_start(buf, sizeof(buf), &off, CTA_PROTOINFO_TCP);
+                size_t ti = nla_nest_start(buf, buflen, &off, CTA_PROTOINFO_TCP);
                 if (ti != (size_t)-1) {
-                    (void)nla_put_u8(buf, sizeof(buf), &off, CTA_PROTOINFO_TCP_STATE, e->tcp_state);
+                    (void)nla_put_u8(buf, buflen, &off, CTA_PROTOINFO_TCP_STATE, e->tcp_state);
                     nla_nest_end(buf, ti, off);
                 }
                 nla_nest_end(buf, pi, off);
             }
         }
+        if (e->helper_id == 1 || (e->flags & 2)) {
+            size_t hn = nla_nest_start(buf, buflen, &off, CTA_HELP);
+            if (hn != (size_t)-1) {
+                (void)nla_put(buf, buflen, &off, CTA_HELP_NAME, "sip", 4);
+                nla_nest_end(buf, hn, off);
+            }
+        }
     }
 
     nh->nlmsg_len = (uint32_t)off;
-    ssize_t r = send(ct->ctnl_fd, buf, nh->nlmsg_len, 0);
-    return r < 0 ? -1 : 0;
+    return off;
+}
+
+static int ctnl_send_apply(struct hadc_conntrack *ct, hadc_ct_apply_pending_t *ap)
+{
+    if (!ct || ct->ctnl_fd < 0 || !ap || !ap->in_use) return -1;
+    char buf[1024];
+    size_t off = ctnl_build_apply_msg(buf, sizeof(buf), &ap->e, ap->is_del, ap->create, ap->seq);
+    if (off == 0) return -1;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    return sendto(ct->ctnl_fd, buf, off, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0 ? -1 : 0;
+}
+
+static hadc_ct_apply_pending_t *ctnl_alloc_apply(struct hadc_conntrack *ct)
+{
+    for (size_t i = 0; i < HADC_CT_APPLY_PENDING_MAX; i++)
+        if (!ct->apply_pending[i].in_use) return &ct->apply_pending[i];
+    return NULL;
+}
+
+static hadc_ct_apply_pending_t *ctnl_find_apply(struct hadc_conntrack *ct, uint32_t seq)
+{
+    if (seq == 0) return NULL;
+    for (size_t i = 0; i < HADC_CT_APPLY_PENDING_MAX; i++)
+        if (ct->apply_pending[i].in_use && ct->apply_pending[i].seq == seq)
+            return &ct->apply_pending[i];
+    return NULL;
+}
+
+static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool is_del)
+{
+    if (!ct || ct->ctnl_fd < 0 || !e) return -1;
+    hadc_ct_apply_pending_t *ap = ctnl_alloc_apply(ct);
+    if (!ap) {
+        /* pending table full: best-effort untracked send */
+        char buf[1024];
+        uint32_t seq = ++ct->ctnl_apply_seq;
+        size_t off = ctnl_build_apply_msg(buf, sizeof(buf), e, is_del, !is_del, seq);
+        if (!off) return -1;
+        struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+        return sendto(ct->ctnl_fd, buf, off, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0 ? -1 : 0;
+    }
+    memset(ap, 0, sizeof(*ap));
+    ap->in_use = true;
+    ap->seq = ++ct->ctnl_apply_seq;
+    ap->e = *e;
+    ap->is_del = is_del;
+    ap->create = !is_del; /* try create; on EEXIST resolve by replacing without CREATE */
+    ap->retries = 0;
+    ap->next_retry_ms = 0;
+    if (ctnl_send_apply(ct, ap) < 0) {
+        ap->in_use = false;
+        return -1;
+    }
+    return 0;
+}
+
+static void ctnl_apply_retry_tick(struct hadc_conntrack *ct, uint64_t now)
+{
+    if (!ct || ct->ctnl_fd < 0) return;
+    for (size_t i = 0; i < HADC_CT_APPLY_PENDING_MAX; i++) {
+        hadc_ct_apply_pending_t *ap = &ct->apply_pending[i];
+        if (!ap->in_use) continue;
+        if (ap->next_retry_ms == 0 || now < ap->next_retry_ms) continue;
+        ap->next_retry_ms = 0;
+        if (ctnl_send_apply(ct, ap) < 0) {
+            ap->in_use = false;
+            ct->st.dropped_entries++;
+        }
+    }
 }
 
 static void apply_shadow_all(struct hadc_conntrack *ct)
@@ -1513,6 +1590,7 @@ static void *conntrack_thread_main(void *arg)
         if (now - ct->last_addr_refresh_ms >= 10000)
             refresh_owned_addrs_locked(ct, ct->ctx);
         prune_shadow(ct, now);
+        ctnl_apply_retry_tick(ct, now);
 
         if (ct->enabled) {
             (void)ensure_listen(ct);
