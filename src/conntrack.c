@@ -54,6 +54,7 @@
 #define HADC_CT_BATCH_MAX 32
 #define HADC_CT_APPLY_PENDING_MAX 128
 #define HADC_CT_APPLY_MAX_RETRIES 3
+#define HADC_CT_DUMP_EVENT_BUF_MAX 2048
 
 enum {
     HADC_CT_MSG_HELLO = 1,
@@ -163,6 +164,11 @@ typedef struct {
     bool in_use;
 } hadc_ct_apply_pending_t;
 
+typedef struct {
+    hadc_ct_entry_v1_t e;
+    bool is_del;
+} hadc_ct_dump_ev_t;
+
 struct hadc_conntrack {
     pthread_mutex_t lock;
     pthread_t thread;
@@ -179,6 +185,9 @@ struct hadc_conntrack {
     uint32_t ctnl_dump_seq;
     uint32_t ctnl_apply_seq;
     hadc_ct_apply_pending_t apply_pending[HADC_CT_APPLY_PENDING_MAX];
+    hadc_ct_dump_ev_t dump_event_buf[HADC_CT_DUMP_EVENT_BUF_MAX];
+    size_t dump_event_count;
+    bool dump_event_overflow;
     bool apply_shadow_pending;
     bool rx_snapshot_active;
     bool slave_resync_requested;
@@ -511,6 +520,8 @@ static void ctnl_abort_dump(struct hadc_conntrack *ct)
     ct->ctnl_dump_pending = false;
     ct->ctnl_dump_aborted = false;
     ct->ctnl_dump_start_ms = 0;
+    ct->dump_event_count = 0;
+    ct->dump_event_overflow = false;
 }
 
 static void ctnl_close(struct hadc_conntrack *ct){
@@ -519,6 +530,8 @@ static void ctnl_close(struct hadc_conntrack *ct){
     ctnl_abort_dump(ct);
     ct->ctnl_dump_aborted = false;
     ct->ctnl_dump_start_ms = 0;
+    ct->dump_event_count = 0;
+    ct->dump_event_overflow = false;
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
 }
 static int ctnl_open(struct hadc_conntrack *ct){
@@ -546,6 +559,8 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     ct->ctnl_dump_pending=true;
     ct->ctnl_dump_aborted=false;
     ct->ctnl_dump_start_ms = now_ms();
+    ct->dump_event_count = 0;
+    ct->dump_event_overflow = false;
     return 0;
 }
 
@@ -892,29 +907,38 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                 continue;
             }
             if(NFNL_SUBSYS_ID(nh->nlmsg_type)!=NFNL_SUBSYS_CTNETLINK) continue;
+            uint16_t mtype_raw = nh->nlmsg_type & 0x00ff;
+            bool event_msg = (mtype_raw == IPCTNL_MSG_CT_NEW || mtype_raw == IPCTNL_MSG_CT_DELETE);
             hadc_ct_entry_v1_t e; bool del=false;
             if(!parse_ct_entry_v4(nh,&e,&del)) continue;
             const char *reason=NULL;
             if(ct->non_local_only && !classify_non_local(ct,&e,&reason)) continue;
             if(!ct->include_related && (e.flags&2)) continue;
             if(ct->role==HADC_ROLE_MASTER){
-                /* During an active dump, CT_NEW/UPDATE entries are treated as snapshot
-                 * content for peers with snapshot_active. CT_DELETE during dump is
-                 * sent as DELETE to avoid resurrecting flows that ended mid-dump.
-                 * If dump was aborted, skip snapshot fanout from this message. */
+                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && event_msg) {
+                    /* Buffer live events during snapshot dump; replay after successful
+                     * dump completion to preserve ordering (snapshot then events). */
+                    if (ct->dump_event_count < HADC_CT_DUMP_EVENT_BUF_MAX) {
+                        ct->dump_event_buf[ct->dump_event_count].e = e;
+                        ct->dump_event_buf[ct->dump_event_count].is_del = del;
+                        ct->dump_event_count++;
+                    } else if (!ct->dump_event_overflow) {
+                        ct->dump_event_overflow = true;
+                        ct->st.dropped_entries++;
+                    }
+                    continue;
+                }
                 uint8_t mtype;
-                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !del) {
+                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && !del) {
                     mtype = HADC_CT_MSG_SNAPSHOT_ENTRY;
-                } else if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && del) {
+                } else if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && del) {
+                    /* defensive: treat dump deletions as delete to avoid resurrection */
                     mtype = HADC_CT_MSG_DELETE;
                     e.flags |= 8;
                 } else {
                     mtype = del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT;
                     if (del) e.flags |= 8;
                 }
-                /* If an aborted dump is still draining, only deliver live incremental
-                 * deletes/updates to snapshot peers as normal ops; snapshot entries
-                 * are meaningless without a complete snapshot. */
                 if (!(ct->ctnl_dump_pending && ct->ctnl_dump_aborted && mtype == HADC_CT_MSG_SNAPSHOT_ENTRY))
                     master_queue_entry_all(ct, mtype, &e, NULL);
             }
@@ -1703,6 +1727,24 @@ static void *conntrack_thread_main(void *arg)
                 (void)send_json_msg(ct, p, HADC_CT_MSG_KEEPALIVE, 0, json_pack("{s:i}", "t", (int)now));
         }
 
+        /* replay buffered live events after successful dump completion, before ending snapshots */
+        if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending && !ct->ctnl_dump_aborted) {
+            if (ct->dump_event_overflow) {
+                for (size_t i = 0; i < ct->n_peers; i++)
+                    if (ct->peers[i].connected && ct->peers[i].snapshot_active)
+                        ct->peers[i].need_resync = true;
+                ct->dump_event_count = 0;
+                ct->dump_event_overflow = false;
+            } else if (ct->dump_event_count > 0) {
+                for (size_t di = 0; di < ct->dump_event_count; di++) {
+                    hadc_ct_entry_v1_t ee = ct->dump_event_buf[di].e;
+                    bool del = ct->dump_event_buf[di].is_del;
+                    if (del) ee.flags |= 8;
+                    master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, &ee, NULL);
+                }
+                ct->dump_event_count = 0;
+            }
+        }
         /* if a dump finished, close snapshot for peers after queued entries flush */
         if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending) {
             for (size_t i = 0; i < ct->n_peers; i++) {
