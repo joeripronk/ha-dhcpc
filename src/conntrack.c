@@ -1098,6 +1098,7 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                 if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted)
                     ct->ctnl_dump_pending = false;
                 ct->ctnl_dump_aborted = false;
+                ct->ctnl_dump_start_ms = 0;
                 in_dump = false;
                 continue;
             }
@@ -1711,7 +1712,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                         ct->st.dropped_entries++;
                 } else {
                     /* normal snapshot: master is authority, remove stale local/shadow state */
-                    hadc_info("conntrack: master snapshot omits entry, removing stale slave state: %s", desc);
+                    hadc_dbg("conntrack: master snapshot omits entry, removing stale slave state: %s", desc);
                     shadow_unlink(ct, s);
                     s->valid = false;
                     s->timer_dirty = false;
@@ -1916,21 +1917,10 @@ static void *conntrack_thread_main(void *arg)
         }
         if (ct->enabled && ct->ctnl_fd < 0)
             (void)ctnl_open(ct, want_ctnl_events);
-        /* if peers await snapshot but dump is idle, (re)request it */
-        if (ct->enabled && ct->role == HADC_ROLE_MASTER && ct->ctnl_fd >= 0 &&
-            !ct->ctnl_dump_pending) {
-            bool any_need = false, any_active = false;
-            for (size_t i = 0; i < ct->n_peers; i++) {
-                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].snapshot_active) any_active = true;
-                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].need_resync) any_need = true;
-            }
-            if (any_need && !any_active)
-                (void)ctnl_request_dump(ct);
-        }
         /* if dump stuck without completion for too long, recover (best-effort) */
         if (ct->ctnl_dump_pending && ct->ctnl_fd >= 0 && ct->ctnl_dump_start_ms > 0 &&
             now - ct->ctnl_dump_start_ms > 30000) {
-            hadc_warn("conntrack: ct dump timeout, aborting snapshot and recovering");
+            hadc_info("conntrack: ct dump timeout, aborting snapshot and recovering");
             ctnl_abort_dump(ct);
             ctnl_close(ct);
         }
