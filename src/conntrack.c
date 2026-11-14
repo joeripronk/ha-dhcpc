@@ -556,9 +556,15 @@ static void master_queue_entry_all(struct hadc_conntrack *ct,uint8_t type,const 
     for(size_t i=0;i<ct->n_peers;i++){
         hadc_ct_peer_t *p=&ct->peers[i];
         if(!p->connected||!p->hello_ok) continue;
-        if(p->need_resync && type!=HADC_CT_MSG_SNAPSHOT_ENTRY) continue;
+        if(type == HADC_CT_MSG_SNAPSHOT_ENTRY) {
+            if(!p->snapshot_active) continue;
+        } else {
+            if(p->need_resync) continue;
+        }
         if(queue_entry(ct,p,type,e)<0) continue;
-        if(ct->max_queue_entries>0 && p->txq_count >= ct->max_queue_entries) p->need_resync=true;
+        uint32_t cap = ct->max_queue_entries ? ct->max_queue_entries : HADC_CT_TXQ_MAX;
+        if(cap > HADC_CT_TXQ_MAX) cap = HADC_CT_TXQ_MAX;
+        if(p->txq_count >= cap) p->need_resync=true;
     }
 }
 
@@ -930,13 +936,9 @@ static int txq_push(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, 
 {
     if (!p) return -1;
     if (len > sizeof(((hadc_ct_txop_t*)0)->data)) return -1;
-    if (p->txq_count >= HADC_CT_TXQ_MAX) {
-        ct->st.queue_drops++;
-        p->drops++;
-        p->need_resync = true;
-        return -1;
-    }
-    if (ct->max_queue_entries > 0 && p->txq_count >= ct->max_queue_entries) {
+    uint32_t cap = ct->max_queue_entries ? ct->max_queue_entries : HADC_CT_TXQ_MAX;
+    if (cap > HADC_CT_TXQ_MAX) cap = HADC_CT_TXQ_MAX;
+    if (p->txq_count >= HADC_CT_TXQ_MAX || p->txq_count >= cap) {
         ct->st.queue_drops++;
         p->drops++;
         p->need_resync = true;
@@ -1314,6 +1316,14 @@ static void *conntrack_thread_main(void *arg)
                 if (rc > 0) p->snapshot_active = false;
                 else if (rc < 0) close_peer(p);
             }
+            /* if another peer requested resync while dump was running, start next dump */
+            bool any_need = false, any_active = false;
+            for (size_t i = 0; i < ct->n_peers; i++) {
+                if (ct->peers[i].connected && ct->peers[i].snapshot_active) any_active = true;
+                if (ct->peers[i].connected && ct->peers[i].hello_ok && ct->peers[i].need_resync) any_need = true;
+            }
+            if (any_need && !any_active && ct->ctnl_fd >= 0)
+                (void)ctnl_request_dump(ct);
         }
 
         int peers_connected = 0;
