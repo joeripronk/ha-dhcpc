@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
+#include "ha-dhcpc/conntrack.h"
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
@@ -77,6 +78,16 @@ static json_t *status_object(hadc_ctx_t *ctx)
     json_object_set_new(o, "cluster_addresses", cluster);
     json_object_set_new(o, "executor", hadc_executor_status());
     json_object_set_new(o, "routing", hadc_routing_status(ctx));
+    {
+        char *ct = hadc_conntrack_status_json(ctx);
+        if (ct) {
+            json_error_t jerr;
+            json_t *j = json_loads(ct, 0, &jerr);
+            if (j)
+                json_object_set_new(o, "conntrack_sync", j);
+            free(ct);
+        }
+    }
     return o;
 }
 
@@ -215,6 +226,15 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             hadc_cluster_set_graceful_restart(ctx, false);
         } else {
             reply = "{\"ok\":false,\"error\":\"usage: graceful-restart enable|disable\"}";
+        }
+    } else if (!strcmp(cmd, "conntrack")) {
+        if (!strcmp(arg, "resync")) {
+            if (hadc_conntrack_resync(ctx) != 0)
+                reply = "{\"ok\":false,\"error\":\"conntrack resync unavailable\"}";
+            else
+                reply = "{\"ok\":true}";
+        } else {
+            reply = "{\"ok\":false,\"error\":\"usage: conntrack resync\"}";
         }
     } else {
         hadc_warn("ctl: unknown command '%s'", cmd);

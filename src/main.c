@@ -26,6 +26,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/config.h"
+#include "ha-dhcpc/conntrack.h"
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
@@ -449,6 +450,7 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         hadc_gwping_start(ctx); /* verify the gateway after a promote */
     } else if (old_role == HADC_ROLE_MASTER)
         hadc_gwping_stop(ctx);
+    hadc_conntrack_notify_role(ctx, old_role, new_role);
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
 }
@@ -651,6 +653,8 @@ int main(int argc, char **argv)
     hadc_routing_init(ctx);
     hadc_ospf_spawn(ctx); /* OSPF RX + tick/FSM/SPF run on their own thread */
     hadc_cluster_elect_check(ctx); /* single-node default role acts at once */
+    if (hadc_conntrack_init(ctx) == 0)
+        (void)hadc_conntrack_start(ctx);
 
     /* Startup desired-state pass from the restored cache: apply the interface
      * before the DHCP engine starts (idempotent, hooks fire only on delta). A
@@ -672,6 +676,7 @@ int main(int argc, char **argv)
         hadc_executor_announce_cluster(ctx);
         hadc_gwping_start(ctx);
     }
+    hadc_conntrack_notify_role(ctx, HADC_ROLE_UNKNOWN, ctx->role);
 
     static const hadc_dhcp_callbacks_t cb = { cb_lease_update, cb_retention,
                                               cb_carrier_return };
@@ -767,6 +772,7 @@ int main(int argc, char **argv)
         hadc_ctl_step(ctx);
         hadc_dhcpcore_step(ctx);
     }
+    hadc_conntrack_shutdown(ctx);
     hadc_dhcpcore_stop(ctx);
     hadc_gwping_stop(ctx);
     hadc_persist_save(ctx); /* while the OSPF LSDB is still alive: captures the

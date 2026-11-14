@@ -799,6 +799,20 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->ospf.auth.type = 0;
     out->ospf.auth.key[0] = '\0';
     out->ospf.auth.key_id = 0;
+
+    /* conntrack sync (IPv4-only v1, off by default). */
+    out->conntrack_sync.enabled = false;
+    out->conntrack_sync.port = 4501;
+    out->conntrack_sync.max_queue_entries = 8192;
+    out->conntrack_sync.snapshot_on_connect = true;
+    out->conntrack_sync.resync_interval_s = 0;
+    out->conntrack_sync.filter.non_local_only = true;
+    out->conntrack_sync.filter.include_related = true;
+    out->conntrack_sync.filter.exclude_loopback = true;
+    out->conntrack_sync.helpers.sip = HADC_CT_SIP_AUTO;
+    out->conntrack_sync.helpers.cache_refresh_s = 30;
+    out->conntrack_sync.apply.slave_apply = HADC_CT_APPLY_STAGED;
+    out->conntrack_sync.apply.max_entry_age_s = 300;
     {
         json_t *r = json_object_get(root, "routing");
         if (r) {
@@ -978,6 +992,119 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                               sizeof(out->ospf.router_id));
                     break;
                 }
+            }
+        }
+    }
+
+    {
+        json_t *ct = json_object_get(root, "conntrack_sync");
+        if (ct) {
+            if (!json_is_object(ct)) {
+                snprintf(err, errlen, "config: conntrack_sync must be a mapping");
+                goto derr;
+            }
+            if (get_bool(ct, "enabled", &out->conntrack_sync.enabled, false)) goto derr;
+            if (get_int(ct, "port", &v, 4501, false, "conntrack_sync")) goto derr;
+            if (v < 1 || v > 65535) {
+                snprintf(err, errlen, "config: conntrack_sync.port out of range");
+                goto derr;
+            }
+            out->conntrack_sync.port = (uint16_t)v;
+            if (get_int(ct, "max_queue_entries", &v, 8192, false, "conntrack_sync")) goto derr;
+            if (v < 64 || v > 1000000) {
+                snprintf(err, errlen, "config: conntrack_sync.max_queue_entries out of range");
+                goto derr;
+            }
+            out->conntrack_sync.max_queue_entries = (uint32_t)v;
+            if (get_bool(ct, "snapshot_on_connect", &out->conntrack_sync.snapshot_on_connect, true)) goto derr;
+            if (get_int(ct, "resync_interval_s", &v, 0, false, "conntrack_sync")) goto derr;
+            if (v < 0 || v > 86400) {
+                snprintf(err, errlen, "config: conntrack_sync.resync_interval_s out of range");
+                goto derr;
+            }
+            out->conntrack_sync.resync_interval_s = (uint32_t)v;
+
+            json_t *f = json_object_get(ct, "filter");
+            if (f) {
+                if (!json_is_object(f)) {
+                    snprintf(err, errlen, "config: conntrack_sync.filter must be a mapping");
+                    goto derr;
+                }
+                if (get_bool(f, "non_local_only", &out->conntrack_sync.filter.non_local_only, true)) goto derr;
+                if (get_bool(f, "include_related", &out->conntrack_sync.filter.include_related, true)) goto derr;
+                if (get_bool(f, "exclude_loopback", &out->conntrack_sync.filter.exclude_loopback, true)) goto derr;
+                json_t *fam = json_object_get(f, "families");
+                if (fam) {
+                    if (!json_is_array(fam)) {
+                        snprintf(err, errlen, "config: conntrack_sync.filter.families must be a list");
+                        goto derr;
+                    }
+                    json_t *e;
+                    size_t idx;
+                    json_array_foreach(fam, idx, e) {
+                        if (!json_is_string(e) || strcmp(json_string_value(e), "ipv4") != 0) {
+                            snprintf(err, errlen, "config: conntrack_sync.filter.families supports only ipv4 in v1");
+                            goto derr;
+                        }
+                    }
+                }
+            }
+
+            json_t *h = json_object_get(ct, "helpers");
+            if (h) {
+                if (!json_is_object(h)) {
+                    snprintf(err, errlen, "config: conntrack_sync.helpers must be a mapping");
+                    goto derr;
+                }
+                json_t *sip = json_object_get(h, "sip");
+                if (sip) {
+                    if (!json_is_string(sip)) {
+                        snprintf(err, errlen, "config: conntrack_sync.helpers.sip must be a string");
+                        goto derr;
+                    }
+                    const char *s = json_string_value(sip);
+                    if (!strcmp(s, "auto")) out->conntrack_sync.helpers.sip = HADC_CT_SIP_AUTO;
+                    else if (!strcmp(s, "require")) out->conntrack_sync.helpers.sip = HADC_CT_SIP_REQUIRE;
+                    else if (!strcmp(s, "off")) out->conntrack_sync.helpers.sip = HADC_CT_SIP_OFF;
+                    else {
+                        snprintf(err, errlen, "config: unknown conntrack_sync.helpers.sip %s", s);
+                        goto derr;
+                    }
+                }
+                if (get_int(h, "cache_refresh_s", &v, 30, false, "conntrack_sync.helpers")) goto derr;
+                if (v < 1 || v > 3600) {
+                    snprintf(err, errlen, "config: conntrack_sync.helpers.cache_refresh_s out of range");
+                    goto derr;
+                }
+                out->conntrack_sync.helpers.cache_refresh_s = (uint32_t)v;
+            }
+
+            json_t *ap = json_object_get(ct, "apply");
+            if (ap) {
+                if (!json_is_object(ap)) {
+                    snprintf(err, errlen, "config: conntrack_sync.apply must be a mapping");
+                    goto derr;
+                }
+                json_t *sa = json_object_get(ap, "slave_apply");
+                if (sa) {
+                    if (!json_is_string(sa)) {
+                        snprintf(err, errlen, "config: conntrack_sync.apply.slave_apply must be a string");
+                        goto derr;
+                    }
+                    const char *s = json_string_value(sa);
+                    if (!strcmp(s, "staged")) out->conntrack_sync.apply.slave_apply = HADC_CT_APPLY_STAGED;
+                    else if (!strcmp(s, "immediate")) out->conntrack_sync.apply.slave_apply = HADC_CT_APPLY_IMMEDIATE;
+                    else {
+                        snprintf(err, errlen, "config: unknown conntrack_sync.apply.slave_apply %s", s);
+                        goto derr;
+                    }
+                }
+                if (get_int(ap, "max_entry_age_s", &v, 300, false, "conntrack_sync.apply")) goto derr;
+                if (v < 1 || v > 86400) {
+                    snprintf(err, errlen, "config: conntrack_sync.apply.max_entry_age_s out of range");
+                    goto derr;
+                }
+                out->conntrack_sync.apply.max_entry_age_s = (uint32_t)v;
             }
         }
     }

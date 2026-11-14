@@ -20,6 +20,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/config.h"
+#include "ha-dhcpc/conntrack.h"
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
@@ -104,6 +105,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.ospf.auth.type != ctx->conf.ospf.auth.type ||
         strcmp(next.ospf.auth.key, ctx->conf.ospf.auth.key) != 0 ||
         next.ospf.auth.key_id != ctx->conf.ospf.auth.key_id;
+    int conntrack_changed = memcmp(&next.conntrack_sync, &ctx->conf.conntrack_sync,
+                                   sizeof(next.conntrack_sync)) != 0;
 
     int apply = interface_changed || cluster_addrs ||
         next.apply.routes != ctx->conf.apply.routes ||
@@ -140,6 +143,8 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     if (cluster_addrs)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%scluster_addresses",
                               n ? " " : "");
+    if (conntrack_changed)
+        n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%sconntrack_sync", n ? " " : "");
     if (restart_only)
         n += (size_t)snprintf(changes + n, sizeof(changes) - n, "%soptions/hook(needs restart)",
                               n ? " " : "");
@@ -190,6 +195,12 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     } else if (routing_changed) {
         hadc_routing_reconcile(ctx, "reload");
     }
+    if (conntrack_changed) {
+        hadc_conntrack_notify_config(ctx);
+        (void)hadc_conntrack_start(ctx);
+    }
+    if (cluster_addrs)
+        hadc_conntrack_notify_vip(ctx);
     if (dhcp_knobs)
         hadc_dhcpcore_reload(ctx);
     if (interface_changed)

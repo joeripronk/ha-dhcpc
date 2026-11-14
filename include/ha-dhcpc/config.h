@@ -129,6 +129,26 @@ typedef struct {
             int key_id;
         } auth;
     } ospf;
+    struct {
+        bool enabled;
+        uint16_t port;                 /* TCP conntrack replication port */
+        uint32_t max_queue_entries;
+        bool snapshot_on_connect;
+        uint32_t resync_interval_s;
+        struct {
+            bool non_local_only;
+            bool include_related;
+            bool exclude_loopback;
+        } filter;
+        struct {
+            enum { HADC_CT_SIP_AUTO = 0, HADC_CT_SIP_REQUIRE = 1, HADC_CT_SIP_OFF = 2 } sip;
+            uint32_t cache_refresh_s;
+        } helpers;
+        struct {
+            enum { HADC_CT_APPLY_STAGED = 0, HADC_CT_APPLY_IMMEDIATE = 1 } slave_apply;
+            uint32_t max_entry_age_s;
+        } apply;
+    } conntrack_sync;
     char ctl_socket[HADC_PATH_MAX];
     /* Engine lease DB (the dhclient-compatible lease file the core reads at
      * start and the daemon keeps current on slaves). Relative names resolve

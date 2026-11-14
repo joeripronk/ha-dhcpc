@@ -11,6 +11,8 @@
 #include <linux/limits.h>
 #include <pthread.h>
 
+struct hadc_conntrack;
+
 struct hadc_ctx {
     hadc_conf_t conf; /* effective merged config: shared doc + local overlay */
 
@@ -56,6 +58,8 @@ struct hadc_ctx {
     pthread_t hb_thread;
     bool hb_thread_started;
     int hb_selfpipe[2]; /* [0] read by main loop, [1] written by thread */
+
+    struct hadc_conntrack *conntrack;
 };
 
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */
