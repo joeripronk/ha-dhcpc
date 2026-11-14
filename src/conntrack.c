@@ -1281,9 +1281,9 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
         ntohl(h->len) >= sizeof(hadc_ct_entry_v1_t)) {
         const hadc_ct_entry_v1_t *e = (const hadc_ct_entry_v1_t *)payload;
         const char *reason = NULL;
+        bool del = (h->type == HADC_CT_MSG_DELETE) || (e->flags & 8);
         if (ct->role == HADC_ROLE_SLAVE) {
             bool ok = classify_non_local(ct, e, &reason) || !ct->non_local_only;
-            bool del = (h->type == HADC_CT_MSG_DELETE) || (e->flags & 8);
             if (ok || del) {
                 if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
                     if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
@@ -1294,6 +1294,20 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             } else {
                 ct->st.dropped_entries++;
                 hadc_dbg("conntrack: drop rx entry from %s reason=%s", p->id, reason ? reason : "filtered");
+            }
+        } else if (ct->role == HADC_ROLE_MASTER && (h->type == HADC_CT_MSG_UPSERT || h->type == HADC_CT_MSG_DELETE)) {
+            bool ok = classify_non_local(ct, e, &reason) || !ct->non_local_only;
+            if (ok || del) {
+                char desc[256];
+                ct_entry_log_tuple(desc, sizeof(desc), e);
+                hadc_info("conntrack: master accepted %s fix from %s: %s",
+                          del ? "delete" : "upsert", p->id, desc);
+                if (ct->ctnl_fd < 0) (void)ctnl_open(ct);
+                (void)ctnl_apply_entry(ct, e, del);
+                ct->st.rx_entries++;
+            } else {
+                ct->st.dropped_entries++;
+                hadc_dbg("conntrack: drop master fix from %s reason=%s", p->id, reason ? reason : "filtered");
             }
         }
         return;
