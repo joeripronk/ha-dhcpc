@@ -568,6 +568,115 @@ int main(void)
             ok("bad cluster config rejected");
     }
 
+    /* conntrack_sync: off by default with documented defaults */
+    write_file(base, BASE_NOMAC);
+    unlink(local);
+    if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+        fail("conntrack_sync default load");
+    else if (conf.conntrack_sync.enabled || conf.conntrack_sync.port != 4501 ||
+             conf.conntrack_sync.max_queue_entries != 8192 ||
+             !conf.conntrack_sync.snapshot_on_connect ||
+             conf.conntrack_sync.resync_interval_s != 0 ||
+             !conf.conntrack_sync.filter.non_local_only ||
+             !conf.conntrack_sync.filter.include_related ||
+             !conf.conntrack_sync.filter.exclude_loopback ||
+             conf.conntrack_sync.helpers.sip != HADC_CT_SIP_AUTO ||
+             conf.conntrack_sync.helpers.cache_refresh_s != 30 ||
+             conf.conntrack_sync.apply.slave_apply != HADC_CT_APPLY_STAGED ||
+             conf.conntrack_sync.apply.max_entry_age_s != 300)
+        fail("conntrack_sync defaults");
+    else
+        ok("conntrack_sync defaults");
+
+    /* conntrack_sync: full parse and overlay precedence */
+    {
+        char cbuf[4096];
+        snprintf(cbuf, sizeof(cbuf),
+                 "%s"
+                 "conntrack_sync:\n"
+                 "  enabled: true\n"
+                 "  port: 4510\n"
+                 "  max_queue_entries: 1024\n"
+                 "  snapshot_on_connect: false\n"
+                 "  resync_interval_s: 60\n"
+                 "  filter:\n"
+                 "    families: [ipv4]\n"
+                 "    non_local_only: false\n"
+                 "    include_related: false\n"
+                 "    exclude_loopback: false\n"
+                 "  helpers:\n"
+                 "    sip: require\n"
+                 "    cache_refresh_s: 45\n"
+                 "  apply:\n"
+                 "    slave_apply: immediate\n"
+                 "    max_entry_age_s: 120\n",
+                 BASE_NOMAC);
+        write_file(base, cbuf);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("conntrack_sync parse");
+        } else if (!conf.conntrack_sync.enabled || conf.conntrack_sync.port != 4510 ||
+                   conf.conntrack_sync.max_queue_entries != 1024 ||
+                   conf.conntrack_sync.snapshot_on_connect ||
+                   conf.conntrack_sync.resync_interval_s != 60 ||
+                   conf.conntrack_sync.filter.non_local_only ||
+                   conf.conntrack_sync.filter.include_related ||
+                   conf.conntrack_sync.filter.exclude_loopback ||
+                   conf.conntrack_sync.helpers.sip != HADC_CT_SIP_REQUIRE ||
+                   conf.conntrack_sync.helpers.cache_refresh_s != 45 ||
+                   conf.conntrack_sync.apply.slave_apply != HADC_CT_APPLY_IMMEDIATE ||
+                   conf.conntrack_sync.apply.max_entry_age_s != 120) {
+            fail("conntrack_sync parsed");
+        } else {
+            ok("conntrack_sync parsed");
+        }
+
+        write_file(local,
+                   "self: node-b\npriority: 90\n"
+                   "conntrack_sync:\n"
+                   "  enabled: false\n"
+                   "  port: 4520\n"
+                   "  helpers:\n"
+                   "    sip: \"off\"\n"
+                   "  apply:\n"
+                   "    slave_apply: \"staged\"\n");
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("conntrack_sync overlay load");
+        } else if (conf.conntrack_sync.enabled || conf.conntrack_sync.port != 4520 ||
+                   conf.conntrack_sync.helpers.sip != HADC_CT_SIP_OFF ||
+                   conf.conntrack_sync.apply.slave_apply != HADC_CT_APPLY_STAGED ||
+                   conf.conntrack_sync.resync_interval_s != 60 ||
+                   conf.conntrack_sync.filter.non_local_only) {
+            fail("conntrack_sync overlay precedence");
+        } else {
+            ok("conntrack_sync overlay precedence");
+        }
+    }
+
+    /* conntrack_sync: invalid values rejected */
+    {
+        const char *bad_ct[] = {
+            "conntrack_sync:\n  port: 0\n",
+            "conntrack_sync:\n  max_queue_entries: 0\n",
+            "conntrack_sync:\n  filter:\n    families: [ipv6]\n",
+            "conntrack_sync:\n  helpers:\n    sip: \"maybe\"\n",
+            "conntrack_sync:\n  apply:\n    slave_apply: \"later\"\n",
+            "conntrack_sync:\n  enabled: sometimes\n",
+        };
+        for (size_t i = 0; i < sizeof(bad_ct) / sizeof(bad_ct[0]); i++) {
+            char cbuf[2048];
+            snprintf(cbuf, sizeof(cbuf), "%s%s", BASE_NOMAC, bad_ct[i]);
+            write_file(base, cbuf);
+            unlink(local);
+            if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+                fail("bad conntrack_sync config should be an error");
+            else
+                ok("bad conntrack_sync config rejected");
+        }
+    }
+
     unlink(base);
     unlink(local);
     rmdir(dir);
