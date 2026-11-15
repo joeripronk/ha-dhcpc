@@ -343,8 +343,10 @@ int hadc_dhcpcore_restart(hadc_ctx_t *ctx)
 
 int hadc_dhcpcore_force_discover(hadc_ctx_t *ctx)
 {
-    if (!g_running)
-        return -1;
+    if (!g_running) {
+        if (hadc_dhcpcore_start(ctx) != 0 || !g_running)
+            return -1;
+    }
     if (dhcp_core_force_discover(ctx->conf.interface) != 0) {
         hadc_warn("dhcpcore: forced discover on %s failed", ctx->conf.interface);
         return -1;
@@ -355,8 +357,10 @@ int hadc_dhcpcore_force_discover(hadc_ctx_t *ctx)
 
 int hadc_dhcpcore_force_renew(hadc_ctx_t *ctx)
 {
-    if (!g_running)
-        return -1;
+    if (!g_running) {
+        if (hadc_dhcpcore_start(ctx) != 0 || !g_running)
+            return -1;
+    }
     if (dhcp_core_force_renew(ctx->conf.interface) != 0) {
         hadc_warn("dhcpcore: forced renew on %s failed", ctx->conf.interface);
         return -1;

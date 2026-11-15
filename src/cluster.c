@@ -1089,7 +1089,9 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                 propagate_role(ctx);
             } else {
                 snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
-                set_role(ctx, ours ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE);
+                /* Adopt self-mastery via the full promotion flow so dataplane and
+                 * the DHCP engine are started; never jump straight to MASTER. */
+                set_role(ctx, ours ? HADC_ROLE_PROMOTING : HADC_ROLE_SLAVE);
                 hadc_persist_save(ctx);
             }
         }
