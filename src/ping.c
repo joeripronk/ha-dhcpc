@@ -255,6 +255,12 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
 {
+    if (!(ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)) {
+        ctx->gwping_start_after_ms = 0;
+        if (g_fd >= 0)
+            hadc_gwping_stop(ctx);
+        return;
+    }
     if (g_fd < 0) {
         if (ctx->gwping_start_after_ms && (uint64_t)hadc_now_ms() >= ctx->gwping_start_after_ms) {
             uint64_t due = ctx->gwping_start_after_ms;
