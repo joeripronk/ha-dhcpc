@@ -75,7 +75,7 @@ static void validate_retained_lease(hadc_ctx_t *ctx)
 {
     hadc_desired_t desired;
 
-    if (!ctx->lease.retention_active || !(ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) ||
+    if (!ctx->lease.retention_active || ctx->role != HADC_ROLE_MASTER ||
         ctx->lease.state != HADC_LEASE_RETAINED || ctx->lease.address.s_addr == 0)
         return;
 
@@ -255,7 +255,7 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
 {
-    if (!(ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)) {
+    if (ctx->role != HADC_ROLE_MASTER) {
         ctx->gwping_start_after_ms = 0;
         if (g_fd >= 0)
             hadc_gwping_stop(ctx);
