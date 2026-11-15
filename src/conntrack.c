@@ -1770,6 +1770,27 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                           del ? "delete" : "upsert", p->id, desc);
                 if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
                 (void)ctnl_apply_entry(ct, e, del);
+                if (del) {
+                    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
+                    if (s) { shadow_unlink(ct, s); s->valid = false; s->timer_dirty = false; }
+                } else {
+                    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
+                    if (s) {
+                        s->e = *e;
+                        s->timer_dirty = false;
+                        s->updated_ms = now_ms();
+                    } else {
+                        s = shadow_alloc_slot(ct, e);
+                        if (s) {
+                            s->e = *e;
+                            s->updated_ms = now_ms();
+                            s->valid = true;
+                            s->seen_in_snapshot = false;
+                            s->timer_dirty = false;
+                            shadow_link(ct, s);
+                        }
+                    }
+                }
                 master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e, p);
                 ct->st.rx_entries++;
             } else {
