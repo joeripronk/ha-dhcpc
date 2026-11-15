@@ -717,6 +717,7 @@ dhcp_core_resume(const char *interface, long t1_s, long t2_s, long t3_s)
 		clock_gettime(CLOCK_MONOTONIC, &time_now);
 		cur_time = time_now.tv_sec;
 		cancel_timeouts_for(ip);
+		paced_cancel(ip);
 		if (ip->client->active != NULL && !ip->client->active->is_bootp) {
 			if (t3_s >= 0) {
 				ip->client->active->renewal = cur_time + (t1_s > 0 ? t1_s : 0);
@@ -748,6 +749,7 @@ dhcp_core_force_discover(const char *interface)
 		if (strcmp(ip->name, interface) != 0 || ip->client == NULL)
 			continue;
 		cancel_timeouts_for(ip);
+		paced_cancel(ip);
 		ip->client->state = S_INIT;
 		note("forcing a new DISCOVER on %s", ip->name);
 		state_init(ip);
@@ -771,6 +773,7 @@ dhcp_core_force_renew(const char *interface)
 		clock_gettime(CLOCK_MONOTONIC, &time_now);
 		cur_time = time_now.tv_sec;
 		cancel_timeouts_for(ip);
+		paced_cancel(ip);
 		ip->client->state = S_BOUND;
 		note("forcing a RENEW on %s", ip->name);
 		state_bound(ip);
