@@ -1870,6 +1870,8 @@ static void ensure_master_connections(struct hadc_conntrack *ct)
 static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t *p)
 {
     if (!p || !p->connected || !p->hello_ok) return;
+    if (p->snapshot_active)
+        return; /* let in-flight snapshot drain/end; do not restart and drop queued entries */
     if (p->tx_partial_len > 0) return; /* don't interleave markers while frame pending */
     if (!p->need_resync && !(ct->snapshot_on_connect && p->tx_seq <= 1))
         return;
@@ -1882,20 +1884,35 @@ static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t
         }
     }
 
+    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, true);
+    if (ct->ctnl_fd < 0) {
+        hadc_warn("conntrack: snapshot cannot open ctnl for %s", p->id[0] ? p->id : "peer");
+        p->need_resync = true;
+        return;
+    }
+
     txq_clear(p);
+    p->need_resync = false;
+    if (ctnl_request_dump(ct) < 0) {
+        hadc_warn("conntrack: snapshot dump request failed for %s", p->id[0] ? p->id : "peer");
+        p->need_resync = true;
+        return;
+    }
+
     int rc = send_json_msg(ct, p, HADC_CT_MSG_SNAPSHOT_BEGIN, HADC_CT_F_SNAPSHOT | HADC_CT_F_RESYNC,
                            json_pack("{s:i}", "gen", (int)ct->generation));
-    if (rc <= 0) { if (rc < 0) close_peer(p); else p->need_resync = true; return; }
-    p->snapshot_active = true;
-    p->need_resync = false;
-    ct->st.resync_count++;
-    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, true);
-    if (ct->ctnl_fd >= 0) {
-        if (ctnl_request_dump(ct) < 0)
-            p->need_resync = true;
-    } else {
-        p->need_resync = true;
+    if (rc <= 0) {
+        hadc_warn("conntrack: snapshot begin send failed for %s", p->id[0] ? p->id : "peer");
+        ctnl_abort_dump(ct);
+        if (rc < 0) close_peer(p);
+        else p->need_resync = true;
+        return;
     }
+    p->snapshot_active = true;
+    ct->st.resync_count++;
+    hadc_info("conntrack: snapshot begin -> %s gen=%u connect=%s",
+              p->id[0] ? p->id : "peer", ct->generation,
+              (ct->snapshot_on_connect && p->tx_seq <= 1) ? "yes" : "no");
 }
 
 static void *conntrack_thread_main(void *arg)
@@ -2034,8 +2051,14 @@ static void *conntrack_thread_main(void *arg)
                 if (p->txq_count > 0 || p->tx_partial_len > 0) continue;
                 int rc = send_json_msg(ct, p, HADC_CT_MSG_SNAPSHOT_END, HADC_CT_F_SNAPSHOT,
                                        json_pack("{s:i}", "gen", (int)ct->generation));
-                if (rc > 0) p->snapshot_active = false;
-                else if (rc < 0) close_peer(p);
+                if (rc > 0) {
+                    p->snapshot_active = false;
+                    hadc_info("conntrack: snapshot end -> %s gen=%u", p->id[0] ? p->id : "peer", ct->generation);
+                } else if (rc < 0) {
+                    close_peer(p);
+                } else {
+                    /* partial/buffered: keep active and retry next loop */
+                }
             }
         }
 
@@ -2082,6 +2105,12 @@ static void *conntrack_thread_main(void *arg)
             drain_ctnl(ct);
         if (ct->listen_fd >= 0 && listen_idx >= 0 && (pfds[listen_idx].revents & POLLIN))
             accept_peer(ct);
+        /* try to flush queued snapshot/updates after drain or wakeups */
+        for (size_t i = 0; i < ct->n_peers; i++) {
+            hadc_ct_peer_t *p = &ct->peers[i];
+            if (p->connected && p->hello_ok && (p->txq_count > 0 || p->tx_partial_len > 0))
+                peer_flush_tx(ct, p);
+        }
         for (size_t i = 0; i < ct->n_peers; i++) {
             hadc_ct_peer_t *p = &ct->peers[i];
             if (p->fd < 0 || peer_idx[i] < 0)
@@ -2089,9 +2118,12 @@ static void *conntrack_thread_main(void *arg)
             short rev = pfds[peer_idx[i]].revents;
             if (!rev)
                 continue;
-            if (rev & (POLLERR | POLLHUP | POLLNVAL)) { close_peer(p); continue; }
-            if (rev & POLLIN) peer_rx(ct, p);
-            if (p->connected && (rev & POLLOUT)) peer_flush_tx(ct, p);
+            if ((rev & POLLOUT) && p->connected)
+                peer_flush_tx(ct, p);
+            if ((rev & POLLIN) && p->connected)
+                peer_rx(ct, p);
+            if ((rev & (POLLERR | POLLHUP | POLLNVAL)) && p->fd >= 0)
+                close_peer(p);
         }
         pthread_mutex_unlock(&ct->lock);
     }
