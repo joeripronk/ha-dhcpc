@@ -39,6 +39,8 @@ static bool g_probe_logged; /* first success reported at info level */
 static unsigned g_failures; /* consecutive unanswered probes */
 static uint32_t g_seq;
 static uint64_t g_last_send_ms;
+static uint64_t g_unreachable_since_ms;
+static uint64_t g_last_discover_ms;
 static uint32_t g_interval_ms = 10000;
 static uint32_t g_timeout_ms = 2000;
 static unsigned g_fail_threshold = 3;
@@ -132,6 +134,8 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
         if (g_unreachable) {
             g_unreachable = false;
             g_unreachable_logged = false; /* next failover warns again */
+            g_unreachable_since_ms = 0;
+            g_last_discover_ms = 0;
             hadc_info("gwping: gateway reachable again (rtt %llums)",
                       (long long)rtt);
             reroute(ctx, "GWPING-OK");
@@ -245,6 +249,8 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
     g_unreachable_logged = false;
     g_probe_logged = false;
     g_failures = 0;
+    g_unreachable_since_ms = 0;
+    g_last_discover_ms = 0;
 }
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
@@ -267,6 +273,7 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
             if (!g_unreachable_logged) {
                 g_unreachable = true;
                 g_unreachable_logged = true;
+                g_unreachable_since_ms = now;
                 hadc_warn("gwping: gateway %s unreachable (%u consecutive probes without reply, timeout %ums); forcing DHCP renew",
                           inet_ntoa((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }),
                           g_failures, g_timeout_ms);
@@ -275,6 +282,18 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
             } else {
                 g_unreachable = true;
                 hadc_dbg("gwping: gateway unreachable (repeated; probes continue)");
+                if (g_unreachable_since_ms == 0)
+                    g_unreachable_since_ms = now;
+                /* Unicast renew can stay stuck on a dead path; escalate to
+                 * DISCOVER while the gateway remains unreachable. */
+                if (now - g_unreachable_since_ms >= 120000 &&
+                    now - g_last_discover_ms >= 120000) {
+                    hadc_warn("gwping: gateway still unreachable; forcing DHCP discover recovery");
+                    if (hadc_dhcpcore_force_discover(ctx) == 0)
+                        g_last_discover_ms = now;
+                    else
+                        hadc_dhcpcore_force_renew(ctx);
+                }
             }
         }
     }

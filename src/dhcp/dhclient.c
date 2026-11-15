@@ -438,6 +438,21 @@ paced_min_interval(void)
 	return core_rate_limit_ms > 0 ? (core_rate_limit_ms + 999) / 1000 : 0;
 }
 
+static void paced_flush(void *x);
+
+static void
+paced_cancel(struct interface_info *ip)
+{
+	int i;
+
+	for (i = 0; i < PACED_SLOTS; i++) {
+		if (paced_slots[i].ip == ip) {
+			cancel_timeout(paced_flush, &paced_slots[i]);
+			paced_slots[i].ip = NULL;
+		}
+	}
+}
+
 static void
 paced_flush(void *x)
 {
@@ -467,39 +482,52 @@ paced_flush(void *x)
  * Minimum interval between DHCP packets we send (ISP-side rate limits,
  * e.g. Odido NL fiber requires >= 10 s between DHCP packets). Sends due
  * too soon are delayed with add_timeout(); delays are whole seconds.
+ * Returns the delay in seconds (0 if sent immediately).
  */
-static void
+static int
 paced_send_packet(struct interface_info *ip, struct in_addr from,
     struct in_addr to)
 {
 	long remaining_ms;
-	int i;
+	int i, delay_s;
 
 	if (core_rate_limit_ms <= 0) {
 		send_packet_unpriv(privfd, &ip->client->packet,
 		    ip->client->packet_length, from, to);
-		return;
+		return (0);
 	}
 	if (rate_last_send != 0) {
 		remaining_ms = core_rate_limit_ms -
 		    (long)(cur_time - rate_last_send) * 1000;
 		if (remaining_ms > 0) {
+			delay_s = (int)((remaining_ms + 999) / 1000);
+			/* A delayed REQUEST/REBOOT during acquisition can
+			   exceed the reboot timeout and loop forever; prefer
+			   correctness over spacing for these states. */
+			if ((ip->client->state == S_REQUESTING ||
+			    ip->client->state == S_REBOOTING) &&
+			    (cur_time - ip->client->first_sending + delay_s) >
+			    ip->client->config->reboot_timeout) {
+				note("rate limit: bypassing %d s delay for %s to meet reboot timeout",
+				    delay_s, ip->name);
+				rate_last_send = cur_time;
+				send_packet_unpriv(privfd, &ip->client->packet,
+				    ip->client->packet_length, from, to);
+				return (0);
+			}
 			for (i = 0; i < PACED_SLOTS; i++) {
 				if (paced_slots[i].ip != NULL)
 					continue;
 				paced_slots[i].ip = ip;
 				paced_slots[i].from = from;
 				paced_slots[i].to = to;
-				add_timeout(cur_time +
-				    (remaining_ms + 999) / 1000,
+				add_timeout(cur_time + delay_s,
 				    paced_flush, &paced_slots[i]);
 				/* Reserve the window so queued sends stay
 				   sequential instead of firing together. */
-				rate_last_send = cur_time +
-				    (remaining_ms + 999) / 1000;
-				debug("rate limit: send delayed %d s",
-				    (int)((remaining_ms + 999) / 1000));
-				return;
+				rate_last_send = cur_time + delay_s;
+				debug("rate limit: send delayed %d s", delay_s);
+				return (delay_s);
 			}
 			/* No free slot: send now rather than drop. */
 		}
@@ -507,6 +535,7 @@ paced_send_packet(struct interface_info *ip, struct in_addr from,
 	rate_last_send = cur_time;
 	send_packet_unpriv(privfd, &ip->client->packet,
 	    ip->client->packet_length, from, to);
+	return (0);
 }
 
 static int retention_active;
@@ -794,6 +823,8 @@ state_reboot(void *ipp)
 {
 	struct interface_info *ip = ipp;
 
+	paced_cancel(ip);
+
 	/* If we don't remember an active lease, go straight to INIT. */
 	if (!ip->client->active || ip->client->active->is_bootp) {
 		state_init(ip);
@@ -832,6 +863,7 @@ state_init(void *ipp)
 {
 	struct interface_info *ip = ipp;
 
+	paced_cancel(ip);
 	ASSERT_STATE(state, S_INIT);
 
 	/* Make a DHCPDISCOVER packet, and set appropriate per-interface
@@ -1669,7 +1701,11 @@ again:
 	    (int)ip->client->interval);
 
 	/* Send out a packet. */
-	paced_send_packet(ip, inaddr_any, inaddr_broadcast);
+	{
+		int delay = paced_send_packet(ip, inaddr_any, inaddr_broadcast);
+		if (delay > 0)
+			ip->client->first_sending += delay;
+	}
 
 	add_timeout(cur_time + ip->client->interval, send_discover, ip);
 }
@@ -1935,7 +1971,13 @@ cancel:
 	    REMOTE_PORT);
 
 	/* Send out a packet. */
-	paced_send_packet(ip, from, to);
+	{
+		int delay = paced_send_packet(ip, from, to);
+		if (delay > 0 &&
+		    (ip->client->state == S_REQUESTING ||
+		     ip->client->state == S_REBOOTING))
+			ip->client->first_sending += delay;
+	}
 
 	add_timeout(cur_time + ip->client->interval, send_request, ip);
 }
@@ -1949,7 +1991,7 @@ send_decline(void *ipp)
 	    inet_ntoa(inaddr_broadcast), REMOTE_PORT);
 
 	/* Send out a packet. */
-	paced_send_packet(ip, inaddr_any, inaddr_broadcast);
+	(void)paced_send_packet(ip, inaddr_any, inaddr_broadcast);
 }
 
 void
