@@ -432,10 +432,12 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
     if (!g_rs.accept_default_route || g_rs.local_working_default)
         return;
 
-    /* On demote/failover wait until the (new) master has fully promoted and a
-     * 5s settle window before installing backup routes, to avoid routing over
+    /* On demote/failover wait until the (new) master has fully promoted and
+     * a settle window before installing backup routes, to avoid routing over
      * backup and breaking NAT before promotion completes. */
     if (ctx->role == HADC_ROLE_SLAVE && now < g_rs.backup_hold_until_ms)
+        return;
+    if (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold)
         return;
 
     /* Accepted fabric default is backup-path only and never published.
@@ -599,7 +601,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     else
         snprintf(g_rs.reason, sizeof(g_rs.reason), "reconcile");
 
-    /* Delay slave backup routes until the master has fully promoted and a 5s
+    /* Delay slave backup routes until the master has fully promoted and a
      * settle window, so failover traffic does not take backup/NAT-breaking paths
      * before the new master is ready. Trigger on demote and on master changes. */
     {
@@ -612,8 +614,13 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
             if (dm[0] && strcmp(dm, g_rs.last_seen_master) != 0)
                 hold = true;
         }
+        if (ctx->handoff_forward_hold && ctx->handoff_hold_until_ms > now)
+            hold = true;
         if (hold) {
-            uint64_t until = now + 5000;
+            uint64_t hold_ms = ctx->conf.apply.handoff_hold_ms;
+            uint64_t until = now + hold_ms;
+            if (ctx->handoff_forward_hold && ctx->handoff_hold_until_ms > until)
+                until = ctx->handoff_hold_until_ms;
             if (until > g_rs.backup_hold_until_ms)
                 g_rs.backup_hold_until_ms = until;
         }
