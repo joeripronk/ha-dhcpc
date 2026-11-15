@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
@@ -278,15 +279,35 @@ int hadc_ctl_init(hadc_ctx_t *ctx)
         hadc_err("ctl: socket: %s", strerror(errno));
         return -1;
     }
-    int tmp_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* Probe for a live holder without blocking startup indefinitely. */
+    int tmp_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (tmp_fd >= 0) {
-        if (connect(tmp_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        int cr = connect(tmp_fd, (struct sockaddr *)&addr, sizeof(addr));
+        if (cr == 0) {
             close(tmp_fd);
             close(ctx->ctl_fd);
             ctx->ctl_fd = -1;
             hadc_err("ctl: %s is held by a live ha-dhcpc; refusing to start",
                      ctx->conf.ctl_socket);
             return -1;
+        }
+        if (errno == EINPROGRESS) {
+            struct pollfd pfd = { .fd = tmp_fd, .events = POLLOUT };
+            cr = poll(&pfd, 1, 200);
+            if (cr > 0) {
+                int soerr = 0;
+                socklen_t slen = sizeof(soerr);
+                getsockopt(tmp_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+                if (soerr == 0) {
+                    close(tmp_fd);
+                    close(ctx->ctl_fd);
+                    ctx->ctl_fd = -1;
+                    hadc_err("ctl: %s is held by a live ha-dhcpc; refusing to start",
+                             ctx->conf.ctl_socket);
+                    return -1;
+                }
+            }
+            /* timeout or connect error: not a responsive live daemon */
         }
         close(tmp_fd);
         unlink(ctx->conf.ctl_socket); /* stale socket from a dead daemon */
