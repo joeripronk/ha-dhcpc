@@ -68,8 +68,38 @@ static void udp_ready(hadc_ctx_t *ctx, int fd);
 
 static const char *role_name(hadc_role_t r)
 {
-    return r == HADC_ROLE_MASTER ? "master" : (r == HADC_ROLE_SLAVE ? "slave" : "unknown");
+    switch (r) {
+    case HADC_ROLE_MASTER:    return "master";
+    case HADC_ROLE_SLAVE:     return "slave";
+    case HADC_ROLE_PROMOTING: return "promoting";
+    case HADC_ROLE_DEMOTING:  return "demoting";
+    default:                  return "unknown";
+    }
 }
+
+static hadc_role_t role_from_name(const char *s)
+{
+    if (!s) return HADC_ROLE_UNKNOWN;
+    if (!strcmp(s, "master"))    return HADC_ROLE_MASTER;
+    if (!strcmp(s, "slave"))     return HADC_ROLE_SLAVE;
+    if (!strcmp(s, "promoting")) return HADC_ROLE_PROMOTING;
+    if (!strcmp(s, "demoting"))  return HADC_ROLE_DEMOTING;
+    return HADC_ROLE_UNKNOWN;
+}
+
+static uint8_t role_wire(hadc_role_t r)
+{
+    switch (r) {
+    case HADC_ROLE_MASTER:    return HADC_WIRE_ROLE_MASTER;
+    case HADC_ROLE_SLAVE:     return HADC_WIRE_ROLE_SLAVE;
+    case HADC_ROLE_PROMOTING: return HADC_WIRE_ROLE_PROMOTING;
+    case HADC_ROLE_DEMOTING:  return HADC_WIRE_ROLE_DEMOTING;
+    default:                  return HADC_WIRE_ROLE_UNKNOWN;
+    }
+}
+
+static bool role_is_master_ready(hadc_role_t r) { return r == HADC_ROLE_MASTER; }
+static bool role_claims_master(hadc_role_t r) { return r == HADC_ROLE_MASTER || r == HADC_ROLE_PROMOTING; }
 
 /* Compact binary heartbeat (minimum-frame sized): 16-byte payload, 64-byte
  * Ethernet frame. Members are referenced by index into the shared config, so
@@ -227,7 +257,7 @@ static void build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
     memset(out, 0, HADC_WIRE_HB_LEN);
     out[1] = (uint8_t)member_index(ctx, ctx->conf.self);
     out[2] = (uint8_t)member_index(ctx, ctx->conf.designated_master);
-    out[3] = (uint8_t)ctx->role; /* matches the HADC_WIRE_ROLE_* codes */
+    out[3] = role_wire(ctx->role);
     put_be(out + 4, ctx->lease.version, 8);
     put_be(out + 12, realtime_ms() & 0xffffffffu, 4);
 }
@@ -251,6 +281,10 @@ static int decode_bin_heartbeat(const hadc_ctx_t *ctx, const uint8_t *p, size_t 
         snprintf(out->role, sizeof(out->role), "master");
     else if (p[3] == HADC_WIRE_ROLE_SLAVE)
         snprintf(out->role, sizeof(out->role), "slave");
+    else if (p[3] == HADC_WIRE_ROLE_PROMOTING)
+        snprintf(out->role, sizeof(out->role), "promoting");
+    else if (p[3] == HADC_WIRE_ROLE_DEMOTING)
+        snprintf(out->role, sizeof(out->role), "demoting");
     else
         snprintf(out->role, sizeof(out->role), "unknown");
     out->lease_version = get_be(p + 4, 8);
@@ -373,7 +407,7 @@ static void *hb_thread_main(void *arg)
         clock_nanosleep(CLOCK_MONOTONIC, 0, &nap, NULL);
 
         pthread_mutex_lock(&ctx->hb_lock);
-        snap.role = (uint8_t)ctx->role;
+        snap.role = role_wire(ctx->role);
         snap.lease_version = ctx->lease.version;
         snap.master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
         snap.self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
@@ -413,7 +447,7 @@ static void *hb_thread_main(void *arg)
             continue;
         }
         uint64_t threshold_ms = (uint64_t)snap.cadence_ms + snap.gap_ms;
-        if (last_send_ms != 0 && snap.role == (uint8_t)HADC_ROLE_MASTER &&
+        if (last_send_ms != 0 && (snap.role == HADC_WIRE_ROLE_MASTER || snap.role == HADC_WIRE_ROLE_PROMOTING) &&
             snap.n_members >= 2 && !snap.graceful &&
             now_ms - last_send_ms > threshold_ms) {
             hadc_warn("cluster: master heartbeat send %llu ms late (> heartbeat %u ms + "
@@ -438,7 +472,7 @@ void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx)
     pthread_mutex_lock(&ctx->hb_lock);
     bool gactive = (ctx->graceful_restart_until_ms != 0 &&
                     realtime_ms() < ctx->graceful_restart_until_ms);
-    bool fire = (ctx->role == HADC_ROLE_MASTER && ctx->conf.n_members >= 2 && !gactive);
+    bool fire = ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && ctx->conf.n_members >= 2 && !gactive);
     pthread_mutex_unlock(&ctx->hb_lock);
     if (fire) {
         hadc_info("cluster: self-monitor requested demote (main loop)");
@@ -924,10 +958,11 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         /* A peer that names itself master is asserting the role. If we are the
          * master too, the higher priority (ties by id) wins; the loser demotes.
          * If we are a slave, follow the asserted master when our current one is
-         * gone or has a lower priority. */
-        if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.master_id, msg.origin)) {
+         * gone or has a lower priority. PROMOTING counts as asserting/active. */
+        if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.master_id, msg.origin) &&
+            (role_claims_master(role_from_name(msg.role)))) {
             const hadc_member_t *om = member_by_id(ctx, msg.origin);
-            if (ctx->role == HADC_ROLE_MASTER) {
+            if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
                 bool peer_wins = om && (om->priority > ctx->conf.priority ||
                     (om->priority == ctx->conf.priority &&
                      strcmp(om->id, ctx->conf.self) < 0));
@@ -941,7 +976,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                               om ? om->priority : 0);
                     propagate_role(ctx);
                 }
-            } else if (strcmp(msg.master_id, ctx->conf.designated_master)) {
+            } else if (strcmp(msg.master_id, ctx->conf.designated_master) && role_is_master_ready(role_from_name(msg.role))) {
                 const hadc_member_t *cur = member_by_id(ctx, ctx->conf.designated_master);
                 bool take = !master_is_alive(ctx, ctx->conf.designated_master) ||
                     (ctx->conf.cluster.preempt && om &&
@@ -1273,9 +1308,9 @@ static void failover_check(hadc_ctx_t *ctx)
         hadc_peer_t *p = &ctx->peers[i];
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
             continue;
-        if (p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+        if (p->alive && !strcmp(p->master_view, ctx->conf.members[i].id) && (strcmp(p->role_view, "master")==0 || strcmp(p->role_view, "promoting")==0))
             return;
-        if (p->alive && strcmp(p->role_view, "slave") != 0) {
+        if (p->alive && strcmp(p->role_view, "slave") != 0 && strcmp(p->role_view, "demoting") != 0) {
             hadc_info("cluster: failover deferred: %s not confirmed demoted (role=%s)",
                       ctx->conf.members[i].id,
                       p->role_view[0] ? p->role_view : "unknown");
@@ -1325,7 +1360,7 @@ static void preempt_check(hadc_ctx_t *ctx)
     if (!cur)
         return;
     hadc_peer_t *p = peer_entry(ctx, ctx->conf.designated_master);
-    if (!p || !p->alive || strcmp(p->master_view, cur->id))
+    if (!p || !p->alive || strcmp(p->master_view, cur->id) || !(strcmp(p->role_view, "master")==0 || strcmp(p->role_view, "promoting")==0))
         return; /* not alive-and-asserting: the election's job */
     for (size_t i = 0; i < ctx->conf.n_members; i++)
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
@@ -1466,9 +1501,9 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
         if (!strcmp(ctx->conf.members[i].id, ctx->conf.self))
             continue;
         p = peer_entry(ctx, ctx->conf.members[i].id);
-        if (p && p->alive && !strcmp(p->master_view, ctx->conf.members[i].id))
+        if (p && p->alive && !strcmp(p->master_view, ctx->conf.members[i].id) && (strcmp(p->role_view, "master")==0 || strcmp(p->role_view, "promoting")==0))
             return;
-        if (p && p->alive && strcmp(p->role_view, "slave") != 0)
+        if (p && p->alive && strcmp(p->role_view, "slave") != 0 && strcmp(p->role_view, "demoting") != 0)
             return;
     }
 
@@ -1510,7 +1545,7 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
 
     if (hadc_cluster_graceful_active(ctx))
         return 0;
-    if (ctx->role != HADC_ROLE_MASTER)
+    if (ctx->role != HADC_ROLE_MASTER && ctx->role != HADC_ROLE_PROMOTING)
         return 0;
     if (!cluster_startup_claim(ctx, claim, sizeof(claim)))
         return 0;
@@ -1546,7 +1581,7 @@ static bool cluster_all_others_demoted(hadc_ctx_t *ctx)
         p = peer_entry(ctx, m->id);
         if (!p || !p->alive)
             continue;
-        if (!strcmp(p->role_view, "master") || !strcmp(p->master_view, m->id)) {
+        if (!strcmp(p->role_view, "master") || !strcmp(p->role_view, "promoting") || (!strcmp(p->master_view, m->id) && strcmp(p->role_view, "slave") && strcmp(p->role_view, "demoting"))) {
             char m2[256];
             snprintf(m2, sizeof(m2), "cluster: cannot promote: %s is not demoted (role=%s master_view=%s)",
                      m->id, p->role_view[0] ? p->role_view : "unknown",
@@ -1554,7 +1589,7 @@ static bool cluster_all_others_demoted(hadc_ctx_t *ctx)
             log_refusal_once(HADC_LOG_INFO, m2);
             return false;
         }
-        if (strcmp(p->role_view, "slave") != 0) {
+        if (strcmp(p->role_view, "slave") != 0 && strcmp(p->role_view, "demoting") != 0) {
             char m2[256];
             snprintf(m2, sizeof(m2), "cluster: cannot promote: %s role not confirmed slave yet (role=%s)",
                      m->id, p->role_view[0] ? p->role_view : "unknown");
@@ -1570,8 +1605,8 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
     const char *target = (new_master_id && *new_master_id) ? new_master_id : ctx->conf.self;
     bool handoff = strcmp(target, ctx->conf.self) != 0;
 
-    if (!strcmp(ctx->conf.designated_master, target) && ctx->role == (handoff ? HADC_ROLE_SLAVE : HADC_ROLE_MASTER)) {
-        hadc_dbg("cluster: promote(%s) is idempotent (already master)", target);
+    if (!strcmp(ctx->conf.designated_master, target) && ((handoff && ctx->role == HADC_ROLE_SLAVE) || (!handoff && (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)))) {
+        hadc_dbg("cluster: promote(%s) is idempotent (already master/promoting)", target);
         return 0;
     }
     if (hadc_cluster_graceful_active(ctx)) {
@@ -1589,14 +1624,19 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         return -1;
     }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
-    set_role(ctx, handoff ? HADC_ROLE_SLAVE : HADC_ROLE_MASTER);
-    if (handoff)
+    if (handoff) {
+        set_role(ctx, HADC_ROLE_SLAVE);
         /* An operator handoff to a lower-ranked member must not be immediately
            undone by this node's own preempt/election; the authority push below
            carries it cluster-wide. Failover (a dead master) is never suppressed. */
         g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
+    } else {
+        /* self-promote: enter PROMOTING; cb_role_change will complete and flip to MASTER
+         * only after dataplane+VIP+GARP are ready so heartbeats announce readiness. */
+        set_role(ctx, HADC_ROLE_PROMOTING);
+    }
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->conf.designated_master,
-              ctx->role == HADC_ROLE_MASTER ? "MASTER" : "SLAVE");
+              role_name(ctx->role));
     propagate_role(ctx);
     hadc_persist_save(ctx);
     return 0;
@@ -1624,8 +1664,9 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
     const hadc_member_t *best = best_alive(ctx, false);
     if (best) {
         snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
-        set_role(ctx, HADC_ROLE_SLAVE);
-        hadc_info("cluster: demoted; handing the master role to %s", best->id);
+        /* enter DEMOTING: keep forwarding, defer egress block until new master ready */
+        set_role(ctx, HADC_ROLE_DEMOTING);
+        hadc_info("cluster: demoted; handing the master role to %s (hold for handoff)", best->id);
     } else {
         ctx->conf.designated_master[0] = '\0';
         set_role(ctx, HADC_ROLE_SLAVE);

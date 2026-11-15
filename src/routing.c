@@ -70,7 +70,7 @@ static hadc_routing_state_t g_rs;
 
 static bool local_master_alive(hadc_ctx_t *ctx)
 {
-    if (ctx->role == HADC_ROLE_MASTER)
+    if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
         return true;
     if (!ctx->conf.designated_master[0])
         return false;
@@ -87,7 +87,7 @@ static bool local_working_default_path(hadc_ctx_t *ctx)
 {
     /* Primary healthy local default path available (not on backup). Local
      * working default always takes precedence over fabric-learned defaults. */
-    if (ctx->role == HADC_ROLE_MASTER) {
+    if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
         return ctx->lease.address.s_addr != 0 && ctx->lease.gateway.s_addr != 0 &&
                !hadc_gwping_unreachable() &&
                (ctx->lease.state == HADC_LEASE_BOUND ||
@@ -100,7 +100,7 @@ static bool local_working_default_path(hadc_ctx_t *ctx)
 
 static bool on_backup_path(hadc_ctx_t *ctx)
 {
-    if (ctx->role == HADC_ROLE_MASTER)
+    if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
         return hadc_gwping_unreachable() || ctx->lease.address.s_addr == 0;
     return ctx->role == HADC_ROLE_SLAVE;
 }
@@ -578,7 +578,7 @@ struct in_addr hadc_routing_backup_gateway(hadc_ctx_t *ctx)
 void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 {
     bool enabled = ctx->conf.routing.enabled;
-    bool master_owner = (ctx->role == HADC_ROLE_MASTER);
+    bool master_owner = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING);
     bool healthy_bound = master_owner && ctx->lease.address.s_addr != 0 &&
                          !hadc_gwping_unreachable() &&
                          (ctx->lease.state == HADC_LEASE_BOUND ||
@@ -598,7 +598,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
         uint64_t now = (uint64_t)hadc_now_ms();
         const char *dm = ctx->conf.designated_master[0] ? ctx->conf.designated_master : "";
         bool hold = false;
-        if (ctx->role == HADC_ROLE_SLAVE) {
+        if (ctx->role == HADC_ROLE_SLAVE || ctx->role == HADC_ROLE_DEMOTING) {
             if (!strcmp(g_rs.reason, "demote"))
                 hold = true;
             if (dm[0] && strcmp(dm, g_rs.last_seen_master) != 0)

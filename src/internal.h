@@ -50,6 +50,16 @@ struct hadc_ctx {
     bool newip_pending;
     struct in_addr newip_old_addr;
 
+    /* Controlled handoff: old master keeps forwarding (VIPs removed, public
+     * IP/route kept, nft egress off) until the new master is ready or timeout. */
+    bool handoff_forward_hold;
+    uint64_t handoff_hold_until_ms;
+    char handoff_target[HADC_NODE_ID_MAX];
+    /* Promotion completion deferred: do not advertise role=master/gwping until
+     * dataplane+VIP announce is done (and optionally after start delay). */
+    bool promotion_pending;
+    uint64_t gwping_start_after_ms;
+
     /* Heartbeat thread: the send cadence runs here so it is never blocked by
      * main-loop work (executor/OSPF/persist); the self-monitor watchdog measures
      * a real process stall, not loop contention. Guards the fields the thread

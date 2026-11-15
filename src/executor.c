@@ -211,14 +211,15 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         if (rgw.s_addr != 0)
             out->backup_gateway = rgw;
     }
-    out->cluster_addrs_present = ctx->role == HADC_ROLE_MASTER;
+    bool master_like = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING);
+    out->cluster_addrs_present = master_like;
     out->n_cluster_ifaces = ctx->conf.cluster.n_ifaces;
     for (size_t i = 0; i < out->n_cluster_ifaces; i++)
         out->cluster_ifaces[i] = ctx->conf.cluster.ifaces[i];
     /* Backup default route: a slave keeps a higher-metric route so it stays
      * reachable when its synced lease has no gateway; a master never uses it.
      * Effective gateway may come from static config or fabric-learned routing. */
-    out->backup_route = ctx->role == HADC_ROLE_SLAVE && out->backup_gateway.s_addr != 0;
+    out->backup_route = (ctx->role == HADC_ROLE_SLAVE) && out->backup_gateway.s_addr != 0;
 
     if (lease->state == HADC_LEASE_NONE) {
         out->present = false;
@@ -236,13 +237,20 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         out->server_id = lease->server_id;
     }
     /* Slaves do not own the DHCP default route: they reach the network through
-     * the master's VIP via the configured backup gateway. */
+     * the master's VIP via the configured backup gateway. During handoff hold
+     * (DEMOTING) keep the public IP and default route so in-flight/stray
+     * traffic can still be forwarded until the new master is ready. */
     if (ctx->role == HADC_ROLE_SLAVE)
         out->gateway.s_addr = 0;
     out->link_state = 0;
     out->slave_nft_block = false;
-    if (ctx->role == HADC_ROLE_MASTER) {
+    if (master_like) {
         out->link_state = 1;
+    } else if (ctx->role == HADC_ROLE_DEMOTING) {
+        out->link_state = 1;
+        out->slave_nft_block = false; /* enabled only after new master ready */
+        if (lease->address.s_addr != 0 && lease->state != HADC_LEASE_NONE)
+            out->present = true;
     } else if (ctx->role == HADC_ROLE_SLAVE && !ctx->shutting_down) {
         if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_DOWN) {
             out->link_state = 2;
@@ -257,7 +265,7 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
      * lease IP yet, the default route goes to the configured backup router and
      * hands back to the lease gateway as soon as the gateway answers again. */
     out->default_via.s_addr = 0;
-    if (ctx->role == HADC_ROLE_MASTER &&
+    if (master_like &&
         ctx->conf.apply.master_backup_gateway.s_addr != 0 &&
         (hadc_gwping_unreachable() || lease->address.s_addr == 0))
         out->default_via = ctx->conf.apply.master_backup_gateway;
@@ -382,6 +390,7 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
                 }
             }
         }
+        rtnl_link_put(link);
     }
 
     /* An address dropped from the shared config must not linger. */
@@ -411,6 +420,7 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
                         "(reason=%s)", inet_ntoa(a->address), a->prefixlen, ci->interface,
                         reason);
             }
+            rtnl_link_put(link);
         }
     }
 }
@@ -701,10 +711,12 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 		    memcmp(nl_addr_get_binary_addr(ll), mac, HADC_MAC_LEN) == 0) {
 			hadc_dbg("executor: neighbor entry for %s already holds the cached "
 			    "lladdr", inet_ntoa(*gw));
+			rtnl_neigh_put(cur);
 			nl_cache_put(ncache);
 			nl_addr_put(dst);
 			return;
 		}
+		rtnl_neigh_put(cur);
 	}
 	n = rtnl_neigh_alloc();
 	if (!n) {
@@ -750,9 +762,9 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN])
 {
 	struct nl_cache *lcache = NULL, *ncache = NULL;
-	struct rtnl_link *link;
+	struct rtnl_link *link = NULL;
 	struct nl_addr *dst;
-	struct rtnl_neigh *n;
+	struct rtnl_neigh *n = NULL;
 	int rc = -1;
 
 	if (!g_sk || !ctx->lease.gateway.s_addr)
@@ -791,6 +803,10 @@ int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN])
 		}
 	}
 out:
+	if (n)
+		rtnl_neigh_put(n);
+	if (link)
+		rtnl_link_put(link);
 	if (lcache)
 		nl_cache_put(lcache);
 	if (ncache)
@@ -814,6 +830,7 @@ static bool neigh_holds(struct nl_cache *ncache, int ifindex,
 		struct nl_addr *ll = rtnl_neigh_get_lladdr(n);
 		ok = ll && nl_addr_get_len(ll) == HADC_MAC_LEN &&
 		     memcmp(nl_addr_get_binary_addr(ll), mac, HADC_MAC_LEN) == 0;
+		rtnl_neigh_put(n);
 	}
 	nl_addr_put(dst);
 	return ok;
@@ -827,7 +844,7 @@ static bool neigh_holds(struct nl_cache *ncache, int ifindex,
 static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 {
 	struct nl_cache *lcache = NULL, *acache = NULL, *rcache = NULL, *ncache = NULL;
-	struct rtnl_link *link;
+	struct rtnl_link *link = NULL;
 	int drift = 0;
 
 	if (!g_sk)
@@ -878,6 +895,7 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 					    : (a && exact))
 						drift++;
 				}
+				rtnl_link_put(cl);
 			}
 		}
 		if (d->add_routes) {
@@ -898,6 +916,8 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 		}
 	}
 out:
+	if (link)
+		rtnl_link_put(link);
 	if (lcache)
 		nl_cache_put(lcache);
 	if (acache)
@@ -1302,7 +1322,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 	 * IP), only when the applied address changed. ddclient dedups against its own
 	 * cache, so a reboot that lands on the same IP is a no-op; a node that comes
 	 * up with a different IP updates. */
-	if (!fatal && ctx->role == HADC_ROLE_MASTER && ctx->conf.apply.ddclient[0] && desired->present &&
+	if (!fatal && (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && ctx->conf.apply.ddclient[0] && desired->present &&
 	    (!prev || !prev->present || prev->address.s_addr != desired->address.s_addr)) {
 		char *argv[4] = { ctx->conf.apply.ddclient, (char *)"-daemon=0", (char *)"-syslog",
 			NULL };
@@ -1408,14 +1428,28 @@ int hadc_executor_announce_cluster(hadc_ctx_t *ctx)
 
     if (!ctx->conf.apply.announce_gratuitous)
         return 0;
-    for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
-        const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
-        for (size_t j = 0; j < ci->n_addrs; j++)
-            if (garp_announce(ci->interface, &ci->addrs[j].address) == 0)
-                announced++;
+    uint32_t duration_ms = ctx->conf.apply.announce_gratuitous_duration_ms;
+    uint64_t deadline = (uint64_t)hadc_now_ms() + duration_ms;
+    for (;;) {
+        int pass = 0;
+        for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+            const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+            for (size_t j = 0; j < ci->n_addrs; j++)
+                if (garp_announce(ci->interface, &ci->addrs[j].address) == 0)
+                    pass++;
+        }
+        if (pass > announced)
+            announced = pass;
+        if (duration_ms == 0)
+            break;
+        uint64_t now = (uint64_t)hadc_now_ms();
+        if (now >= deadline)
+            break;
+        usleep(2000);
     }
     if (announced)
-        hadc_info("executor: announced %d cluster address(es) with gratuitous ARP", announced);
+        hadc_info("executor: announced %d cluster address(es) with gratuitous ARP (burst %ums)",
+                  announced, duration_ms);
     return 0;
 }
 

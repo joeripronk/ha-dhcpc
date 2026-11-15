@@ -187,10 +187,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
             hadc_routing_reconcile(ctx, "reload");
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired, "RELOAD");
-        if (ctx->role == HADC_ROLE_MASTER && cluster_addrs)
+        if ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && cluster_addrs)
             hadc_executor_announce_cluster(ctx);
         hadc_gwping_stop(ctx);
-        if (ctx->role == HADC_ROLE_MASTER)
+        if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
             hadc_gwping_start(ctx);
     } else if (routing_changed) {
         hadc_routing_reconcile(ctx, "reload");

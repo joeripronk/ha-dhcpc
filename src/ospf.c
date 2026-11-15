@@ -1529,7 +1529,7 @@ static uint32_t orig_hash(bool want_pub, struct in_addr pub, bool want_def, hadc
     FNV(want_pub);
     FNV(pub.s_addr);
     FNV(want_def);
-    if (c && c->conf.routing.advertise.vip_subnets && c->role == HADC_ROLE_MASTER) {
+    if (c && c->conf.routing.advertise.vip_subnets && (c->role == HADC_ROLE_MASTER || c->role == HADC_ROLE_PROMOTING)) {
         for (size_t i = 0; i < c->conf.cluster.n_ifaces; i++) {
             const hadc_cluster_if_t *ci = &c->conf.cluster.ifaces[i];
             for (size_t j = 0; j < ci->n_addrs; j++) {
@@ -1621,7 +1621,7 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
     }
     /* VIP subnets from config as stub network links (master-owned) */
     hadc_ctx_t *c = g_ospf.ctx ? g_ospf.ctx : ctx;
-    if (c && c->conf.routing.advertise.vip_subnets && c->role == HADC_ROLE_MASTER) {
+    if (c && c->conf.routing.advertise.vip_subnets && (c->role == HADC_ROLE_MASTER || c->role == HADC_ROLE_PROMOTING)) {
         for (size_t i = 0; i < c->conf.cluster.n_ifaces && nlinks < 64; i++) {
             const hadc_cluster_if_t *ci = &c->conf.cluster.ifaces[i];
             for (size_t j = 0; j < ci->n_addrs && nlinks < 64; j++) {

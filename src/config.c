@@ -718,12 +718,15 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.suppress_member_dad = true;
     out->apply.arp_responder = true;
     out->apply.announce_gratuitous = true;
+    out->apply.announce_gratuitous_duration_ms = 10;
+    out->apply.handoff_hold_ms = 5000;
     out->apply.slave_link_down = false;
     out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
     out->apply.gateway_probe = true;
     out->apply.gateway_probe_interval_ms = 10000;
     out->apply.gateway_probe_timeout_ms = 2000;
     out->apply.gateway_probe_fail_threshold = 3;
+    out->apply.gateway_probe_start_delay_ms = 5000;
     out->apply.abort_tcp_on_newip = false;
     out->apply.disable_ipv6 = true;
     out->apply.dhcp_disable_ipv6_set = false;
@@ -731,6 +734,18 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
+        if (get_int(a, "announce_gratuitous_duration_ms", &v, (int)out->apply.announce_gratuitous_duration_ms, false, "apply")) goto derr;
+        if (v < 0 || v > 10000) {
+            snprintf(err, errlen, "config: announce_gratuitous_duration_ms out of range 0..10000");
+            goto derr;
+        }
+        out->apply.announce_gratuitous_duration_ms = (uint32_t)v;
+        if (get_int(a, "handoff_hold_ms", &v, (int)out->apply.handoff_hold_ms, false, "apply")) goto derr;
+        if (v < 0 || v > 60000) {
+            snprintf(err, errlen, "config: handoff_hold_ms out of range 0..60000");
+            goto derr;
+        }
+        out->apply.handoff_hold_ms = (uint32_t)v;
         if (get_bool(a, "slave_link_down", &out->apply.slave_link_down, false)) goto derr;
         {
             json_t *iso = json_object_get(a, "slave_isolation");
@@ -774,6 +789,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             goto derr;
         }
         out->apply.gateway_probe_fail_threshold = (uint32_t)v;
+        if (get_int(a, "gateway_probe_start_delay_ms", &v, (int)out->apply.gateway_probe_start_delay_ms, false, "apply")) goto derr;
+        if (v < 0 || v > 60000) {
+            snprintf(err, errlen, "config: gateway_probe_start_delay_ms out of range 0..60000");
+            goto derr;
+        }
+        out->apply.gateway_probe_start_delay_ms = (uint32_t)v;
         if (get_bool(a, "abort_tcp_on_newip", &out->apply.abort_tcp_on_newip, false)) goto derr;
         if (get_bool(a, "disable_ipv6", &out->apply.disable_ipv6, true)) goto derr;
         if (json_object_get(a, "disable_ipv6_dhcp")) {

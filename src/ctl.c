@@ -27,7 +27,13 @@
 
 static const char *role_name(hadc_role_t r)
 {
-    return r == HADC_ROLE_MASTER ? "master" : (r == HADC_ROLE_SLAVE ? "slave" : "unknown");
+    switch (r) {
+    case HADC_ROLE_MASTER:    return "master";
+    case HADC_ROLE_SLAVE:     return "slave";
+    case HADC_ROLE_PROMOTING: return "promoting";
+    case HADC_ROLE_DEMOTING:  return "demoting";
+    default:                  return "unknown";
+    }
 }
 
 static char g_ctl_path[HADC_PATH_MAX]; /* where ctl_fd is bound (rebind check) */
@@ -73,7 +79,7 @@ static json_t *status_object(hadc_ctx_t *ctx)
         }
         json_array_append_new(cluster,
             json_pack("{s:s, s:b, s:o}", "interface", ci->interface, "owned",
-                      ctx->role == HADC_ROLE_MASTER, "addresses", addrs));
+                      ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) || ctx->role == HADC_ROLE_PROMOTING), "addresses", addrs));
     }
     json_object_set_new(o, "cluster_addresses", cluster);
     json_object_set_new(o, "executor", hadc_executor_status());

@@ -32,6 +32,8 @@
 #define HADC_WIRE_ROLE_UNKNOWN      0
 #define HADC_WIRE_ROLE_MASTER       1
 #define HADC_WIRE_ROLE_SLAVE        2
+#define HADC_WIRE_ROLE_PROMOTING    3
+#define HADC_WIRE_ROLE_DEMOTING     4
 
 /* Heartbeat payload (all JSON messages carry origin/master/version/role; the
  * binary heartbeat carries them as bytes and has no room for the digest). */

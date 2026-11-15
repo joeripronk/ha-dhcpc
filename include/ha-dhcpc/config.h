@@ -92,6 +92,8 @@ typedef struct {
         bool suppress_member_dad;      /* compatibility no-op */
         bool arp_responder;            /* compatibility no-op (VIP owner answers) */
         bool announce_gratuitous;      /* gratuitous ARP on promotion */
+        uint32_t announce_gratuitous_duration_ms; /* GARP burst duration on promotion */
+        uint32_t handoff_hold_ms;      /* keep old master forwarding before egress block */
         bool slave_link_down;          /* legacy alias for slave_isolation=down */
         hadc_slave_isolation_t slave_isolation; /* how a slave isolates the DHCP
                                                  * interface (none/down/nft) */
@@ -99,6 +101,7 @@ typedef struct {
         uint32_t gateway_probe_interval_ms; /* probe interval, ms */
         uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */
         uint32_t gateway_probe_fail_threshold; /* consecutive misses -> unreachable */
+        uint32_t gateway_probe_start_delay_ms; /* delay first probe after promote */
         bool abort_tcp_on_newip;       /* after ctl newip obtains a lease, reset
                                         * TCP connections bound to the old address */
         bool disable_ipv6;             /* global: disable IPv6 on managed ifaces (default on) */

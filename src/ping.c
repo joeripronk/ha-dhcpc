@@ -73,7 +73,7 @@ static void validate_retained_lease(hadc_ctx_t *ctx)
 {
     hadc_desired_t desired;
 
-    if (!ctx->lease.retention_active || ctx->role != HADC_ROLE_MASTER ||
+    if (!ctx->lease.retention_active || !(ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) ||
         ctx->lease.state != HADC_LEASE_RETAINED || ctx->lease.address.s_addr == 0)
         return;
 
@@ -179,6 +179,8 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
         return;
     if (!ctx->conf.apply.gateway_probe)
         return;
+    if (ctx->gwping_start_after_ms && (uint64_t)hadc_now_ms() < ctx->gwping_start_after_ms)
+        return; /* delayed to avoid probe traffic/mac flips during handoff */
     g_interval_ms = ctx->conf.apply.gateway_probe_interval_ms;
     g_timeout_ms = ctx->conf.apply.gateway_probe_timeout_ms;
     g_fail_threshold = ctx->conf.apply.gateway_probe_fail_threshold;
@@ -247,8 +249,16 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
 {
-    if (g_fd < 0)
+    if (g_fd < 0) {
+        if (ctx->gwping_start_after_ms && (uint64_t)hadc_now_ms() >= ctx->gwping_start_after_ms) {
+            uint64_t due = ctx->gwping_start_after_ms;
+            ctx->gwping_start_after_ms = 0;
+            hadc_gwping_start(ctx);
+            if (due)
+                hadc_info("gwping: delayed probe start reached");
+        }
         return;
+    }
     uint64_t now = (uint64_t)hadc_now_ms();
     if (g_awaiting && now - g_last_send_ms >= g_timeout_ms) {
         g_awaiting = false;

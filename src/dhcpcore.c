@@ -184,7 +184,7 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
     int fds[CORE_FDS_MAX];
     int nfds;
 
-    if (ctx->role != HADC_ROLE_MASTER) {
+    if (!(ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)) {
         hadc_dbg("dhcpcore: not started (slaves are passive to DHCP)");
         return 0;
     }

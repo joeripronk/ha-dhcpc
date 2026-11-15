@@ -21,6 +21,8 @@ typedef enum {
     HADC_ROLE_UNKNOWN = 0,
     HADC_ROLE_MASTER,
     HADC_ROLE_SLAVE,
+    HADC_ROLE_PROMOTING, /* master setup in progress; not announced as master yet */
+    HADC_ROLE_DEMOTING,  /* handing off; forwarding held, egress block pending */
 } hadc_role_t;
 
 typedef enum {

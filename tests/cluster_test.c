@@ -87,7 +87,8 @@ int main(void)
     hadc_ctx_t ctx;
 
     /* A master in a real cluster, with a live peer, must demote when the heartbeat
-     * thread reports a stall. Mark B seen so it is the handoff target. */
+     * thread reports a stall. Mark B seen so it is the handoff target. Demotion
+     * enters a forwarding hold (DEMOTING) until the new master is ready. */
     setup(&ctx);
     ctx.role = HADC_ROLE_MASTER;
     ctx.peers[1].last_seen_ms = now_ms(); /* B live: the handoff target */
@@ -95,10 +96,10 @@ int main(void)
     hadc_cluster_selfpipe_ready(&ctx);
     if (hook_count != 1)
         return fail("stalled master did not demote on the main loop");
-    if (hook_old != HADC_ROLE_MASTER || hook_new != HADC_ROLE_SLAVE)
+    if (hook_old != HADC_ROLE_MASTER || hook_new != HADC_ROLE_DEMOTING)
         return fail("self-demotion role transition wrong");
-    if (ctx.role != HADC_ROLE_SLAVE)
-        return fail("role not settled to slave");
+    if (ctx.role != HADC_ROLE_DEMOTING)
+        return fail("role not settled to demoting");
     if (strcmp(ctx.conf.designated_master, "B") != 0)
         return fail("did not hand the role to the live peer");
 

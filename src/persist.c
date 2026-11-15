@@ -104,9 +104,11 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
     out->found = true;
     json_t *v;
     if ((v = json_object_get(root, "role")) && json_is_string(v))
-        out->role = !strcmp(json_string_value(v), "master")      ? HADC_ROLE_MASTER
-                   : !strcmp(json_string_value(v), "slave")      ? HADC_ROLE_SLAVE
-                                                                  : HADC_ROLE_UNKNOWN;
+        if (!strcmp(json_string_value(v), "master")) out->role = HADC_ROLE_MASTER;
+        else if (!strcmp(json_string_value(v), "slave")) out->role = HADC_ROLE_SLAVE;
+        else if (!strcmp(json_string_value(v), "promoting")) out->role = HADC_ROLE_PROMOTING;
+        else if (!strcmp(json_string_value(v), "demoting")) out->role = HADC_ROLE_DEMOTING;
+        else out->role = HADC_ROLE_UNKNOWN;
     if ((v = json_object_get(root, "master_id")) && json_is_string(v))
         snprintf(out->master_id, sizeof(out->master_id), "%s",
                  json_string_value(v));
@@ -225,6 +227,8 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:o}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
+                          : ctx->role == HADC_ROLE_PROMOTING ? "promoting"
+                          : ctx->role == HADC_ROLE_DEMOTING ? "demoting"
                                                          : "unknown",
                           "master_id", ctx->conf.designated_master,
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
