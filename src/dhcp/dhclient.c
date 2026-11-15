@@ -479,19 +479,20 @@ paced_flush(void *x)
 }
 
 /*
- * Minimum interval between DHCP packets we send (ISP-side rate limits,
- * e.g. Odido NL fiber requires >= 10 s between DHCP packets). Sends due
- * too soon are delayed with add_timeout(); delays are whole seconds.
+ * Minimum interval between DHCPDISCOVER packets we send (ISP-side rate limits,
+ * e.g. Odido NL fiber requires >= 10 s between DHCP packets). Only DISCOVERs
+ * are paced; other messages (REQUEST/DECLINE/etc.) are sent immediately.
+ * Sends due too soon are delayed with add_timeout(); delays are whole seconds.
  * Returns the delay in seconds (0 if sent immediately).
  */
 static int
 paced_send_packet(struct interface_info *ip, struct in_addr from,
-    struct in_addr to)
+    struct in_addr to, int pace_discover)
 {
 	long remaining_ms;
 	int i, delay_s;
 
-	if (core_rate_limit_ms <= 0) {
+	if (!pace_discover || core_rate_limit_ms <= 0) {
 		send_packet_unpriv(privfd, &ip->client->packet,
 		    ip->client->packet_length, from, to);
 		return (0);
@@ -501,17 +502,6 @@ paced_send_packet(struct interface_info *ip, struct in_addr from,
 		    (long)(cur_time - rate_last_send) * 1000;
 		if (remaining_ms > 0) {
 			delay_s = (int)((remaining_ms + 999) / 1000);
-			/* DHCPREQUEST/REBOOT packets are time-sensitive responses in
-			   the acquisition handshake; delaying them breaks DORA when
-			   the server's offer/transaction times out.  Prefer
-			   correctness over inter-packet spacing for these states. */
-			if (ip->client->state == S_REQUESTING ||
-			    ip->client->state == S_REBOOTING) {
-				rate_last_send = cur_time;
-				send_packet_unpriv(privfd, &ip->client->packet,
-				    ip->client->packet_length, from, to);
-				return (0);
-			}
 			for (i = 0; i < PACED_SLOTS; i++) {
 				if (paced_slots[i].ip != NULL)
 					continue;
@@ -1685,7 +1675,7 @@ again:
 			(ip->client->first_sending +
 			 ip->client->config->timeout) - cur_time + 1;
 
-	/* Never retry faster than the send pacing window allows. */
+	/* Never retry DISCOVER faster than the send pacing window allows. */
 	if (paced_min_interval() > ip->client->interval)
 		ip->client->interval = paced_min_interval();
 
@@ -1702,7 +1692,7 @@ again:
 
 	/* Send out a packet. */
 	{
-		int delay = paced_send_packet(ip, inaddr_any, inaddr_broadcast);
+		int delay = paced_send_packet(ip, inaddr_any, inaddr_broadcast, 1);
 		if (delay > 0)
 			ip->client->first_sending += delay;
 	}
@@ -1936,10 +1926,6 @@ cancel:
 		ip->client->interval =
 		    ip->client->active->expiry - cur_time + 1;
 
-	/* Never retry faster than the send pacing window allows. */
-	if (paced_min_interval() > ip->client->interval)
-		ip->client->interval = paced_min_interval();
-
 	/* If the lease T2 time has elapsed, or if we're not yet bound,
 	   broadcast the DHCPREQUEST rather than unicasting. */
 	if (ip->client->state == S_REQUESTING ||
@@ -1971,13 +1957,7 @@ cancel:
 	    REMOTE_PORT);
 
 	/* Send out a packet. */
-	{
-		int delay = paced_send_packet(ip, from, to);
-		if (delay > 0 &&
-		    (ip->client->state == S_REQUESTING ||
-		     ip->client->state == S_REBOOTING))
-			ip->client->first_sending += delay;
-	}
+	(void)paced_send_packet(ip, from, to, 0);
 
 	add_timeout(cur_time + ip->client->interval, send_request, ip);
 }
@@ -1991,7 +1971,7 @@ send_decline(void *ipp)
 	    inet_ntoa(inaddr_broadcast), REMOTE_PORT);
 
 	/* Send out a packet. */
-	(void)paced_send_packet(ip, inaddr_any, inaddr_broadcast);
+	(void)paced_send_packet(ip, inaddr_any, inaddr_broadcast, 0);
 }
 
 void
