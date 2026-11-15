@@ -501,15 +501,12 @@ paced_send_packet(struct interface_info *ip, struct in_addr from,
 		    (long)(cur_time - rate_last_send) * 1000;
 		if (remaining_ms > 0) {
 			delay_s = (int)((remaining_ms + 999) / 1000);
-			/* A delayed REQUEST/REBOOT during acquisition can
-			   exceed the reboot timeout and loop forever; prefer
-			   correctness over spacing for these states. */
-			if ((ip->client->state == S_REQUESTING ||
-			    ip->client->state == S_REBOOTING) &&
-			    (cur_time - ip->client->first_sending + delay_s) >
-			    ip->client->config->reboot_timeout) {
-				note("rate limit: bypassing %d s delay for %s to meet reboot timeout",
-				    delay_s, ip->name);
+			/* DHCPREQUEST/REBOOT packets are time-sensitive responses in
+			   the acquisition handshake; delaying them breaks DORA when
+			   the server's offer/transaction times out.  Prefer
+			   correctness over inter-packet spacing for these states. */
+			if (ip->client->state == S_REQUESTING ||
+			    ip->client->state == S_REBOOTING) {
 				rate_last_send = cur_time;
 				send_packet_unpriv(privfd, &ip->client->packet,
 				    ip->client->packet_length, from, to);
