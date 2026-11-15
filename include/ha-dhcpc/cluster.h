@@ -97,10 +97,20 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx);
  * Returns 1 when the role was changed (before any state is applied). */
 int hadc_cluster_startup_gate(hadc_ctx_t *ctx);
 
-/* Heartbeat tick: called from the daemon's heartbeat timer every
- * heartbeat_ms, on every role. Sends a heartbeat cluster-wide (plan §4:
- * bidirectional) and runs the v1 dead-master alarm. */
+/* Cluster maintenance cadence (ms) for peer aging/failover/election, decoupled
+ * from heartbeat send rate: bounded well below the election deadline. */
+uint32_t hadc_cluster_maint_interval_ms(const hadc_ctx_t *ctx);
+
+/* Heartbeat/maintenance tick: called from the cluster-maintenance timer on every
+ * role. Heartbeat send cadence and stall watchdog run on the hb thread; this
+ * performs lightweight peer aging/failover/election (heavy netlink/persist/fanout
+ * work runs from periodic maintenance). */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx);
+
+/* Slow-cadence master gateway-MAC refresh (netlink observe + persist/push on
+ * change) and graceful-restart keepalive/expiry; called from periodic maintenance. */
+void hadc_cluster_gateway_mac_refresh(hadc_ctx_t *ctx);
+void hadc_cluster_graceful_keepalive(hadc_ctx_t *ctx);
 
 /* Role-change hook: invoked when a promote/demote/role_change actually
  * changes this node's role, after the change is applied locally. */

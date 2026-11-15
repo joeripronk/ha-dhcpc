@@ -1384,39 +1384,68 @@ static void preempt_check(hadc_ctx_t *ctx)
     hadc_cluster_promote(ctx, ctx->conf.self);
 }
 
-/* Heartbeat tick (called by the daemon every heartbeat_ms, all roles). */
-void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
+/* Slow-cadence gateway-MAC refresh (master): netlink observe can be costly, so
+ * this runs from periodic maintenance/events rather than every heartbeat tick.
+ * On change, persist and push state so members hold it before a failover. */
+void hadc_cluster_gateway_mac_refresh(hadc_ctx_t *ctx)
 {
+    if (ctx->role != HADC_ROLE_MASTER || ctx->lease.gateway.s_addr == 0)
+        return;
+    uint8_t mac[HADC_MAC_LEN];
+    if (hadc_executor_observe_gw_mac(ctx, mac) != 0)
+        return;
+    if (ctx->lease.gw_mac_valid && hadc_mac_equal(ctx->lease.gw_mac, mac))
+        return;
+    memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
+    ctx->lease.gw_mac_valid = true;
     bool standalone = (ctx->conf.n_members == 0);
+    hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached%s",
+              inet_ntoa(ctx->lease.gateway), mac[0], mac[1], mac[2], mac[3],
+              mac[4], mac[5], standalone ? "" : "; pushing state");
+    hadc_persist_save(ctx);
+    if (!standalone)
+        hadc_cluster_push_state(ctx, &ctx->lease);
+}
 
-    if (ctx->graceful_restart_until_ms && !hadc_cluster_graceful_active(ctx)) {
-        /* expired: persist cleared state once */
+/* Periodic graceful-restart keepalive/expiry handling. The active window is
+ * broadcast on transitions and here at a slow cadence instead of every heartbeat
+ * tick; expiry is detected and persisted once. */
+void hadc_cluster_graceful_keepalive(hadc_ctx_t *ctx)
+{
+    if (!ctx->graceful_restart_until_ms)
+        return;
+    if (!hadc_cluster_graceful_active(ctx)) {
+        /* expired: lazily cleared above; persist once */
         hadc_info("cluster: graceful restart window expired");
         hadc_persist_save(ctx);
+        return;
     }
-    if (!standalone && hadc_cluster_graceful_active(ctx))
+    if (ctx->conf.n_members != 0)
         hadc_cluster_broadcast_graceful(ctx);
+}
 
-    /* Master-side gateway MAC cache: pick up the gateway lladdr from our own
-     * resolved neighbor entry (the first ARP after binding may not have
-     * answered yet when the lease event fired) and push it so every member
-     * holds it before a failover. */
-    if (ctx->role == HADC_ROLE_MASTER && ctx->lease.gateway.s_addr != 0) {
-        uint8_t mac[HADC_MAC_LEN];
-        if (hadc_executor_observe_gw_mac(ctx, mac) == 0 &&
-            (!ctx->lease.gw_mac_valid || !hadc_mac_equal(ctx->lease.gw_mac, mac))) {
-            memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
-            ctx->lease.gw_mac_valid = true;
-            hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached%s",
-                      inet_ntoa(ctx->lease.gateway), mac[0], mac[1], mac[2], mac[3],
-                      mac[4], mac[5], standalone ? "" : "; pushing state");
-            hadc_persist_save(ctx);
-            if (!standalone)
-                hadc_cluster_push_state(ctx, &ctx->lease);
-        }
-    }
+uint32_t hadc_cluster_maint_interval_ms(const hadc_ctx_t *ctx)
+{
+    uint32_t interval_ms = 500;
+    uint32_t dl = ctx->conf.cluster.election_deadline_ms;
+    if (dl == 0)
+        dl = 6000;
+    if (dl / 2 < interval_ms)
+        interval_ms = dl / 2;
+    if (interval_ms < 100)
+        interval_ms = dl < 100 ? (dl ? dl : 100) : 100;
+    if (interval_ms > 1000)
+        interval_ms = 1000;
+    return interval_ms;
+}
 
-    if (standalone) {
+/* Cluster maintenance tick: called from the maintenance timer on every role.
+ * Heartbeat send cadence and the stall watchdog run on the hb thread; this does
+ * lightweight peer aging/failover/election. Heavy netlink/persist/fanout runs
+ * from periodic maintenance. */
+void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
+{
+    if (ctx->conf.n_members == 0) {
         hadc_cluster_elect_check(ctx);
         return;
     }

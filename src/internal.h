@@ -28,8 +28,8 @@ struct hadc_ctx {
     char pidfile_path[PATH_MAX];
 
     int epfd;
-    int timerfd;   /* heartbeat */
-    int periodicfd; /* 1 s maintenance ticks */
+    int maintfd;    /* cluster maintenance (peer aging/failover/election), decoupled from heartbeat send */
+    int periodicfd; /* 1 s maintenance ticks (audit/gwping/routing/gw-mac/graceful) */
     int core_timerfd; /* DHCP core timers (dhcpcore adapter) */
     int ctl_fd;    /* unix control socket */
     int udp_fd;    /* cluster transport, bound to local sync_address */

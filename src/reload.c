@@ -70,7 +70,6 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     }
 
     /* What changed, so the log says what was applied and what needs a restart. */
-    int heartbeat = next.cluster.heartbeat_ms != ctx->conf.cluster.heartbeat_ms;
     const struct in_addr *sync_old = self_sync(ctx), *sync_new = self_sync_of(&next);
     int transport = next.cluster.port != ctx->conf.cluster.port ||
         (sync_old && sync_new && memcmp(sync_old, sync_new, sizeof(*sync_new)) != 0);
@@ -164,15 +163,18 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     hadc_log_set_level(ctx->conf.loglevel);
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);
 
-    if (heartbeat) {
+    {
+        /* Cluster maintenance cadence depends on election deadline (heartbeat send
+         * rate is driven by the hb thread and reads conf each tick). */
+        uint32_t maint_ms = hadc_cluster_maint_interval_ms(ctx);
         struct itimerspec its = {
-            .it_interval = { .tv_sec = ctx->conf.cluster.heartbeat_ms / 1000,
-                             .tv_nsec = (long)(ctx->conf.cluster.heartbeat_ms % 1000) * 1000000 },
-            .it_value = { .tv_sec = ctx->conf.cluster.heartbeat_ms / 1000,
-                          .tv_nsec = (long)(ctx->conf.cluster.heartbeat_ms % 1000) * 1000000 },
+            .it_interval = { .tv_sec = maint_ms / 1000,
+                             .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
+            .it_value = { .tv_sec = maint_ms / 1000,
+                          .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
         };
-        if (ctx->timerfd >= 0 && timerfd_settime(ctx->timerfd, 0, &its, NULL) != 0)
-            hadc_warn("reload: timerfd re-arm failed: %s", strerror(errno));
+        if (ctx->maintfd >= 0 && timerfd_settime(ctx->maintfd, 0, &its, NULL) != 0)
+            hadc_warn("reload: maintfd re-arm failed: %s", strerror(errno));
     }
     if (transport)
         hadc_cluster_rebind(ctx);
