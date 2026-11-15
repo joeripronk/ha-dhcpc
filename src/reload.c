@@ -107,6 +107,11 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     int conntrack_changed = memcmp(&next.conntrack_sync, &ctx->conf.conntrack_sync,
                                    sizeof(next.conntrack_sync)) != 0;
 
+    int heartbeat = next.cluster.heartbeat_ms != ctx->conf.cluster.heartbeat_ms ||
+                    next.cluster.election_deadline_ms != ctx->conf.cluster.election_deadline_ms ||
+                    next.cluster.self_demote_gap_ms != ctx->conf.cluster.self_demote_gap_ms ||
+                    next.cluster.preempt != ctx->conf.cluster.preempt;
+
     int apply = interface_changed || cluster_addrs ||
         next.apply.routes != ctx->conf.apply.routes ||
         next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||

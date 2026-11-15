@@ -763,15 +763,16 @@ int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN])
 {
 	struct nl_cache *lcache = NULL, *ncache = NULL;
 	struct rtnl_link *link = NULL;
-	struct nl_addr *dst;
+	struct nl_addr *dst = NULL;
 	struct rtnl_neigh *n = NULL;
 	int rc = -1;
 
+	hadc_maint_lock();
 	if (!g_sk || !ctx->lease.gateway.s_addr)
-		return -1;
+		goto out;
 	dst = nl_addr_build(AF_INET, (void *)&ctx->lease.gateway, 4);
 	if (!dst)
-		return -1;
+		goto out;
 	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache ||
 	    rtnl_neigh_alloc_cache(g_sk, &ncache) < 0 || !ncache) {
 		hadc_dbg("executor: neighbor observation: netlink cache dump failed");
@@ -812,6 +813,7 @@ out:
 	if (ncache)
 		nl_cache_put(ncache);
 	nl_addr_put(dst);
+	hadc_maint_unlock();
 	return rc;
 }
 
@@ -950,6 +952,7 @@ static void reconcile_now(hadc_ctx_t *ctx, const char *reason)
 
 void hadc_executor_audit_tick(hadc_ctx_t *ctx)
 {
+	hadc_maint_lock();
 	/* Pending monitor events are acted on the first heartbeat tick after the
 	 * debounce interval, so a burst (netifd flush+re-add) settles first. */
 	if (g_mon_pending && (uint64_t)hadc_now_ms() - g_mon_last_reconcile_ms >=
@@ -957,12 +960,16 @@ void hadc_executor_audit_tick(hadc_ctx_t *ctx)
 		g_mon_pending = false;
 		g_mon_last_reconcile_ms = (uint64_t)hadc_now_ms();
 		reconcile_now(ctx, "RECONCILE");
+		hadc_maint_unlock();
 		return;
 	}
-	if ((uint64_t)hadc_now_ms() - g_last_audit_ms < HADC_EXECUTOR_AUDIT_MS)
+	if ((uint64_t)hadc_now_ms() - g_last_audit_ms < HADC_EXECUTOR_AUDIT_MS) {
+		hadc_maint_unlock();
 		return;
+	}
 	g_last_audit_ms = (uint64_t)hadc_now_ms();
 	reconcile_now(ctx, "AUDIT");
+	hadc_maint_unlock();
 }
 
 int hadc_executor_monitor_start(hadc_ctx_t *ctx)
@@ -1013,25 +1020,31 @@ static void monitor_ready(hadc_ctx_t *ctx, int fd)
 	char buf[4096];
 
 	(void)ctx;
+	hadc_maint_lock();
 	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0)
 		g_mon_pending = true;
+	hadc_maint_unlock();
 }
 
 json_t *hadc_executor_status(void)
 {
 	char hash[65] = "";
 
+	hadc_maint_lock();
 	if (g_applied_valid) {
 		for (size_t i = 0; i < 32; i++)
 			snprintf(hash + i * 2, 3, "%02x", g_applied.config_hash[i]);
 	}
-	return json_pack("{s:s, s:I, s:I, s:b}", "applied_hash", hash, "verified",
+	json_t *o = json_pack("{s:s, s:I, s:I, s:b}", "applied_hash", hash, "verified",
 	    (json_int_t)g_last_verify, "drift_reconciled", (json_int_t)g_drift_reconciled,
 	    "monitor", g_mon_fd >= 0);
+	hadc_maint_unlock();
+	return o;
 }
 
 int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const char *reason)
 {
+	hadc_maint_lock();
 	if (g_applied_valid && !memcmp(g_applied.config_hash, desired->config_hash,
 	    sizeof(g_applied.config_hash))) {
 		/* The memo says applied — but it is a fast path, not the truth: an
@@ -1043,6 +1056,7 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 		if (v == 0) {
 			hadc_dbg("executor: desired state already applied (no delta, reason=%s)",
 			    reason);
+			hadc_maint_unlock();
 			return 0;
 		}
 		if (v > 0) {
@@ -1051,7 +1065,9 @@ int hadc_executor_apply(hadc_ctx_t *ctx, const hadc_desired_t *desired, const ch
 			    "diverged, reason=%s); reconciling live state", v, reason);
 		}
 	}
-	return executor_apply_locked(ctx, desired, reason, false);
+	int rc = executor_apply_locked(ctx, desired, reason, false);
+	hadc_maint_unlock();
+	return rc;
 }
 
 static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
@@ -1534,18 +1550,22 @@ int hadc_executor_link_up(const char *ifname)
     struct rtnl_link *link;
     int rc = 0;
 
+    hadc_maint_lock();
     if (!g_sk) {
         hadc_warn("executor: netlink socket not open");
+        hadc_maint_unlock();
         return -1;
     }
     if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache) {
         hadc_warn("executor: netlink cache dump failed");
+        hadc_maint_unlock();
         return -1;
     }
     link = rtnl_link_get_by_name(lcache, ifname);
     if (!link) {
         hadc_warn("executor: interface %s not found", ifname);
         nl_cache_put(lcache);
+        hadc_maint_unlock();
         return -1;
     }
     if (!(rtnl_link_get_flags(link) & IFF_UP)) {
@@ -1555,5 +1575,6 @@ int hadc_executor_link_up(const char *ifname)
             hadc_info("executor: link %s brought up", ifname);
     }
     nl_cache_put(lcache);
+    hadc_maint_unlock();
     return rc;
 }

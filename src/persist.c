@@ -212,7 +212,10 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
     return 0;
 }
 
-int hadc_persist_save(hadc_ctx_t *ctx)
+/* Serialize the cluster view. Built on the calling thread so it observes a
+ * consistent ctx snapshot (the main loop owns that state); only the blocking
+ * file IO is offloaded to the maintenance worker. */
+static char *persist_build_json(hadc_ctx_t *ctx)
 {
     /* t1/t2/t3 are remaining seconds at observed_at_utc and can be stale between
      * lease events; persist a snapshot aged to now so restarts resume correctly. */
@@ -223,7 +226,7 @@ int hadc_persist_save(hadc_ctx_t *ctx)
 
     json_t *lj = lease_json(&snap);
     if (!lj)
-        return -1;
+        return NULL;
     json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:o}", "role",
                           ctx->role == HADC_ROLE_MASTER ? "master"
                           : ctx->role == HADC_ROLE_SLAVE ? "slave"
@@ -238,7 +241,7 @@ int hadc_persist_save(hadc_ctx_t *ctx)
                           (json_int_t)ctx->graceful_restart_until_ms, "lease", lj);
     if (!o) {
         json_decref(lj);
-        return -1;
+        return NULL;
     }
     /* Self-originated OSPF LSAs: persisted so a restart re-adopts the exact
      * same LSDB entries (sequence continues, content identical) and the LSDB
@@ -249,26 +252,75 @@ int hadc_persist_save(hadc_ctx_t *ctx)
         json_object_set_new(o, "ospf_self_lsas", arr);
         json_object_set_new(o, "ospf_seq", json_integer((json_int_t)hadc_ospf_next_seq()));
     }
+    char *txt = json_dumps(o, JSON_PRESERVE_ORDER | JSON_COMPACT);
+    json_decref(o);
+    return txt;
+}
+
+/* Atomic rename + fsync. */
+static int persist_write_file(const char *path, const char *json)
+{
     char tmp[PATH_MAX];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", g_path);
+    size_t len = strlen(json);
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (!f) {
         hadc_err("persist: fopen %s: %s", tmp, strerror(errno));
-        json_decref(o);
         return -1;
     }
-    if (json_dumpf(o, f, JSON_PRESERVE_ORDER | JSON_COMPACT) != 0) {
-        hadc_err("persist: write %s failed", tmp);
+    if (fwrite(json, 1, len, f) != len) {
+        hadc_err("persist: write %s failed: %s", tmp, strerror(errno));
         fclose(f);
-        json_decref(o);
         return -1;
     }
     fsync(fileno(f));
     fclose(f);
-    json_decref(o);
-    if (rename(tmp, g_path) != 0) {
-        hadc_err("persist: rename to %s: %s", g_path, strerror(errno));
+    if (rename(tmp, path) != 0) {
+        hadc_err("persist: rename to %s: %s", path, strerror(errno));
         return -1;
     }
     return 0;
+}
+
+typedef struct {
+    char *path;
+    char *json;
+} persist_write_req_t;
+
+static void persist_write_task(void *arg)
+{
+    persist_write_req_t *r = arg;
+    (void)persist_write_file(r->path, r->json);
+    free(r->path);
+    free(r->json);
+    free(r);
+}
+
+int hadc_persist_save(hadc_ctx_t *ctx)
+{
+    char *json = persist_build_json(ctx);
+    if (!json)
+        return -1;
+    if (hadc_maint_running()) {
+        /* Offload the fsync/rename to the maintenance worker; the serialized
+         * snapshot above is already consistent, so ordering is preserved. */
+        persist_write_req_t *r = calloc(1, sizeof(*r));
+        if (!r) {
+            free(json);
+            return -1;
+        }
+        r->path = strdup(g_path);
+        r->json = json;
+        if (!r->path || hadc_maint_post_fn(persist_write_task, r) != 0) {
+            free(r->path);
+            free(r->json);
+            free(r);
+            return -1;
+        }
+        return 0;
+    }
+    int rc = persist_write_file(g_path, json);
+    free(json);
+    return rc;
 }

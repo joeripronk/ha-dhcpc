@@ -86,6 +86,21 @@ void hadc_gwping_start(hadc_ctx_t *ctx);
 void hadc_gwping_stop(hadc_ctx_t *ctx);
 void hadc_gwping_tick(hadc_ctx_t *ctx);
 
+/* Serialized maintenance worker (step 3): heavy/IO maintenance (fsync-heavy
+ * persist, netlink-heavy executor audit/routing reconcile) runs on a dedicated
+ * thread, fed by main-loop dirty/event signals, so a slow netlink dump or disk
+ * sync does not delay packet/ctl handling. hadc_maint_lock serializes the
+ * executor/routing/ping/persist state between the worker and the main loop;
+ * take it outermost (before hb_lock/ospf_lock). */
+typedef void (*hadc_maint_fn_t)(void *arg);
+int  hadc_maint_start(hadc_ctx_t *ctx);
+void hadc_maint_stop(void);
+int  hadc_maint_post_tick(hadc_ctx_t *ctx);
+int  hadc_maint_post_fn(hadc_maint_fn_t fn, void *arg);
+void hadc_maint_lock(void);
+void hadc_maint_unlock(void);
+bool hadc_maint_running(void);
+
 /* OSPF self-LSA persistence hooks (implemented in ospf.c, called by persist.c;
  * arr is a jansson json_t* array, void* to keep this header dependency-free). */
 void hadc_ospf_collect_self_lsas(void *arr);

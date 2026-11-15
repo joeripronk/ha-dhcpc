@@ -550,6 +550,7 @@ void hadc_routing_set_default_candidates(hadc_ctx_t *ctx,
 {
     /* Backend-fed fabric candidates. Local-master default is derived from
      * cluster information (heartbeat/sync), not from this feed. */
+    hadc_maint_lock();
     size_t n = 0;
     memset(g_rs.remote_cands, 0, sizeof(g_rs.remote_cands));
     for (size_t i = 0; i < count && n < HADC_ROUTING_MAX_CANDIDATES; i++) {
@@ -563,6 +564,7 @@ void hadc_routing_set_default_candidates(hadc_ctx_t *ctx,
         n++;
     }
     g_rs.n_remote_cands = n;
+    hadc_maint_unlock();
     hadc_routing_reconcile(ctx, reason ? reason : "candidates");
 }
 
@@ -570,13 +572,19 @@ struct in_addr hadc_routing_backup_gateway(hadc_ctx_t *ctx)
 {
     struct in_addr none = {0};
     (void)ctx;
-    if (!g_rs.accept_default_route)
+    hadc_maint_lock();
+    if (!g_rs.accept_default_route) {
+        hadc_maint_unlock();
         return none;
-    return g_rs.backup_gw;
+    }
+    struct in_addr gw = g_rs.backup_gw;
+    hadc_maint_unlock();
+    return gw;
 }
 
 void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
 {
+    hadc_maint_lock();
     bool enabled = ctx->conf.routing.enabled;
     bool master_owner = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING);
     bool healthy_bound = master_owner && ctx->lease.address.s_addr != 0 &&
@@ -680,6 +688,7 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
                   g_rs.backup_scope[0] ? g_rs.backup_scope : "none", g_rs.reason,
                   g_rs.local_master_up ? "local-master-up" : "local-master-down");
     }
+    hadc_maint_unlock();
 }
 
 
@@ -688,11 +697,15 @@ const char *hadc_routing_router_id(hadc_ctx_t *ctx)
 {
     if (ctx && ctx->conf.ospf.router_id[0])
         return ctx->conf.ospf.router_id;
-    return g_rs.router_id;
+    hadc_maint_lock();
+    const char *rid = g_rs.router_id;
+    hadc_maint_unlock();
+    return rid;
 }
 
 json_t *hadc_routing_status(hadc_ctx_t *ctx)
 {
+    hadc_maint_lock();
     char pub[INET_ADDRSTRLEN] = "0.0.0.0";
     char bgw[INET_ADDRSTRLEN] = "0.0.0.0";
     if (g_rs.public_ip32.s_addr)
@@ -717,6 +730,7 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
                                                g_rs.remote_cands[i].origin, "valid",
                                                g_rs.remote_cands[i].valid));
     }
+    /* remaining g_rs fields are read below while holding maint_lock */
 
     int cand_count = g_rs.n_remote_cands + ((g_rs.local_cand.valid && g_rs.local_cand.gateway.s_addr) ? 1 : 0);
     json_t *prefixes = json_array();
@@ -789,5 +803,6 @@ json_t *hadc_routing_status(hadc_ctx_t *ctx)
         ctx->conf.ospf.auth.type == 2 ? "md5" :
         (ctx->conf.ospf.auth.type == 1 ? "plaintext" : "none")));
     json_object_set_new(o, "ospf", ost);
+    hadc_maint_unlock();
     return o;
 }
