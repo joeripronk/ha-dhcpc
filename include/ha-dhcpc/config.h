@@ -31,7 +31,7 @@
 typedef struct {
     /* identity: per-node fields come from the local overlay */
     char self[HADC_NODE_ID_MAX];
-    int priority; /* failover priority (higher wins) */
+    int priority; /* failover priority (higher wins); derived from this node's members-list entry */
 
     /* shared cluster membership */
     char designated_master[HADC_NODE_ID_MAX]; /* runtime master (may be elected) */
@@ -194,6 +194,12 @@ typedef struct {
  * Returns 0 on success, -1 with err filled. */
 int hadc_config_load(const char *base_path, const char *local_path,
                      hadc_conf_t *out, char *err, size_t errlen);
+
+/* Verify a loaded config belongs to this node: with members configured, self
+ * (from config or hostname) must be one of them and that member's sync_address
+ * must be an address on this host. Refuses to start (or reload) otherwise; a
+ * memberless standalone node passes. Returns 0 on success, -1 with err filled. */
+int hadc_config_identity_check(const hadc_conf_t *conf, char *err, size_t errlen);
 
 /* Read one YAML file into a jansson document (NULL + err on failure). */
 json_t *hadc_config_read_yaml(const char *path, char *err, size_t errlen);

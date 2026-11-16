@@ -58,6 +58,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         hadc_err("reload(%s): %s; keeping the config in use", why, err);
         return -1;
     }
+    if (hadc_config_identity_check(&next, err, sizeof(err)) != 0) {
+        hadc_err("reload(%s): %s; keeping the config in use", why, err);
+        return -1;
+    }
     /* The file's designated_master is only the cold-start seed. Keep the
      * runtime master (possibly elected) unless the operator changed the seed,
      * so an unchanged reload compares equal and does nothing. */

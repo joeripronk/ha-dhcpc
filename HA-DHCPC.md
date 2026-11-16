@@ -104,8 +104,8 @@ automatic failover (heartbeat + quorum + priority)
 |        (UDP, trusted LAN) on shared link                                 |
 +--------------------------------------------------------------------------+
 
-config inputs: ha-dhcpc.conf (shared: members + MAC, timers, retention, hooks;
-               cluster-synced) + ha-dhcpc-local.conf (self, priority, overrides)
+config inputs: ha-dhcpc.conf (shared: members + MAC + priorities, timers,
+               retention, hooks; cluster-synced) + ha-dhcpc-local.conf (self, overrides)
 ```
 
 Components:
@@ -252,8 +252,8 @@ member, and the master is authoritative for it.
 designated_master: node-a
 master_mac: "aa:bb:cc:dd:ee:ff"
 members:
-  # priority mirrors each member's local priority: every node must compute the
-  # same election winner from the shared list.
+  # the single source of truth for the election ranking: every node, itself
+  # included, reads its priority from this list.
   - { id: node-a, sync_address: 10.10.0.1, priority: 100 }   # distinct secondary addrs, same link
   - { id: node-b, sync_address: 10.10.0.2, priority: 90 }
   - { id: node-c, sync_address: 10.10.0.3, priority: 80 }
@@ -310,12 +310,13 @@ lease_file: dhclient.leases  # optional; relative names resolve against this
 ```
 
 `/etc/ha-dhcpc/ha-dhcpc-local.conf` — the **per-node overlay** (the old
-`slave.conf` role): this node's identity and failover priority, plus any shared
-key this node must run differently. It is never overwritten by a sync.
+`slave.conf` role): this node's identity (the startup refuses a node whose
+hostname and members entry do not match, or whose members sync_address is not
+an address on that host), plus any shared key this node must run differently.
+It is never overwritten by a sync.
 
 ```yaml
-self: node-b
-priority: 90   # failover priority; highest live member wins
+self: node-b         # priority comes from this node's entry in the members list
 interface: eth1        # per-node overrides: interface, default_role, ...
 default_role: slave
 apply:

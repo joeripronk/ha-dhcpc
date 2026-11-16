@@ -39,7 +39,6 @@ static void write_file(const char *path, const char *text)
 }
 
 static const char *BASE_NOMAC = "self: node-a\n"
-                                "priority: 100\n"
                                 "designated_master: node-a\n"
                                 "master_mac: \"aa:bb:cc:dd:ee:ff\"\n"
                                 "members:\n"
@@ -56,7 +55,6 @@ static const char *BASE_NOMAC = "self: node-a\n"
                                 "ctl_socket: /run/ha-dhcpc.ctl\n";
 
 static const char *OVERLAY = "self: node-b\n"
-                             "priority: 90\n"
                              "interface: eth1\n"
                              "default_role: master\n"
                              "cluster:\n"
@@ -84,7 +82,7 @@ int main(void)
         return 1;
     }
     if (strcmp(conf.self, "node-b") != 0 || conf.priority != 90)
-        fail("self/priority from the overlay");
+        fail("self from the overlay, priority from the members list");
     else if (strcmp(conf.interface, "eth1") != 0 || !conf.default_role_master)
         fail("interface/default_role overrides");
     else if (conf.cluster.heartbeat_ms != 5000 || conf.cluster.port != 4227)
@@ -102,7 +100,7 @@ int main(void)
      * it, and a change to the shared file always does */
     char sha_before[65];
     snprintf(sha_before, sizeof(sha_before), "%s", conf.sha256);
-    write_file(local, "self: node-c\npriority: 10\n");
+    write_file(local, "self: node-c\n");
     if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
         printf("config_test: %s\n", err);
         return 1;
@@ -268,7 +266,7 @@ int main(void)
             fail("ddclient overlay wins");
         else
             ok("ddclient overlay wins");
-        write_file(local, "self: node-b\npriority: 90\n");
+        write_file(local, "self: node-b\n");
     }
     {
         write_file(base, BASE_NOMAC);
@@ -301,14 +299,14 @@ int main(void)
 
         write_file(base, BASE_NOMAC);
         write_file(local,
-                   "self: node-b\npriority: 90\napply:\n  backup_gateway: 192.168.10.1\n");
+                   "self: node-b\napply:\n  backup_gateway: 192.168.10.1\n");
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("backup_gateway overlay load");
         else if (conf.apply.backup_gateway.s_addr != want_gw.s_addr)
             fail("backup_gateway overlay wins");
         else
             ok("backup_gateway overlay wins");
-        write_file(local, "self: node-b\npriority: 90\n");
+        write_file(local, "self: node-b\n");
 
         write_file(base, BASE_NOMAC);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
@@ -359,14 +357,14 @@ int main(void)
 
         write_file(base, BASE_NOMAC);
         write_file(local,
-                   "self: node-b\npriority: 90\napply:\n  master_backup_gateway: 192.168.10.3\n");
+                   "self: node-b\napply:\n  master_backup_gateway: 192.168.10.3\n");
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("master_backup_gateway overlay load");
         else if (conf.apply.master_backup_gateway.s_addr != want_gw.s_addr)
             fail("master_backup_gateway overlay wins");
         else
             ok("master_backup_gateway overlay wins");
-        write_file(local, "self: node-b\npriority: 90\n");
+        write_file(local, "self: node-b\n");
 
         write_file(base, BASE_NOMAC);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
@@ -453,14 +451,14 @@ int main(void)
             ok("abort_tcp_on_newip parsed from the shared document");
 
         write_file(base, BASE_NOMAC);
-        write_file(local, "self: node-b\npriority: 90\napply:\n  abort_tcp_on_newip: true\n");
+        write_file(local, "self: node-b\napply:\n  abort_tcp_on_newip: true\n");
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("abort_tcp_on_newip overlay load");
         else if (!conf.apply.abort_tcp_on_newip)
             fail("abort_tcp_on_newip overlay wins");
         else
             ok("abort_tcp_on_newip overlay wins");
-        write_file(local, "self: node-b\npriority: 90\n");
+        write_file(local, "self: node-b\n");
     }
 
     /* apply.demote_nat_bypass_mark: default off, parses, range guard;
@@ -496,7 +494,7 @@ int main(void)
             ok("demote_nat_bypass_mark out of range refused");
     }
 
-    /* cluster: quorum defaults to majority; failover priority is explicit */
+    /* cluster: quorum defaults to majority; priority comes from the members list */
     write_file(base, BASE_NOMAC);
     unlink(local);
     if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
@@ -666,7 +664,7 @@ int main(void)
         }
 
         write_file(local,
-                   "self: node-b\npriority: 90\n"
+                   "self: node-b\n"
                    "conntrack_sync:\n"
                    "  enabled: false\n"
                    "  port: 4520\n"
@@ -708,6 +706,61 @@ int main(void)
             else
                 ok("bad conntrack_sync config rejected");
         }
+    }
+
+    /* the members list is the single source of truth for priority: a node's
+     * own value is the list entry for its own id, and a top-level priority
+     * key is refused outright */
+    {
+        write_file(base, BASE_NOMAC);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("members-list priority load");
+        else if (conf.priority != 100)
+            fail("priority derived from own members entry");
+        else
+            ok("priority derived from own members entry");
+
+        char with_prio[2048];
+        snprintf(with_prio, sizeof(with_prio), "%spriority: 100\n", BASE_NOMAC);
+        write_file(base, with_prio);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("top-level priority should be refused");
+        else
+            ok("top-level priority refused");
+    }
+
+    /* identity check: with members, self must be one of them and that entry's
+     * sync_address must be an address on this host; a memberless node passes */
+    {
+        hadc_conf_t ic;
+        memset(&ic, 0, sizeof(ic));
+        if (hadc_config_identity_check(&ic, err, sizeof(err)) != 0)
+            fail("memberless standalone should pass the identity check");
+        else
+            ok("memberless standalone passes the identity check");
+
+        snprintf(ic.self, sizeof(ic.self), "node-z");
+        ic.n_members = 1;
+        snprintf(ic.members[0].id, sizeof(ic.members[0].id), "node-a");
+        inet_pton(AF_INET, "127.0.0.1", &ic.members[0].sync_address);
+        if (hadc_config_identity_check(&ic, err, sizeof(err)) == 0)
+            fail("self outside the members list should be refused");
+        else
+            ok("self outside the members list refused");
+
+        snprintf(ic.self, sizeof(ic.self), "node-a");
+        inet_pton(AF_INET, "10.10.0.1", &ic.members[0].sync_address);
+        if (hadc_config_identity_check(&ic, err, sizeof(err)) == 0)
+            fail("non-local sync_address should be refused");
+        else
+            ok("non-local sync_address refused");
+
+        inet_pton(AF_INET, "127.0.0.1", &ic.members[0].sync_address);
+        if (hadc_config_identity_check(&ic, err, sizeof(err)) != 0)
+            fail("local sync_address should pass");
+        else
+            ok("identity check passes for this host's own entry");
     }
 
     unlink(base);

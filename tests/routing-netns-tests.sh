@@ -102,7 +102,6 @@ loglevel: debug
 EOF
     cat >"$dir/ha-dhcpc-local.conf" <<EOF
 self: $self
-priority: 100
 EOF
 }
 

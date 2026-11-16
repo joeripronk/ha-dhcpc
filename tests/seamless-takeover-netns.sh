@@ -151,11 +151,11 @@ ip netns exec "$NS2" ip link set "$V2" name "$FAB_IF"
 # digest-based); per-node paths belong in the local overlay.
 write_shared_conf "$STATE_BASE/$NS1"
 cp "$STATE_BASE/$NS1/ha-dhcpc.conf" "$STATE_BASE/$NS2/ha-dhcpc.conf"
-printf 'self: node1\npriority: 200\nctl_socket: %s\n' "$STATE_BASE/$NS1/ctl.sock" \
+printf 'self: node1\nctl_socket: %s\n' "$STATE_BASE/$NS1/ctl.sock" \
     >"$STATE_BASE/$NS1/ha-dhcpc-local.conf"
 # node2 must not bootstrap-adopt master at startup (that would settle dual-master);
 # it follows the seeded designated_master instead.
-printf 'self: node2\npriority: 100\ndefault_role: slave\nctl_socket: %s\n' "$STATE_BASE/$NS2/ctl.sock" \
+printf 'self: node2\ndefault_role: slave\nctl_socket: %s\n' "$STATE_BASE/$NS2/ctl.sock" \
     >"$STATE_BASE/$NS2/ha-dhcpc-local.conf"
 
 start_node() {

@@ -1080,6 +1080,10 @@ int main(int argc, char **argv)
         hadc_err("config: %s", err);
         return 1;
     }
+    if (hadc_config_identity_check(&ctx->conf, err, sizeof(err))) {
+        hadc_err("%s", err);
+        return 1;
+    }
     hadc_log_set_level(ctx->conf.loglevel);
 
     /* Initial role: obey persisted view, else the designated master in the

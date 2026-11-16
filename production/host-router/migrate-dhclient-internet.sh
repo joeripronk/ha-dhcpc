@@ -31,7 +31,7 @@ run() {
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
 ip link show "$IFACE" >/dev/null || { echo "interface $IFACE missing" >&2; exit 1; }
 [ -x "$BINARY" ] || { echo "binary $BINARY missing (set BINARY=...)" >&2; exit 1; }
-for f in ha-dhcpc.conf ha-dhcpc-local.conf "$UNIT"; do
+for f in ha-dhcpc.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done
 [ -f "$DHCLIENT_LEASES" ] || { echo "no $DHCLIENT_LEASES to migrate from" >&2; exit 1; }
@@ -95,7 +95,6 @@ echo "$STATE_JSON" | sed 's/^/# /'
 run "mkdir -p $STATE_DIR && chmod 700 $STATE_DIR"
 run "mkdir -p $CONF_DIR"
 run "install -m 640 $SRC_DIR/ha-dhcpc.conf $CONF_DIR/ha-dhcpc.conf"
-run "install -m 640 $SRC_DIR/ha-dhcpc-local.conf $CONF_DIR/ha-dhcpc-local.conf"
 
 [ "$BINARY" = /usr/local/bin/ha-dhcpc ] || run "install -m 755 $BINARY /usr/local/bin/ha-dhcpc"
 run "install -m 644 $SRC_DIR/$UNIT /etc/systemd/system/$UNIT"

@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <jansson.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -453,9 +454,11 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         }
         snprintf(out->self, sizeof(out->self), "%s", host);
     }
-    if (get_int(root, "priority", &v, 100, false, "config"))
+    if (json_object_get(root, "priority")) {
+        snprintf(err, errlen, "config: top-level priority is gone: each node derives "
+                              "its own priority from its entry in the members list");
         goto derr;
-    out->priority = (int)v;
+    }
 
     /* shared cluster membership */
     char mac[64];
@@ -498,6 +501,17 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             mm->priority = (pj && json_is_integer(pj)) ? (int)json_integer_value(pj) : 0;
         }
     }
+
+    /* Each node's own priority is the members-list value for its own id, so
+     * every node computes the same ranking from one source of truth. A node
+     * that is not in the list keeps the default; hadc_config_identity_check
+     * refuses that at startup and on reload. */
+    out->priority = 100;
+    for (size_t i = 0; i < out->n_members; i++)
+        if (!strcmp(out->members[i].id, out->self)) {
+            out->priority = out->members[i].priority;
+            break;
+        }
 
     if (get_str(root, "interface", out->interface, HADC_IFNAME_MAX, true, "config")) {
         snprintf(err, errlen, "%s", g_errbuf);
@@ -1225,5 +1239,52 @@ derr:
     if (!err[0])
         snprintf(err, errlen, "%s", g_errbuf[0] ? g_errbuf : "config: schema error");
     json_decref(root);
+    return -1;
+}
+
+/* Gate a cluster node against its own config: its identity (self, defaulting
+ * to the hostname) must be one of the members, and that member's sync_address
+ * must be an address on this host. Refuses a node running with a foreign local
+ * overlay — the election only works when every node reads the same members
+ * list. A standalone node (no members) has nothing to disagree about. Returns
+ * 0 on success, -1 with err filled. */
+int hadc_config_identity_check(const hadc_conf_t *conf, char *err, size_t errlen)
+{
+    const hadc_member_t *self = NULL;
+    struct ifaddrs *ifas = NULL;
+
+    if (conf->n_members == 0)
+        return 0;
+
+    for (size_t i = 0; i < conf->n_members; i++)
+        if (!strcmp(conf->members[i].id, conf->self)) {
+            self = &conf->members[i];
+            break;
+        }
+    if (!self) {
+        snprintf(err, errlen, "config: identity: self '%s' is not a member of this "
+                              "cluster (hostname must match a members entry)", conf->self);
+        return -1;
+    }
+    if (getifaddrs(&ifas) != 0) {
+        snprintf(err, errlen, "config: identity: getifaddrs failed: %s", strerror(errno));
+        return -1;
+    }
+    for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
+        if (sin->sin_addr.s_addr == self->sync_address.s_addr) {
+            freeifaddrs(ifas);
+            return 0;
+        }
+    }
+    freeifaddrs(ifas);
+    {
+        char ip[64];
+        inet_ntop(AF_INET, &self->sync_address, ip, sizeof(ip));
+        snprintf(err, errlen, "config: identity: member '%s' has sync_address %s, "
+                              "which is not an address on this host", conf->self, ip);
+    }
     return -1;
 }

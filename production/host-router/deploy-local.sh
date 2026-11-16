@@ -23,7 +23,7 @@ if [ "$(id -u)" -ne 0 ]; then
 	exec sudo -- "$0" "$@"
 fi
 
-for f in ha-dhcpc.conf ha-dhcpc-local.conf "$UNIT"; do
+for f in ha-dhcpc.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done
 
@@ -31,12 +31,18 @@ make -C "$REPO_DIR" -s
 make -C "$REPO_DIR" -s test
 
 changed=0
-for f in ha-dhcpc.conf ha-dhcpc-local.conf; do
+for f in ha-dhcpc.conf; do
 	if [ ! -f "$CONF_DIR/$f" ] || ! cmp -s "$SRC_DIR/$f" "$CONF_DIR/$f"; then
 		changed=1
 		run "install -m 640 $SRC_DIR/$f $CONF_DIR/$f"
 	fi
 done
+# the local overlay is optional now (self defaults to the hostname and
+# priority comes from the members list); this node has nothing per-node to say.
+if [ -f "$CONF_DIR/ha-dhcpc-local.conf" ]; then
+	changed=1
+	run "rm -f $CONF_DIR/ha-dhcpc-local.conf"
+fi
 # old three-file layout (plan §6): the daemon no longer reads these, so they
 # are removed to keep one source of truth on the node.
 retired=0
