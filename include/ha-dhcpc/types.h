@@ -67,6 +67,15 @@ typedef struct {
     bool ipv6_disable;
 } hadc_cluster_if_t;
 
+
+#define HADC_VIP_NEIGH_DEFAULT 1024
+
+typedef struct {
+    char ifname[HADC_IFNAME_MAX];
+    struct in_addr ip;
+    uint8_t mac[HADC_MAC_LEN];
+} hadc_vip_neigh_t;
+
 static inline bool hadc_mac_equal(const uint8_t a[HADC_MAC_LEN], const uint8_t b[HADC_MAC_LEN])
 {
     for (size_t i = 0; i < HADC_MAC_LEN; i++)

@@ -21,6 +21,9 @@ cluster:
   preempt: true                # converge on the best live master (off = elect
   # only when no live master is present)
   cluster_timeout_ms: 0        # default-role bootstrap deadline (0=off)
+  neighbor_sync: true          # sync REACHABLE neighbors on VIP interfaces to slaves
+  neighbor_sync_resync_s: 0    # periodic resync seconds, 0 = event-driven only
+  neighbor_sync_max: 1024    # max VIP neighbors to sync/store
   # addresses:                 # VIPs owned by the master, keyed by interface
   #   br-lan: [192.168.10.1/24] # CIDR or dotted netmask
 default_role: slave            # master = bootstrap election when no master

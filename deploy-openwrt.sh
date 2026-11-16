@@ -13,6 +13,8 @@ WITH_VALGRIND=0
 APK=
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SDK_DEFAULT="$HOME/src/openwrt-sdk-25.12.6-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/openwrt-cluster-lib.sh"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -43,103 +45,7 @@ fi
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
 echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}${WITH_VALGRIND:+ (with-valgrind)}"
 
-json_field() {
-	python3 -c 'import json,sys
-try:
- d=json.load(sys.stdin); print(d.get(sys.argv[1],""))
-except Exception:
- print("")' "$1"
-}
-
-host_status() {
-	ssh -q "root@$1" 'ha-dhcpc ctl status 2>/dev/null' 2>/dev/null || true
-}
-
-find_master() {
-	masters=
-	unreachable=
-	for h in $HOSTS; do
-		status=$(host_status "$h")
-		if [ -z "$status" ]; then
-			unreachable="${unreachable}${unreachable:+ }$h"
-			continue
-		fi
-		role=$(printf '%s' "$status" | json_field role)
-		self=$(printf '%s' "$status" | json_field self)
-		master_view=$(printf '%s' "$status" | json_field master)
-		echo "status: host=$h self=${self:-?} role=${role:-?} master_view=${master_view:-?}" >&2
-		if [ "$role" = "master" ]; then
-			masters="${masters}${masters:+ }$h"
-		fi
-	done
-	if [ -n "$unreachable" ]; then
-		echo "status: unreachable/no-status: $unreachable" >&2
-	fi
-	case "$masters" in
-	"")
-		echo "graceful-restart: master not found" >&2
-		return 1
-		;;
-	*" "*)
-		echo "graceful-restart: multiple masters found: $masters" >&2
-		return 1
-		;;
-	*)
-		echo "$masters"
-		return 0
-		;;
-	esac
-}
-
-graceful_ctl() {
-	host=$1 action=$2
-	if [ "$DRY_RUN" -eq 1 ]; then
-		echo "dry-run: would run graceful-restart $action on $host"
-		return 0
-	fi
-	for i in 1 2 3 4 5 6 7 8 9 10; do
-		out=$(ssh -q "root@$host" "ha-dhcpc ctl graceful-restart $action" 2>/dev/null || true)
-		case "$out" in
-		*'"ok":true'*|*'"ok": true'*)
-			echo "graceful-restart: $action on $host"
-			return 0
-			;;
-		*not\ master*)
-			echo "graceful-restart: $host is not master; refusing to retry $action" >&2
-			return 1
-			;;
-		*"unknown command"*|*'"ok":false'*|*"error"*)
-			echo "graceful-restart: $action rejected on $host ($out) - daemon may lack support" >&2
-			return 1
-			;;
-		"")
-			;;
-		esac
-		sleep 1
-	done
-	echo "graceful-restart: failed to $action on $host (no response/timeout); daemon may lack graceful-restart support" >&2
-	return 1
-}
-
-graceful_disable_any() {
-	if [ "$DRY_RUN" -eq 1 ]; then
-		echo "dry-run: would try graceful-restart disable on any host"
-		return 0
-	fi
-	for h in $HOSTS; do
-		out=$(ssh -q "root@$h" "ha-dhcpc ctl graceful-restart disable" 2>/dev/null || true)
-		case "$out" in
-		*'"ok":true'*|*'"ok": true'*)
-			echo "graceful-restart: disable on $h"
-			return 0
-			;;
-		esac
-	done
-	echo "graceful-restart: disable failed on all hosts; window will expire automatically" >&2
-	return 1
-}
-
-MASTER=$(find_master || true)
+MASTER=$(cluster_find_master $HOSTS || true)
 GRACEFUL=0
 if [ -n "$MASTER" ]; then
 	echo "master: $MASTER"
@@ -154,7 +60,7 @@ if [ -n "$MASTER" ]; then
 		done
 		exit 0
 	fi
-	if graceful_ctl "$MASTER" enable; then
+	if cluster_graceful_ctl "$MASTER" enable "$DRY_RUN"; then
 		GRACEFUL=1
 		# allow broadcasts/heartbeats to reach and persist on all peers before restarts
 		sleep 3
@@ -190,12 +96,12 @@ if [ "$GRACEFUL" -eq 1 ]; then
 		if [ "$tries" -ge "$max_tries" ]; then
 			echo
 			echo "graceful-restart: timed out waiting for a single master after deploy; attempting disable on any host (window will expire automatically if that fails)" >&2
-			graceful_disable_any || true
+			cluster_graceful_disable_any "$DRY_RUN" $HOSTS || true
 			exit 1
 		fi
 		sleep 3
 		tries=$((tries + 1))
-		MASTER2=$(find_master 2>&1 | tail -n 1 || true)
+		MASTER2=$(cluster_find_master $HOSTS 2>&1 | tail -n 1 || true)
 		case "$MASTER2" in
 		""|*" "*|*"graceful-restart:"*|*"status:"*)
 			MASTER2=""
@@ -204,5 +110,6 @@ if [ "$GRACEFUL" -eq 1 ]; then
 		esac
 	done
 	echo
-	graceful_ctl "$MASTER2" disable || graceful_disable_any || true
+	cluster_graceful_ctl "$MASTER2" disable "$DRY_RUN" || cluster_graceful_disable_any "$DRY_RUN" $HOSTS || true
 fi
+

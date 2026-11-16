@@ -106,11 +106,15 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.ospf.auth.key_id != ctx->conf.ospf.auth.key_id;
     int conntrack_changed = memcmp(&next.conntrack_sync, &ctx->conf.conntrack_sync,
                                    sizeof(next.conntrack_sync)) != 0;
+    int neigh_sync_changed = next.cluster.neighbor_sync != ctx->conf.cluster.neighbor_sync ||
+        next.cluster.neighbor_sync_resync_s != ctx->conf.cluster.neighbor_sync_resync_s ||
+        next.cluster.neighbor_sync_max != ctx->conf.cluster.neighbor_sync_max;
 
     int heartbeat = next.cluster.heartbeat_ms != ctx->conf.cluster.heartbeat_ms ||
                     next.cluster.election_deadline_ms != ctx->conf.cluster.election_deadline_ms ||
                     next.cluster.self_demote_gap_ms != ctx->conf.cluster.self_demote_gap_ms ||
                     next.cluster.preempt != ctx->conf.cluster.preempt;
+    heartbeat = heartbeat || neigh_sync_changed;
 
     int apply = interface_changed || cluster_addrs ||
         next.apply.routes != ctx->conf.apply.routes ||

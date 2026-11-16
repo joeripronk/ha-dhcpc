@@ -557,6 +557,19 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     if (get_int(c ? c : root, "cluster_timeout_ms", &v, 0, false, "cluster")) goto derr;
     out->cluster.cluster_timeout_ms = (uint32_t)v;
     if (get_bool(c ? c : root, "preempt", &out->cluster.preempt, true)) goto derr;
+    if (get_bool(c ? c : root, "neighbor_sync", &out->cluster.neighbor_sync, true)) goto derr;
+    if (get_int(c ? c : root, "neighbor_sync_resync_s", &v, 0, false, "cluster")) goto derr;
+    if (v < 0 || v > 86400) {
+        snprintf(err, errlen, "config: cluster.neighbor_sync_resync_s out of range 0..86400");
+        goto derr;
+    }
+    out->cluster.neighbor_sync_resync_s = (uint32_t)v;
+    if (get_int(c ? c : root, "neighbor_sync_max", &v, HADC_VIP_NEIGH_DEFAULT, false, "cluster")) goto derr;
+    if (v < 0 || v > 65536) {
+        snprintf(err, errlen, "config: cluster.neighbor_sync_max out of range 0..65536");
+        goto derr;
+    }
+    out->cluster.neighbor_sync_max = (uint32_t)v;
 
     /* cluster.addresses: interface name -> list of address/prefix entries.
      * Every member loads the same list; only the master puts them on the

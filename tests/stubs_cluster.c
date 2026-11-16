@@ -94,3 +94,7 @@ int hadc_persist_save(hadc_ctx_t *ctx)
     (void)ctx;
     return 0;
 }
+
+void hadc_maint_lock(void) {}
+void hadc_maint_unlock(void) {}
+bool hadc_maint_running(void) { return false; }

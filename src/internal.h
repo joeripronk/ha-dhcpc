@@ -64,6 +64,13 @@ struct hadc_ctx {
      * main-loop work (executor/OSPF/persist); the self-monitor watchdog measures
      * a real process stall, not loop contention. Guards the fields the thread
      * reads (role, lease.version, graceful_restart_until_ms). */
+    /* VIP/cluster-interface neighbor sync (master-collected, synced to slaves).
+     * vip_neigh holds the effective set: master's last snapshot or slaves' last
+     * received set. Applied to VIP interfaces on promotion only. */
+    hadc_vip_neigh_t *vip_neighs;
+    size_t n_vip_neighs;
+    size_t vip_neighs_cap;
+    uint64_t vip_neigh_last_resync_ms;
     pthread_mutex_t hb_lock;
     pthread_t hb_thread;
     bool hb_thread_started;

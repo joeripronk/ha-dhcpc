@@ -107,4 +107,8 @@ int hadc_executor_announce_cluster(hadc_ctx_t *ctx);
  * for forwarding count). 0 = learned, -1 = nothing resolved. */
 int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN]);
 
+/* VIP neighbor sync: collect REACHABLE neighbors on cluster interfaces (master)
+ * and apply synced neighbors on promotion as non-permanent entries. */
+int hadc_executor_collect_vip_neighs(struct hadc_ctx *ctx, bool force_push);
+
 #endif /* HA_DHCPC_EXECUTOR_H */

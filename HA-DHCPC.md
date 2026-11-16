@@ -21,6 +21,7 @@ a promoted node is byte-for-byte the same DHCP client identity.
 
 ## 1. Goals
 
+- Master can sync REACHABLE neighbor (ARP) entries from cluster/VIP interfaces to slaves over cluster UDP state (on-change; optional periodic resync) and install them as non-permanent neighbors on promotion to reduce ARP storms (`cluster.neighbor_sync`, default enabled).
 - Exactly one node (the master) speaks DHCP (RFC 2131/2136) on the network; the
   DHCP server sees a single client identity: the designated master's MAC, present
   on every member (copied from the shared `ha-dhcpc.conf`).

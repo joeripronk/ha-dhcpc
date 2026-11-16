@@ -589,6 +589,77 @@ static hadc_lease_state_t name_to_state(const char *n)
     return HADC_LEASE_NONE;
 }
 
+
+static json_t *vip_neighs_json(hadc_ctx_t *ctx)
+{
+    json_t *arr = json_array();
+    if (!arr)
+        return NULL;
+    hadc_maint_lock();
+    for (size_t i = 0; i < ctx->n_vip_neighs; i++) {
+        const hadc_vip_neigh_t *n = &ctx->vip_neighs[i];
+        char ip[INET_ADDRSTRLEN], mac[32];
+        inet_ntop(AF_INET, &n->ip, ip, sizeof(ip));
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 n->mac[0], n->mac[1], n->mac[2], n->mac[3], n->mac[4], n->mac[5]);
+        json_array_append_new(arr, json_pack("{s:s, s:s, s:s}", "if", n->ifname, "ip", ip, "mac", mac));
+    }
+    hadc_maint_unlock();
+    return arr;
+}
+
+static int ensure_vip_neigh_cap(hadc_ctx_t *ctx, size_t need)
+{
+    size_t cap = ctx->conf.cluster.neighbor_sync_max;
+    if (need > cap) need = cap;
+    if (ctx->vip_neighs_cap >= need)
+        return 0;
+    if (cap == 0)
+        return 0;
+    size_t ncap = ctx->vip_neighs_cap ? ctx->vip_neighs_cap : 16;
+    while (ncap < need && ncap < cap)
+        ncap *= 2;
+    if (ncap > cap) ncap = cap;
+    hadc_vip_neigh_t *p = realloc(ctx->vip_neighs, ncap * sizeof(*p));
+    if (!p)
+        return -1;
+    ctx->vip_neighs = p;
+    ctx->vip_neighs_cap = ncap;
+    return 0;
+}
+
+static void parse_vip_neighs(json_t *vn, hadc_ctx_t *ctx)
+{
+    ctx->n_vip_neighs = 0;
+    if (!vn || !json_is_array(vn) || ctx->conf.cluster.neighbor_sync_max == 0)
+        return;
+    size_t limit = ctx->conf.cluster.neighbor_sync_max;
+    size_t arrsz = json_array_size(vn);
+    if (arrsz > limit) arrsz = limit;
+    if (ensure_vip_neigh_cap(ctx, arrsz) != 0)
+        return;
+    size_t idx; json_t *e;
+    json_array_foreach(vn, idx, e) {
+        if (ctx->n_vip_neighs >= limit || ctx->n_vip_neighs >= ctx->vip_neighs_cap)
+            break;
+        const char *ifn = json_string_value(json_object_get(e, "if"));
+        const char *ip = json_string_value(json_object_get(e, "ip"));
+        const char *macs = json_string_value(json_object_get(e, "mac"));
+        if (!ifn || !ip || !macs)
+            continue;
+        hadc_vip_neigh_t *n = &ctx->vip_neighs[ctx->n_vip_neighs];
+        memset(n, 0, sizeof(*n));
+        snprintf(n->ifname, sizeof(n->ifname), "%s", ifn);
+        if (inet_pton(AF_INET, ip, &n->ip) != 1)
+            continue;
+        unsigned b[6];
+        if (sscanf(macs, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+            continue;
+        for (int i = 0; i < 6; i++) n->mac[i] = (uint8_t)b[i];
+        ctx->n_vip_neighs++;
+    }
+}
+
 static void parse_lease(json_t *lj, hadc_lease_t *out)
 {
     json_t *v;
@@ -665,6 +736,7 @@ static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
     json_object_set_new(m, "ts_ms", json_integer((json_int_t)realtime_ms()));
     json_object_set_new(m, "graceful_restart_until_ms",
                         json_integer((json_int_t)ctx->graceful_restart_until_ms));
+    json_object_set_new(m, "vip_neighbors", vip_neighs_json(ctx));
     return m;
 }
 
@@ -863,7 +935,7 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
 }
 
 /* Slave pre-apply: adopt the master's lease state, apply via executor, ack. */
-static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_full)
+static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, json_t *vip_neighs, int is_full)
 {
     hadc_desired_t desired;
     const hadc_member_t *master = member_by_id(ctx, msg->origin);
@@ -872,6 +944,12 @@ static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, int is_f
     ctx->lease = msg->lease;
     ctx->lease.version = msg->lease_version;
     HB_UNLOCK(ctx);
+    hadc_maint_lock();
+    if (vip_neighs)
+        parse_vip_neighs(vip_neighs, ctx);
+    else
+        ctx->n_vip_neighs = 0;
+    hadc_maint_unlock();
     if (msg->ts_ms != 0) {
         uint64_t now_ms = realtime_ms();
         long long elapsed_s = now_ms > msg->ts_ms ? (long long)((now_ms - msg->ts_ms) / 1000) : 0;
@@ -1032,7 +1110,8 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
         }
     } else if (!strcmp(msg.type, HADC_MSG_STATE_PUSH) || !strcmp(msg.type, HADC_MSG_FULL_STATE)) {
         if (ctx->role == HADC_ROLE_SLAVE && !strcmp(msg.origin, ctx->conf.designated_master))
-            slave_adopt_and_ack(ctx, &msg, !strcmp(msg.type, HADC_MSG_FULL_STATE));
+            slave_adopt_and_ack(ctx, &msg, m ? json_object_get(m, "vip_neighbors") : NULL,
+                                 !strcmp(msg.type, HADC_MSG_FULL_STATE));
         else
             hadc_info("sync: %s from %s version=%llu (ignored: role/master mismatch)", msg.type,
                       msg.origin, (unsigned long long)msg.lease_version);
@@ -1737,7 +1816,7 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
 
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
-    if (ctx->udp_fd < 0 || ctx->role != HADC_ROLE_MASTER)
+    if (ctx->udp_fd < 0 || (ctx->role != HADC_ROLE_MASTER && ctx->role != HADC_ROLE_PROMOTING))
         return 0;
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
@@ -1749,6 +1828,8 @@ int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
         json_t *lj = msg ? lease_json(lease) : NULL;
         if (lj)
             json_object_set_new(msg, "lease", lj);
+        if (msg)
+            json_object_set_new(msg, "vip_neighbors", vip_neighs_json(ctx));
         if (msg && send_to_member(ctx, m, msg) == 0)
             hadc_info("sync: state_push v%llu sent to %s",
                       (unsigned long long)lease->version, m->id);

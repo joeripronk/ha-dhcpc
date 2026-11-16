@@ -49,6 +49,8 @@ static struct nl_sock *g_mon_sk;
 static int g_mon_fd = -1;
 static uint64_t g_mon_last_reconcile_ms;
 static bool g_mon_pending; /* monitor events set this; a heartbeat tick acts on it */
+static bool g_vip_neigh_pending; /* coalesce neighbor-driven VIP snapshot refresh */
+static uint64_t g_last_vip_neigh_collect_ms;
 static uint64_t g_last_audit_ms;
 static uint64_t g_drift_reconciled;
 static int g_last_verify = -1; /* -1 = unverified, 0 = matches, 1 = drift */
@@ -328,6 +330,9 @@ static bool desired_has_cluster_addr(const hadc_desired_t *d, const char *ifname
  * Reconcile the exact configured set (never other addresses on the interface),
  * so a node that was master before a crash/reboot also removes a leftover VIP
  * when it comes back as a slave. */
+static void hadc_executor_apply_vip_neighs(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+    struct nl_cache *lcache);
+
 static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
     struct nl_cache *acache, const hadc_desired_t *d, const hadc_desired_t *prev,
     const char *reason)
@@ -392,6 +397,9 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
         }
         rtnl_link_put(link);
     }
+
+    if (present)
+        hadc_executor_apply_vip_neighs(ctx, d, lcache);
 
     /* An address dropped from the shared config must not linger. */
     if (prev && !graceful) {
@@ -817,6 +825,169 @@ out:
 	return rc;
 }
 
+
+static bool vip_neigh_collectable_ifindex(struct nl_cache *lcache, const char *ifname, int *out_ifindex)
+{
+    struct rtnl_link *link = rtnl_link_get_by_name(lcache, ifname);
+    if (!link)
+        return false;
+    *out_ifindex = rtnl_link_get_ifindex(link);
+    rtnl_link_put(link);
+    return true;
+}
+
+/* Collect resolved IPv4 neighbors on cluster/VIP interfaces (master-side). */
+int hadc_executor_collect_vip_neighs(hadc_ctx_t *ctx, bool force_push)
+{
+    struct nl_cache *lcache = NULL, *ncache = NULL;
+    hadc_vip_neigh_t *out = NULL;
+    size_t n = 0, cap = 0;
+    bool do_push = false, did_change = false, collected = false;
+    size_t log_n = 0;
+    int rc = -1;
+
+    hadc_maint_lock();
+    if (!g_sk || !ctx->conf.cluster.neighbor_sync || ctx->conf.n_members == 0 ||
+        ctx->conf.cluster.neighbor_sync_max == 0)
+        goto out_unlock;
+    if (ctx->role != HADC_ROLE_MASTER && ctx->role != HADC_ROLE_PROMOTING)
+        goto out_unlock;
+    if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache ||
+        rtnl_neigh_alloc_cache(g_sk, &ncache) < 0 || !ncache)
+        goto out_unlock;
+
+    cap = ctx->conf.cluster.neighbor_sync_max;
+    out = calloc(cap, sizeof(*out));
+    if (!out)
+        goto out_unlock;
+
+    /* iterate configured cluster interfaces and pick resolved neighbors.
+     * Include usable states (REACHABLE/STALE/DELAY/PROBE/PERMANENT) so kernel
+     * reachability-timer transitions do not churn the snapshot; updates reflect
+     * add/delete or IP/MAC changes only. */
+    for (size_t ci = 0; ci < ctx->conf.cluster.n_ifaces && n < cap; ci++) {
+        int ifindex;
+        const char *ifname = ctx->conf.cluster.ifaces[ci].interface;
+        if (!vip_neigh_collectable_ifindex(lcache, ifname, &ifindex))
+            continue;
+        for (struct nl_object *obj = nl_cache_get_first(ncache); obj && n < cap;
+             obj = nl_cache_get_next(obj)) {
+            struct rtnl_neigh *ne = (struct rtnl_neigh *)obj;
+            int state = rtnl_neigh_get_state(ne);
+            if (rtnl_neigh_get_ifindex(ne) != ifindex)
+                continue;
+            if (rtnl_neigh_get_family(ne) != AF_INET)
+                continue;
+            if (!(state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT)))
+                continue;
+            struct nl_addr *dst = rtnl_neigh_get_dst(ne);
+            struct nl_addr *ll = rtnl_neigh_get_lladdr(ne);
+            if (!dst || nl_addr_get_len(dst) != 4 || !ll || nl_addr_get_len(ll) != HADC_MAC_LEN)
+                continue;
+            hadc_vip_neigh_t *e = &out[n];
+            memset(e, 0, sizeof(*e));
+            snprintf(e->ifname, sizeof(e->ifname), "%s", ifname);
+            memcpy(&e->ip, nl_addr_get_binary_addr(dst), 4);
+            memcpy(e->mac, nl_addr_get_binary_addr(ll), HADC_MAC_LEN);
+            n++;
+        }
+    }
+
+    /* stable order for comparison/push */
+    if (n > 1) {
+        int cmp(const void *a, const void *b) {
+            const hadc_vip_neigh_t *x = a, *y = b;
+            int c = strcmp(x->ifname, y->ifname);
+            if (c) return c;
+            if (x->ip.s_addr != y->ip.s_addr)
+                return (ntohl(x->ip.s_addr) < ntohl(y->ip.s_addr)) ? -1 : 1;
+            return memcmp(x->mac, y->mac, HADC_MAC_LEN);
+        }
+        qsort(out, n, sizeof(out[0]), cmp);
+    }
+
+    {
+        bool changed = (n != ctx->n_vip_neighs) ||
+            (n && (!ctx->vip_neighs || memcmp(out, ctx->vip_neighs, n * sizeof(out[0])) != 0));
+        if (changed) {
+            hadc_vip_neigh_t *np = NULL;
+            if (n > 0) {
+                np = malloc(n * sizeof(*np));
+                if (np) {
+                    memcpy(np, out, n * sizeof(*np));
+                } else {
+                    hadc_warn("executor: vip neighbor snapshot alloc failed; keeping previous snapshot");
+                    changed = false;
+                }
+            }
+            if (changed) {
+                free(ctx->vip_neighs);
+                ctx->vip_neighs = np;
+                ctx->n_vip_neighs = n;
+                ctx->vip_neighs_cap = n;
+                did_change = true;
+                log_n = n;
+            }
+        }
+        collected = true;
+        do_push = force_push || did_change;
+        rc = did_change ? 1 : 0;
+    }
+
+out_unlock:
+    if (lcache) nl_cache_put(lcache);
+    if (ncache) nl_cache_put(ncache);
+    hadc_maint_unlock();
+
+    if (collected && do_push)
+        hadc_cluster_push_state(ctx, &ctx->lease);
+    if (did_change)
+        hadc_info("executor: vip neighbor snapshot updated (%zu entries)", log_n);
+
+    free(out);
+    return rc;
+}
+
+/* Apply synced VIP neighbors on cluster interfaces as non-permanent entries.
+ * Called during VIP install/promotion path; requires interface/link context. */
+static void hadc_executor_apply_vip_neighs(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+    struct nl_cache *lcache)
+{
+    if (!g_sk || !ctx->conf.cluster.neighbor_sync || !desired || !desired->cluster_addrs_present)
+        return;
+    for (size_t i = 0; i < ctx->n_vip_neighs; i++) {
+        const hadc_vip_neigh_t *vn = &ctx->vip_neighs[i];
+        /* only for interfaces we are bringing up as VIP owner now */
+        bool want_if = false;
+        for (size_t j = 0; j < desired->n_cluster_ifaces; j++)
+            if (!strcmp(desired->cluster_ifaces[j].interface, vn->ifname)) { want_if = true; break; }
+        if (!want_if)
+            continue;
+        struct rtnl_link *link = rtnl_link_get_by_name(lcache, vn->ifname);
+        if (!link)
+            continue;
+        int ifindex = rtnl_link_get_ifindex(link);
+        struct rtnl_neigh *n = rtnl_neigh_alloc();
+        struct nl_addr *dst = nl_addr_build(AF_INET, (void *)&vn->ip, 4);
+        struct nl_addr *ll = nl_addr_build(AF_UNSPEC, (void *)vn->mac, HADC_MAC_LEN);
+        if (n && dst && ll) {
+            rtnl_neigh_set_family(n, AF_INET);
+            rtnl_neigh_set_ifindex(n, ifindex);
+            rtnl_neigh_set_state(n, NUD_REACHABLE);
+            rtnl_neigh_set_dst(n, dst); dst = NULL; /* takes ownership */
+            rtnl_neigh_set_lladdr(n, ll); ll = NULL;
+            int rc = rtnl_neigh_add(g_sk, n, NLM_F_CREATE | NLM_F_REPLACE);
+            if (rc < 0 && rc != -NLE_EXIST)
+                hadc_dbg("executor: vip neighbor %s dev %s add: %s", inet_ntoa(vn->ip), vn->ifname, nl_geterror(rc));
+        }
+        if (dst) nl_addr_put(dst);
+        if (ll) nl_addr_put(ll);
+        if (n) rtnl_neigh_put(n);
+        rtnl_link_put(link);
+    }
+}
+
+
 /* Does the neighbor cache hold an entry for gw carrying exactly this lladdr? */
 static bool neigh_holds(struct nl_cache *ncache, int ifindex,
     const struct in_addr *gw, const uint8_t mac[HADC_MAC_LEN])
@@ -953,6 +1124,27 @@ static void reconcile_now(hadc_ctx_t *ctx, const char *reason)
 void hadc_executor_audit_tick(hadc_ctx_t *ctx)
 {
 	hadc_maint_lock();
+	if (ctx->conf.cluster.neighbor_sync &&
+	    (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)) {
+		uint64_t now = (uint64_t)hadc_now_ms();
+		uint64_t iv = (uint64_t)ctx->conf.cluster.neighbor_sync_resync_s * 1000ULL;
+		bool never = (ctx->vip_neigh_last_resync_ms == 0);
+		bool periodic = (ctx->conf.cluster.neighbor_sync_resync_s > 0 &&
+		    (never || now - ctx->vip_neigh_last_resync_ms >= iv));
+		bool due = g_vip_neigh_pending &&
+		    (now - g_last_vip_neigh_collect_ms >= HADC_EXECUTOR_RECONCILE_MIN_INTERVAL_MS);
+		if (never || periodic || due) {
+			bool initial = never;
+			g_vip_neigh_pending = false;
+			g_last_vip_neigh_collect_ms = now;
+			ctx->vip_neigh_last_resync_ms = now ? now : 1;
+			hadc_maint_unlock();
+			hadc_executor_collect_vip_neighs(ctx, initial); /* initial snapshot: push once */
+			hadc_maint_lock();
+		}
+	} else {
+		g_vip_neigh_pending = false;
+	}
 	/* Pending monitor events are acted on the first heartbeat tick after the
 	 * debounce interval, so a burst (netifd flush+re-add) settles first. */
 	if (g_mon_pending && (uint64_t)hadc_now_ms() - g_mon_last_reconcile_ms >=
@@ -1018,11 +1210,16 @@ int hadc_executor_monitor_start(hadc_ctx_t *ctx)
 static void monitor_ready(hadc_ctx_t *ctx, int fd)
 {
 	char buf[4096];
+	bool got = false;
 
-	(void)ctx;
 	hadc_maint_lock();
-	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0)
+	while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
 		g_mon_pending = true;
+		got = true;
+	}
+	if (got && ctx && ctx->conf.cluster.neighbor_sync &&
+	    (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING))
+		g_vip_neigh_pending = true;
 	hadc_maint_unlock();
 }
 

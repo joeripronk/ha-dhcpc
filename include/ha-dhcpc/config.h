@@ -58,6 +58,11 @@ typedef struct {
         bool preempt; /* true (default): the cluster converges on the
                        * highest-priority live member; false: members are only
                        * elected when no live master is present */
+        bool neighbor_sync;            /* sync VIP-interface REACHABLE neighbors to
+                                        * slaves and apply them on promotion */
+        uint32_t neighbor_sync_resync_s; /* periodic master resync of VIP neighbors,
+                                          * 0 = event-driven only */
+        uint32_t neighbor_sync_max;    /* max synced VIP neighbors (snapshot cap) */
         /* Virtual/shared addresses owned by the master, keyed by interface.
          * Order and contents are part of the shared document. */
         hadc_cluster_if_t ifaces[HADC_CLUSTER_IF_MAX];
