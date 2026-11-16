@@ -424,6 +424,7 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
     const char *scope = "none";
     const char *origin = "";
     uint64_t now = (uint64_t)hadc_now_ms();
+    uint64_t chosen_age = UINT64_MAX; /* effective LSA age of the chosen candidate */
 
     g_rs.backup_gw.s_addr = 0;
     g_rs.backup_scope[0] = '\0';
@@ -490,10 +491,13 @@ static void select_backup_gateway(hadc_ctx_t *ctx)
             /* remote candidates come from backend/fabric; do not accept as local */
             if (c->scope == HADC_ROUTE_SCOPE_LOCAL_MASTER)
                 continue;
+            /* freshest LSA wins among candidates of the wanted scope */
+            if (chosen.s_addr != 0 && chosen_age <= c->age_s)
+                continue;
             chosen = c->gateway;
+            chosen_age = c->age_s;
             scope = scope_name(HADC_ROUTE_SCOPE_REMOTE_MASTER);
             origin = c->origin;
-            break;
         }
     }
 

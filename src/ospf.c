@@ -157,6 +157,8 @@ typedef struct {
     time_t last_hello_sent;
     time_t last_self_orig;
     uint32_t last_orig_hash;
+    int last_role;    /* role at last origination; a role change bypasses the
+                       * hash gate so promotion/demotion refloods immediately */
     time_t start_time; /* for the post-startup LSA grace window */
     hadc_ctx_t *ctx;
     pthread_mutex_t lock; /* guards g_ospf; held across RX/tick/FSM/LSDB/SPF on the
@@ -551,6 +553,12 @@ static void send_allspfrouters(const uint8_t *pkt, size_t len)
         if (g_ospf.ifaces[i].up && g_ospf.ifaces[i].ifindex)
             send_to(dst, g_ospf.ifaces[i].ifindex, pkt, len);
     }
+}
+
+/* Effective LSA age now (stored age at last refresh + time since). */
+static uint32_t lsa_effective_age(const ospf_lsa_t *e)
+{
+    return (uint32_t)ntohs(e->hdr.age) + (uint32_t)(time(NULL) - e->originated);
 }
 
 static bool lsa_same(const ospf_lsa_hdr_t *a, const ospf_lsa_hdr_t *b)
@@ -1561,7 +1569,8 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
     uint32_t h = orig_hash(want_pub, pub, want_default_route, ctx);
     time_t now = time(NULL);
     bool refresh = (g_ospf.last_self_orig != 0 && now - g_ospf.last_self_orig >= OSPF_LSA_REFRESH);
-    if (h == g_ospf.last_orig_hash && !refresh)
+    bool role_changed = ctx && (int)ctx->role != g_ospf.last_role;
+    if (h == g_ospf.last_orig_hash && !refresh && !role_changed)
         return;
 
     /* Grace window (startup restore or graceful restart active): hold the LSDB
@@ -1751,10 +1760,13 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
 
     g_ospf.last_orig_hash = h;
     g_ospf.last_self_orig = now;
+    if (ctx)
+        g_ospf.last_role = (int)ctx->role;
 
     char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(g_ospf.router_id, ridbuf, sizeof(ridbuf));
-    hadc_dbg("ospf: originated self LSAs (rid %s, %zu stub links, default=%s)",
-             ridbuf, nlinks, want_default_route ? "yes" : "no");
+    hadc_dbg("ospf: originated self LSAs (rid %s, %zu stub links, default=%s%s)",
+             ridbuf, nlinks, want_default_route ? "yes" : "no",
+             role_changed ? ", role change" : "");
 
     for (size_t i = 0; i < OSPF_MAX_NEIGHBORS; i++) {
         if (g_ospf.nbrs[i].in_use && g_ospf.nbrs[i].state >= NSTATE_2WAY)
@@ -2082,6 +2094,7 @@ static size_t ospf_default_candidates_locked(hadc_ctx_t *ctx, hadc_routing_defau
         char rid[INET_ADDRSTRLEN];
         u32_to_rid(ntohl(e->hdr.adv_router), rid, sizeof(rid));
         snprintf(c->origin, sizeof(c->origin), "%s", rid);
+        c->age_s = lsa_effective_age(e);
         if (ctx) {
             for (size_t m = 0; m < ctx->conf.n_members; m++) {
                 char ms[INET_ADDRSTRLEN] = "";
@@ -2172,7 +2185,7 @@ static size_t ospf_learned_routes_locked(hadc_ctx_t *ctx, hadc_ospf_learned_rout
                 hadc_ospf_learned_route_t *r = &out[n++];
                 memset(r, 0, sizeof(*r));
                 r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
-                r->lsa_type = e->hdr.type; r->valid = true;
+                r->lsa_type = e->hdr.type; r->valid = true; r->age_s = lsa_effective_age(e);
                 uint32_t mv = ntohl(mask.s_addr);
                 unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
                 r->prefixlen = plen;
@@ -2208,13 +2221,36 @@ static size_t ospf_learned_routes_locked(hadc_ctx_t *ctx, hadc_ospf_learned_rout
         hadc_ospf_learned_route_t *r = &out[n++];
         memset(r, 0, sizeof(*r));
         r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
-        r->lsa_type = e->hdr.type; r->valid = true;
+        r->lsa_type = e->hdr.type; r->valid = true; r->age_s = lsa_effective_age(e);
         uint32_t mv = ntohl(mask.s_addr);
         unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
         r->prefixlen = plen;
         u32_to_rid(ntohl(e->hdr.adv_router), r->origin, sizeof(r->origin));
     }
-    return n;
+
+    /* The freshest LSA wins when several advertise the same prefix. */
+    for (size_t i = 0; i < n; i++) {
+        if (!out[i].valid)
+            continue;
+        for (size_t j = i + 1; j < n; j++) {
+            if (!out[j].valid)
+                continue;
+            if (out[i].prefix.s_addr == out[j].prefix.s_addr &&
+                out[i].mask.s_addr == out[j].mask.s_addr) {
+                if (out[i].age_s <= out[j].age_s)
+                    out[j].valid = false;
+                else {
+                    out[i].valid = false;
+                    break;
+                }
+            }
+        }
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < n; i++)
+        if (out[i].valid)
+            out[kept++] = out[i];
+    return kept;
 }
 
 size_t hadc_ospf_learned_routes(hadc_ctx_t *ctx, hadc_ospf_learned_route_t *out, size_t max)
@@ -2323,11 +2359,28 @@ static json_t *ospf_status_locked(hadc_ctx_t *ctx)
                      "learned_prefixes", learned);
 }
 
+/* Last successful status snapshot so a busy OSPF thread never makes the ctl
+ * path wait: when the lock is busy we serve the snapshot marked stale. */
+static json_t *g_ospf_status_snapshot;
+static pthread_mutex_t g_ospf_snap_lock = PTHREAD_MUTEX_INITIALIZER;
+
 json_t *hadc_ospf_status(hadc_ctx_t *ctx)
 {
-    OSPF_LOCK();
-    json_t *r = ospf_status_locked(ctx);
-    OSPF_UNLOCK();
+    if (pthread_mutex_trylock(&g_ospf.lock) == 0) {
+        json_t *r = ospf_status_locked(ctx);
+        pthread_mutex_lock(&g_ospf_snap_lock);
+        if (g_ospf_status_snapshot)
+            json_decref(g_ospf_status_snapshot);
+        g_ospf_status_snapshot = r ? json_incref(r) : NULL;
+        pthread_mutex_unlock(&g_ospf_snap_lock);
+        OSPF_UNLOCK();
+        return r;
+    }
+    pthread_mutex_lock(&g_ospf_snap_lock);
+    json_t *r = g_ospf_status_snapshot ? json_deep_copy(g_ospf_status_snapshot) : NULL;
+    if (r)
+        json_object_set_new(r, "stale", json_true());
+    pthread_mutex_unlock(&g_ospf_snap_lock);
     return r;
 }
 

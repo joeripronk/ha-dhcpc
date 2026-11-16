@@ -847,11 +847,19 @@ static void r_ospf_routes(json_t *st, bool detail)
 {
     json_t *ospf = jobj(jobj(st, "routing"), "ospf");
     json_t *list = jarr(ospf, "learned_prefixes");
+    json_t *state = jobj(jobj(st, "routing"), "state");
+    json_t *origins = state ? jarr(state, "originated_prefixes") : NULL;
     size_t n = list ? json_array_size(list) : 0;
+    size_t m = origins ? json_array_size(origins) : 0;
 
     if (!ospf)
         return;
-    printf("ospf     routes %zu learned\n", n);
+    printf("ospf     routes %zu learned, %zu advertised\n", n, m);
+    for (size_t i = 0; i < m; i++) {
+        json_t *p = json_array_get(origins, i);
+        printf("         %s/%lld (advertised by self)\n", str_or_null(jsget(p, "prefix")),
+               jint(p, "prefixlen", -1));
+    }
     for (size_t i = 0; i < n; i++) {
         json_t *p = json_array_get(list, i);
         const char *prefix = jsget(p, "prefix");

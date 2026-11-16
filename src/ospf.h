@@ -36,6 +36,8 @@ typedef struct {
     unsigned prefixlen;
     struct in_addr nexthop;
     uint32_t metric;
+    uint32_t age_s;   /* effective LSA age at observation time; freshest wins
+                       * when the same prefix is advertised by several LSAs */
     uint8_t lsa_type;
     char origin[HADC_ROUTING_ORIGIN_MAX];
     bool valid;

@@ -24,6 +24,8 @@ typedef struct {
     struct in_addr gateway; /* nexthop/backup candidate; 0.0.0.0 = invalid */
     hadc_route_scope_t scope;
     char origin[HADC_ROUTING_ORIGIN_MAX]; /* router-id/node-id/source hint */
+    uint64_t age_s;   /* effective LSA age at observation time, seconds;
+                       * selection prefers the freshest (lowest) among equals */
     bool valid;
 } hadc_routing_default_candidate_t;
 
