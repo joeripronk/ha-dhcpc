@@ -40,7 +40,8 @@ if [ -z "$APK" ]; then
 fi
 
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "apk not found: ${APK:-none}" >&2; exit 1; }
-echo "deploying $(basename "$APK")${DRY_RUN:+ (dry-run)}"
+[ "$DRY_RUN" -eq 1 ] && dlabel=" (dry-run)" || dlabel=
+echo "deploying $(basename "$APK")$dlabel"
 
 MASTER=$(cluster_find_master $HOSTS || true)
 GRACEFUL=0
