@@ -74,6 +74,29 @@ static json_t *status_object(hadc_ctx_t *ctx)
                   "invalid", ctx->demote_route_via_new_master_invalid,
                   "reason", ctx->demote_route_via_new_master_reason));
     json_object_set_new(o, "members", members);
+    {
+        char la[64], ln[64], lg[64], ls[64];
+        snprintf(la, sizeof(la), "%s", inet_ntoa(ctx->lease.address));
+        snprintf(ln, sizeof(ln), "%s", inet_ntoa(ctx->lease.netmask));
+        snprintf(lg, sizeof(lg), "%s", inet_ntoa(ctx->lease.gateway));
+        snprintf(ls, sizeof(ls), "%s", inet_ntoa(ctx->lease.server_id));
+        json_t *dns = json_array();
+        for (size_t i = 0; i < ctx->lease.n_dns; i++) {
+            char b[64];
+            snprintf(b, sizeof(b), "%s", inet_ntoa(ctx->lease.dns[i]));
+            json_array_append_new(dns, json_string(b));
+        }
+        json_object_set_new(o, "dhcp",
+            json_pack("{s:s, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I}",
+                      "state", hadc_lease_state_name(ctx->lease.state),
+                      "address", la, "netmask", ln, "gateway", lg, "server_id", ls,
+                      "dns", dns, "t1_remaining_s", (json_int_t)ctx->lease.t1_remaining_s,
+                      "t2_remaining_s", (json_int_t)ctx->lease.t2_remaining_s,
+                      "t3_remaining_s", (json_int_t)ctx->lease.t3_remaining_s));
+        json_object_set_new(o, "gwping",
+            json_pack("{s:b, s:b}", "enabled", ctx->conf.apply.gateway_probe,
+                      "unreachable", hadc_gwping_unreachable()));
+    }
     json_t *cluster = json_array();
     for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
         const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];

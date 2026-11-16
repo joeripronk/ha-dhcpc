@@ -40,6 +40,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <jansson.h>
+
 #ifndef HADC_VERSION
 #define HADC_VERSION "dev"
 #endif
@@ -621,10 +623,11 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "usage: %s [--conf path] [--local-conf path] [--persist path] [--oneshot]\n"
             "       %s ctl <cmd> [--conf path] [--local-conf path]\n"
+            "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
             "ctl cmds: status promote demote reload graceful-restart "
             "conf-status conf-sync conntrack-status conntrack-resync\n",
-            argv0, argv0, argv0);
+            argv0, argv0, argv0, argv0);
 }
 
 /* Client mode: ha-dhcpc [conf paths] ctl promote|demote|status|update|renew|newip [id] (plan §3). */
@@ -663,6 +666,257 @@ static int ctl_client(const char *conf_path, const char *local_path, const char 
     return 0;
 }
 
+/* Human-readable status: ha-dhcpc status|s [cluster|c|ip|i|ospf|o
+ * [routes|r|neighbors|n]] [detailed|d]. Asks the daemon for the standard
+ * status JSON and renders the selected section(s). */
+
+static const char *jsget(json_t *o, const char *key)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    return json_is_string(v) ? json_string_value(v) : NULL;
+}
+
+static json_t *jobj(json_t *o, const char *key)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    return json_is_object(v) ? v : NULL;
+}
+
+static json_t *jarr(json_t *o, const char *key)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    return json_is_array(v) ? v : NULL;
+}
+
+static int jbool(json_t *o, const char *key, int dflt)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    if (json_is_boolean(v))
+        return (int)json_boolean_value(v);
+    return dflt;
+}
+
+static long long jint(json_t *o, const char *key, long long dflt)
+{
+    json_t *v = o ? json_object_get(o, key) : NULL;
+    return json_is_integer(v) ? (long long)json_integer_value(v) : dflt;
+}
+
+static const char *yns(int b)
+{
+    return b < 0 ? "unknown" : (b ? "yes" : "no");
+}
+
+static const char *str_or_null(const char *s)
+{
+    return s ? s : "n/a";
+}
+
+static void r_ip(json_t *st, bool detail)
+{
+    json_t *dhcp = jobj(st, "dhcp");
+    json_t *gwp = jobj(st, "gwping");
+    json_t *rs = jobj(jobj(st, "routing"), "state");
+    const char *gwp_state = "off";
+
+    if (gwp) {
+        if (jbool(gwp, "enabled", 0))
+            gwp_state = jbool(gwp, "unreachable", 0) ? "UNREACHABLE" : "reachable";
+    }
+    printf("ip       public %s  dhcp %s lease %s gw %s  gwping %s\n",
+           str_or_null(jsget(rs, "public_ip32")), str_or_null(jsget(dhcp, "state")),
+           str_or_null(jsget(dhcp, "address")), str_or_null(jsget(dhcp, "gateway")), gwp_state);
+    if (detail && dhcp) {
+        printf("         t1 %llds t2 %llds t3 %llds  server %s  retention %s  lease v%lld\n",
+               jint(dhcp, "t1_remaining_s", -1), jint(dhcp, "t2_remaining_s", -1),
+               jint(dhcp, "t3_remaining_s", -1), str_or_null(jsget(dhcp, "server_id")),
+               yns(jbool(st, "retention", -1)), jint(st, "lease_version", -1));
+        json_t *dns = jarr(dhcp, "dns");
+        if (dns && json_array_size(dns) > 0) {
+            printf("         dns");
+            for (size_t i = 0; i < json_array_size(dns); i++) {
+                json_t *e = json_array_get(dns, i);
+                printf(" %s", json_is_string(e) ? json_string_value(e) : "n/a");
+            }
+            printf("\n");
+        }
+    }
+}
+
+static void r_cluster(json_t *st, bool detail)
+{
+    json_t *members = jarr(st, "members");
+    size_t n = members ? json_array_size(members) : 0;
+    size_t alive = 0;
+
+    for (size_t i = 0; i < n; i++)
+        if (jbool(json_array_get(members, i), "alive", 0))
+            alive++;
+    printf("cluster  role %s  self %s  master %s  members %zu (%zu alive)\n",
+           str_or_null(jsget(st, "role")), str_or_null(jsget(st, "self")),
+           str_or_null(jsget(st, "master")), n, alive);
+    if (!detail)
+        return;
+    for (size_t i = 0; i < n; i++) {
+        json_t *m = json_array_get(members, i);
+        printf("         %s %s %s ack v%lld  role-view %s  master-view %s  conf %s\n",
+               str_or_null(jsget(m, "id")), str_or_null(jsget(m, "sync_address")),
+               jbool(m, "alive", 0) ? "alive" : "DEAD", jint(m, "acked_version", -1),
+               str_or_null(jsget(m, "role")), str_or_null(jsget(m, "master_view")),
+               str_or_null(jsget(m, "conf_sha256")));
+    }
+    json_t *gr = jobj(st, "graceful_restart");
+    printf("         graceful-restart %s until %lldms  timers: heartbeat %lldms election %lldms\n",
+           yns(jbool(gr, "active", -1)), jint(gr, "until_ms", -1),
+           jint(jobj(st, "timers"), "heartbeat_ms", -1), jint(jobj(st, "timers"), "election_deadline_ms", -1));
+    json_t *dm = jobj(st, "demote_route_via_new_master");
+    if (dm)
+        printf("         steered-takeover configured=%s active=%s invalid=%s reason=%s\n",
+               yns(jbool(dm, "configured", -1)), yns(jbool(dm, "active", -1)), yns(jbool(dm, "invalid", -1)),
+               str_or_null(jsget(dm, "reason")));
+    json_t *addrs = jarr(st, "cluster_addresses");
+    for (size_t i = 0; addrs && i < json_array_size(addrs); i++) {
+        json_t *ci = json_array_get(addrs, i);
+        json_t *list = jarr(ci, "addresses");
+        for (size_t j = 0; list && j < json_array_size(list); j++) {
+            json_t *e = json_array_get(list, j);
+            printf("         vip %s on %s (owned %s)\n",
+                   str_or_null(json_is_string(e) ? json_string_value(e) : NULL),
+                   str_or_null(jsget(ci, "interface")), yns(jbool(ci, "owned", -1)));
+        }
+    }
+}
+
+static void r_ospf_neighbors(json_t *st, bool detail)
+{
+    json_t *ospf = jobj(jobj(st, "routing"), "ospf");
+    json_t *list = jarr(ospf, "neighbor_list");
+    size_t n = list ? json_array_size(list) : 0;
+
+    if (!ospf)
+        return;
+    printf("ospf     neighbors %lld/%lld 2-way (lsdb %lld self + %lld other = %lld)\n",
+           jint(ospf, "neighbors_2way", -1), jint(ospf, "neighbors", -1),
+           jint(ospf, "lsdb_self", -1), jint(ospf, "lsdb_other", -1), jint(ospf, "lsdb_total", -1));
+    if (!detail) {
+        /* Minimal: one compressed line, but never hide a non-full neighbor. */
+        size_t full = 0;
+        for (size_t i = 0; i < n; i++)
+            if (jsget(json_array_get(list, i), "state") &&
+                !strcmp(jsget(json_array_get(list, i), "state"), "full"))
+                full++;
+        if (n == 0)
+            return;
+        if (full == n) {
+            printf("         %zu neighbors, all full\n", n);
+            return;
+        }
+        for (size_t i = 0; i < n; i++) {
+            json_t *nb = json_array_get(list, i);
+            const char *state = jsget(nb, "state");
+            if (state && strcmp(state, "full") == 0)
+                continue;
+            printf("         %s %s %s dead_in %llds\n", str_or_null(jsget(nb, "router_id")),
+                   str_or_null(jsget(nb, "ip")), str_or_null(state), jint(nb, "dead_in", -1));
+        }
+        return;
+    }
+    for (size_t i = 0; i < n; i++) {
+        json_t *nb = json_array_get(list, i);
+        printf("         %s %s %s dead_in %llds\n", str_or_null(jsget(nb, "router_id")),
+               str_or_null(jsget(nb, "ip")), str_or_null(jsget(nb, "state")), jint(nb, "dead_in", -1));
+    }
+}
+
+static void r_ospf_routes(json_t *st, bool detail)
+{
+    json_t *ospf = jobj(jobj(st, "routing"), "ospf");
+    json_t *list = jarr(ospf, "learned_prefixes");
+    size_t n = list ? json_array_size(list) : 0;
+
+    if (!ospf)
+        return;
+    printf("ospf     routes %zu learned\n", n);
+    for (size_t i = 0; i < n; i++) {
+        json_t *p = json_array_get(list, i);
+        const char *prefix = jsget(p, "prefix");
+        bool is_default = prefix && !strcmp(prefix, "0.0.0.0");
+        if (detail || is_default)
+            printf("         %s/%lld via %s (origin %s, %s, lsa %lld)\n", str_or_null(prefix),
+                   jint(p, "prefixlen", -1), str_or_null(jsget(p, "nexthop")),
+                   str_or_null(jsget(p, "origin")), str_or_null(jsget(p, "source")), jint(p, "lsa_type", -1));
+    }
+}
+
+static int status_client(const char *conf_path, const char *local_path,
+    const char *section, const char *sub, bool detail)
+{
+    hadc_conf_t conf;
+    char err[256];
+    const char *line = "status\n";
+    char buf[262144];
+    ssize_t total = 0;
+
+    if (hadc_config_load(conf_path, local_path, &conf, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ha-dhcpc status: %s\n", err);
+        return 1;
+    }
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", conf.ctl_socket);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "ha-dhcpc status: connect %s: %s\n", conf.ctl_socket, strerror(errno));
+        return 1;
+    }
+    if (write(fd, line, strlen(line)) != (ssize_t)strlen(line)) {
+        fprintf(stderr, "ha-dhcpc status: write: %s\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+    for (;;) {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - (size_t)total - 1);
+        if (n <= 0)
+            break;
+        total += n;
+        if (total >= (ssize_t)sizeof(buf) - 1)
+            break;
+    }
+    close(fd);
+    if (total <= 0) {
+        fprintf(stderr, "ha-dhcpc status: no reply from daemon\n");
+        return 1;
+    }
+    buf[total] = '\0';
+    json_error_t jerr;
+    json_t *st = json_loads(buf, 0, &jerr);
+    if (!st) {
+        fprintf(stderr, "ha-dhcpc status: unparsable reply: %s\n", jerr.text);
+        return 1;
+    }
+    if (!section) {
+        r_ip(st, detail);
+        r_cluster(st, detail);
+        r_ospf_neighbors(st, detail);
+        r_ospf_routes(st, detail);
+    } else if (!strcmp(section, "ip")) {
+        r_ip(st, detail);
+    } else if (!strcmp(section, "cluster")) {
+        r_cluster(st, detail);
+    } else if (!strcmp(section, "ospf")) {
+        if (!sub || !strcmp(sub, "neighbors"))
+            r_ospf_neighbors(st, detail);
+        if (!sub || !strcmp(sub, "routes"))
+            r_ospf_routes(st, detail);
+    }
+    json_decref(st);
+    return 0;
+}
+
+static bool status_tok(const char *t, const char *full, const char *abbr)
+{
+    return !strcmp(t, full) || !strcmp(t, abbr);
+}
+
 int main(int argc, char **argv)
 {
     const char *conf_path = "/etc/ha-dhcpc/ha-dhcpc.conf";
@@ -694,6 +948,33 @@ int main(int argc, char **argv)
                 strncat(cmd, argv[j], sizeof(cmd) - strlen(cmd) - 1);
             }
             return ctl_client(conf_path, local_path, cmd);
+        }
+        if (status_tok(argv[i], "status", "s")) {
+            const char *section = NULL, *sub = NULL;
+            bool detail = false;
+            for (int j = i + 1; j < argc; j++) {
+                if (status_tok(argv[j], "detailed", "d"))
+                    detail = true;
+                else if (!section && status_tok(argv[j], "summary", "s"))
+                    ; /* full summary: no specific section */
+                else if (!section && status_tok(argv[j], "cluster", "c"))
+                    section = "cluster";
+                else if (!section && status_tok(argv[j], "ip", "i"))
+                    section = "ip";
+                else if (!section && status_tok(argv[j], "ospf", "o"))
+                    section = "ospf";
+                else if (section && !sub && !strcmp(section, "ospf") &&
+                         status_tok(argv[j], "routes", "r"))
+                    sub = "routes";
+                else if (section && !sub && !strcmp(section, "ospf") &&
+                         status_tok(argv[j], "neighbors", "n"))
+                    sub = "neighbors";
+                else {
+                    fprintf(stderr, "ha-dhcpc status: bad argument '%s'\n", argv[j]);
+                    return 1;
+                }
+            }
+            return status_client(conf_path, local_path, section, sub, detail);
         }
     }
 
