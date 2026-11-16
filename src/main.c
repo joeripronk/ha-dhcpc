@@ -709,7 +709,7 @@ static const char *yns(int b)
 
 static const char *str_or_null(const char *s)
 {
-    return s ? s : "n/a";
+    return (s && s[0]) ? s : "n/a";
 }
 
 static void r_ip(json_t *st, bool detail)
@@ -747,11 +747,16 @@ static void r_cluster(json_t *st, bool detail)
 {
     json_t *members = jarr(st, "members");
     size_t n = members ? json_array_size(members) : 0;
+    const char *self = jsget(st, "self");
     size_t alive = 0;
 
-    for (size_t i = 0; i < n; i++)
-        if (jbool(json_array_get(members, i), "alive", 0))
+    for (size_t i = 0; i < n; i++) {
+        json_t *m = json_array_get(members, i);
+        if (jsget(m, "id") && self && !strcmp(jsget(m, "id"), self))
+            alive++; /* this node: alive by definition */
+        else if (jbool(m, "alive", 0))
             alive++;
+    }
     printf("cluster  role %s  self %s  master %s  members %zu (%zu alive)\n",
            str_or_null(jsget(st, "role")), str_or_null(jsget(st, "self")),
            str_or_null(jsget(st, "master")), n, alive);
@@ -759,6 +764,16 @@ static void r_cluster(json_t *st, bool detail)
         return;
     for (size_t i = 0; i < n; i++) {
         json_t *m = json_array_get(members, i);
+        bool is_self = jsget(m, "id") && self && !strcmp(jsget(m, "id"), self);
+        if (is_self) {
+            /* Peer-view columns have no entry for this node; show what this
+             * node actually knows about itself. */
+            printf("         %s %s alive ack v%lld  role-view %s  master-view %s  conf %s (self)\n",
+                   str_or_null(jsget(m, "id")), str_or_null(jsget(m, "sync_address")),
+                   jint(st, "lease_version", -1), str_or_null(jsget(st, "role")),
+                   str_or_null(jsget(st, "master")), str_or_null(jsget(st, "conf_sha256")));
+            continue;
+        }
         printf("         %s %s %s ack v%lld  role-view %s  master-view %s  conf %s\n",
                str_or_null(jsget(m, "id")), str_or_null(jsget(m, "sync_address")),
                jbool(m, "alive", 0) ? "alive" : "DEAD", jint(m, "acked_version", -1),
