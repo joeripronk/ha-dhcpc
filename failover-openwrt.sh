@@ -1,12 +1,12 @@
 #!/bin/sh
-# Fail over master role between meterkast and woonkamer on the OpenWrt ha-dhcpc
-# cluster and validate that established TCP connections on a given port keep
-# working (conntrack flows remain present across the promotion).
+# Fail over master role between OpenWrt ha-dhcpc cluster nodes and validate
+# that established TCP connections on a given port keep working (conntrack
+# flows remain present across the promotion).
 #
-# Usage: ./failover-openwrt.sh <port> [--from meterkast|woonkamer] [--to meterkast|woonkamer] [--timeout N]
+# Usage: ./failover-openwrt.sh <port> [--from <host>] [--to <host>] [--timeout N]
 #   port      TCP port number to monitor/validate (e.g. 3724)
-#   --from    require this node to be master before failover
-#   --to      target node to promote (defaults to the other of the pair)
+#   --from    require this node to be master before failover (optional)
+#   --to      target node to promote (defaults to preferred slave)
 #   --timeout seconds to wait for role convergence and validation (default 30)
 #
 # Uses ssh root@<host> and `ha-dhcpc ctl promote/status` (no daemon restarts).
@@ -17,16 +17,17 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/openwrt-cluster-lib.sh"
 
-PAIR_A="meterkast"
-PAIR_B="woonkamer"
-ALL_HOSTS="meterkast woonkamer studeerkamer"
+: "${CLUSTER_HOSTS:=studeerkamer woonkamer meterkast}"
+ALL_HOSTS="$CLUSTER_HOSTS"
+# Capture every cluster node so old/new master (and any other participant) are covered.
+CAP_IFACES="br-lan.5 br-lan.300"
 PORT=""
 FROM=""
 TO=""
 TIMEOUT=30
 
 usage() {
-	echo "usage: $0 <port> [--from meterkast|woonkamer] [--to meterkast|woonkamer] [--timeout N]" >&2
+	echo "usage: $0 <port> [--from <host>] [--to <host>] [--timeout N]" >&2
 	exit 2
 }
 
@@ -45,8 +46,17 @@ done
 
 [ -n "$PORT" ] || usage
 case "$PORT" in *[!0-9]*|"") echo "port must be a number: $PORT" >&2; exit 2 ;; esac
-case "$FROM" in ""|"$PAIR_A"|"$PAIR_B") ;; *) echo "--from must be $PAIR_A or $PAIR_B" >&2; exit 2 ;; esac
-case "$TO" in ""|"$PAIR_A"|"$PAIR_B") ;; *) echo "--to must be $PAIR_A or $PAIR_B" >&2; exit 2 ;; esac
+
+host_in_list() {
+	h=$1
+	for x in $ALL_HOSTS; do
+		[ "$x" = "$h" ] && return 0
+	done
+	return 1
+}
+
+case "$FROM" in "") ;; *) host_in_list "$FROM" || { echo "--from must be one of: $ALL_HOSTS" >&2; exit 2; } ;; esac
+case "$TO" in "") ;; *) host_in_list "$TO" || { echo "--to must be one of: $ALL_HOSTS" >&2; exit 2; } ;; esac
 if [ -n "$FROM" ] && [ -n "$TO" ] && [ "$FROM" = "$TO" ]; then echo "--from and --to must differ" >&2; exit 2; fi
 
 json_str() { cluster_json_field "$1"; }
@@ -55,31 +65,47 @@ host_status() { cluster_host_status "$1"; }
 role_of() { host_status "$1" | json_str role; }
 master_of_view() { host_status "$1" | json_str master; }
 
-require_host() {
-	r=$(role_of "$1")
-	[ -n "$r" ] || { echo "error: cannot read ha-dhcpc status from $1" >&2; exit 1; }
-}
-
-for h in $PAIR_A $PAIR_B; do require_host "$h"; done
-
-ROLE_A=$(role_of "$PAIR_A"); ROLE_B=$(role_of "$PAIR_B")
-MASTER_A=$(master_of_view "$PAIR_A"); MASTER_B=$(master_of_view "$PAIR_B")
-
-CURRENT_MASTER=""
-if [ "$ROLE_A" = "master" ]; then CURRENT_MASTER="$PAIR_A"; fi
-if [ "$ROLE_B" = "master" ]; then
-	if [ -n "$CURRENT_MASTER" ] && [ "$CURRENT_MASTER" != "$PAIR_B" ]; then
-		echo "error: both $PAIR_A and $PAIR_B report master role" >&2; exit 1
-	fi
-	CURRENT_MASTER="$PAIR_B"
+# Auto-discover current master
+echo "discovering master from hosts: $ALL_HOSTS"
+CURRENT_MASTER=$(cluster_find_master $ALL_HOSTS 2>/dev/null || true)
+if [ -z "$CURRENT_MASTER" ]; then
+	echo "error: could not auto-discover a single master (check cluster status/reachability)" >&2
+	exit 1
 fi
-[ -n "$CURRENT_MASTER" ] || { echo "error: neither $PAIR_A nor $PAIR_B is master (roles: $PAIR_A=$ROLE_A/$MASTER_A, $PAIR_B=$ROLE_B/$MASTER_B)" >&2; exit 1; }
-if [ -n "$FROM" ] && [ "$FROM" != "$CURRENT_MASTER" ]; then echo "error: --from $FROM is not current master ($CURRENT_MASTER)" >&2; exit 1; fi
-if [ -n "$TO" ]; then TARGET="$TO"; else if [ "$CURRENT_MASTER" = "$PAIR_A" ]; then TARGET="$PAIR_B"; else TARGET="$PAIR_A"; fi; fi
+
+if [ -n "$FROM" ] && [ "$FROM" != "$CURRENT_MASTER" ]; then
+	echo "error: --from $FROM is not current master ($CURRENT_MASTER)" >&2
+	exit 1
+fi
+
+if [ -n "$TO" ]; then
+	TARGET="$TO"
+else
+	# Prefer the other of the original pair when applicable
+	if [ "$CURRENT_MASTER" = "meterkast" ]; then
+		TARGET="woonkamer"
+	elif [ "$CURRENT_MASTER" = "woonkamer" ]; then
+		TARGET="meterkast"
+	else
+		# pick first non-master host
+		for h in $ALL_HOSTS; do
+			if [ "$h" != "$CURRENT_MASTER" ]; then
+				TARGET="$h"
+				break
+			fi
+		done
+	fi
+fi
+
+[ -n "$TARGET" ] || { echo "error: could not determine failover target" >&2; exit 1; }
 [ "$TARGET" != "$CURRENT_MASTER" ] || { echo "error: target equals current master ($TARGET)" >&2; exit 1; }
+host_in_list "$TARGET" || { echo "error: target $TARGET not in cluster hosts ($ALL_HOSTS)" >&2; exit 1; }
 
 echo "cluster: current master=$CURRENT_MASTER target=$TARGET port=$PORT timeout=${TIMEOUT}s"
-echo "views: $PAIR_A role=$ROLE_A master=$MASTER_A; $PAIR_B role=$ROLE_B master=$MASTER_B"
+for h in $ALL_HOSTS; do
+	echo "  $h: role=$(role_of "$h" 2>/dev/null || echo '?') master=$(master_of_view "$h" 2>/dev/null || echo '?')"
+done
+CAP_HOSTS="$ALL_HOSTS"
 
 # Match original/reply sport/dport so NATed forwarded flows are included.
 ct_flows() {
@@ -99,9 +125,178 @@ ct_tuples() {
 }
 
 tmpdir=${TMPDIR:-/tmp}/failover-openwrt.$$.$PORT
-mkdir -p "$tmpdir"
+ts=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo now)
+CAP_DIR="$PWD/failover-captures/${ts}-port${PORT}-${CURRENT_MASTER}-to-${TARGET}"
+mkdir -p "$tmpdir" "$CAP_DIR/analysis"
 cleanup() { rm -rf "$tmpdir"; }
 trap cleanup EXIT INT TERM
+
+FETCH_OK=1
+
+fetch_remote_file() {
+	_rh=$1 _rf=$2 _lf=$3 _label=$4
+	_err="$tmpdir/scp.err.$$"
+	if scp -o BatchMode=yes -o ConnectTimeout=5 "root@${_rh}:${_rf}" "$_lf" </dev/null >"$_err" 2>&1; then
+		echo "  saved: $_lf"
+		return 0
+	fi
+	echo "  warning: could not fetch ${_label}: $(tr '\n' ' ' <"$_err" 2>/dev/null)" >&2
+	FETCH_OK=0
+	return 1
+}
+
+capture_start() {
+	echo "== tcpdump captures =="
+	echo "capture dir: $CAP_DIR (full capture, snaplen ${CAP_SNAPLEN:-100}B, ${CAP_SIZE_MB:-100}MB/file limit)"
+	for h in $CAP_HOSTS; do
+		for iface in $CAP_IFACES; do
+			rfile="/tmp/ha-failover-${ts}-${PORT}-${h}-${iface}.pcap"
+			pfile="/tmp/ha-failover-${ts}-${PORT}-${h}-${iface}.pid"
+			logfile="/tmp/ha-failover-${ts}-${PORT}-${h}-${iface}.log"
+			printf '%s\n' "$h $iface $rfile $pfile $logfile" >>"$tmpdir/captures.list"
+			if ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" \
+				"rm -f '$rfile' '$pfile' '$logfile'; tcpdump -i '$iface' -nn -s ${CAP_SNAPLEN:-100} -C ${CAP_SIZE_MB:-100} -W 1 -U -w '$rfile' >'$logfile' 2>&1 & echo \$! >'$pfile'" \
+				>"$tmpdir/start.err" 2>&1; then
+				echo "  started: $h $iface -> $CAP_DIR/$(basename "$rfile")"
+			else
+				echo "  warning: failed to start tcpdump on $h $iface: $(tr '\n' ' ' <"$tmpdir/start.err" 2>/dev/null)" >&2
+				FETCH_OK=0
+			fi
+		done
+	done
+	sleep 1
+}
+capture_stop() {
+	[ -f "$tmpdir/captures.list" ] || true
+	echo "== stopping tcpdump captures (and killing any remaining tcpdump/conntrack on capture hosts) =="
+	if [ -f "$tmpdir/captures.list" ]; then
+		while IFS=' ' read -r h iface rfile pfile logfile; do
+			[ -n "$h" ] || continue
+			ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$h" \
+				"if [ -f '$pfile' ]; then kill \"\$(cat '$pfile')\" 2>/dev/null || true; sleep 1; kill -9 \"\$(cat '$pfile')\" 2>/dev/null || true; fi" \
+				</dev/null >/dev/null 2>&1 || true
+			ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "ls ${rfile}* 2>/dev/null" </dev/null >"$tmpdir/rfiles" 2>/dev/null || true
+			if [ ! -s "$tmpdir/rfiles" ]; then
+				echo "  warning: no pcap files found on $h $iface (${rfile}*)" >&2
+				FETCH_OK=0
+			else
+				while IFS= read -r rf; do
+					[ -n "$rf" ] || continue
+					base=$(basename "$rf")
+					fetch_remote_file "$h" "$rf" "$CAP_DIR/$base" "$h:$rf" || true
+				done <"$tmpdir/rfiles"
+			fi
+			if ! fetch_remote_file "$h" "$logfile" "$CAP_DIR/${h}-${iface}.tcpdump.log" "$h:$logfile"; then
+				: # already warned
+			fi
+		done <"$tmpdir/captures.list"
+	fi
+	# Always try to kill any leftover tcpdump/conntrack processes on capture hosts (and analysis hosts too, for safety)
+	for h in $CAP_HOSTS $ALL_HOSTS; do
+		ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "killall tcpdump 2>/dev/null || true; killall conntrack 2>/dev/null || true" >/dev/null 2>&1 || true
+	done
+}
+ct_dump_remote() {
+	host=$1 label=$2
+	rbase="/tmp/ha-failover-${ts}-${PORT}-${host}-${label}"
+	ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$host" "
+		conntrack -L -p tcp -o extended 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' >'${rbase}.extended' || true
+		conntrack -L -p tcp -o save 2>/dev/null | grep -E '(^|[[:space:]])(sport[[:space:]]+${PORT}|dport[[:space:]]+${PORT})([[:space:]]|$)' >'${rbase}.save' || true
+		conntrack -L -p tcp 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' >'${rbase}.plain' || true
+		cat /proc/net/nf_conntrack 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' >'${rbase}.nf_conntrack' || true
+		ip route show default >'${rbase}.ip_default' 2>&1 || true
+		ip -4 route >'${rbase}.ip_r4' 2>&1 || true
+		ha-dhcpc ctl status 2>'${rbase}.status.err' >'${rbase}.status.json' || true
+	" >"$tmpdir/ctdump.err" 2>&1 || { echo "  warning: ct dump ($label) failed on $host: $(tr '\n' ' ' <"$tmpdir/ctdump.err" 2>/dev/null)" >&2; FETCH_OK=0; }
+	printf '%s\n' "$host $label $rbase" >>"$tmpdir/analysis.files"
+}
+
+analysis_start() {
+	echo "== analysis capture =="
+	echo "analysis dir: $CAP_DIR/analysis (conntrack dumps/events, ha-dhcpc status/logs)"
+	for h in $ALL_HOSTS; do
+		ct_dump_remote "$h" pre
+	done
+	for h in $CURRENT_MASTER $TARGET; do
+		emon="/tmp/ha-failover-${ts}-${PORT}-${h}-events.log"
+		epid="/tmp/ha-failover-${ts}-${PORT}-${h}-events.pid"
+		smon="/tmp/ha-failover-${ts}-${PORT}-${h}-samples.log"
+		spid="/tmp/ha-failover-${ts}-${PORT}-${h}-samples.pid"
+		printf '%s\n' "$h bg $emon $epid" >>"$tmpdir/analysis.files"
+		printf '%s\n' "$h bg $smon $spid" >>"$tmpdir/analysis.files"
+		if ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "
+			rm -f '$emon' '$epid' '$smon' '$spid'
+			(conntrack -E -o extended -p tcp 2>/dev/null | grep --line-buffered -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' >'$emon') & echo \$! >'$epid'
+			(i=0; while [ \$i -lt 30 ]; do echo \"--- sample \$i \$(date +%s 2>/dev/null || echo now) ---\"; conntrack -L -p tcp -o save 2>/dev/null | grep -E '(^|[[:space:]])(sport[[:space:]]+${PORT}|dport[[:space:]]+${PORT})([[:space:]]|$)' || conntrack -L -p tcp -o extended 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' || true; i=\$((i+1)); sleep 1; done >'$smon') & echo \$! >'$spid'
+		" >"$tmpdir/amon.err" 2>&1; then
+			echo "  started: $h conntrack events+samples"
+		else
+			echo "  warning: failed to start analysis monitors on $h: $(tr '\n' ' ' <"$tmpdir/amon.err" 2>/dev/null)" >&2
+			FETCH_OK=0
+		fi
+	done
+}
+
+analysis_stop_fetch() {
+	echo "== collecting analysis =="
+	for h in $ALL_HOSTS; do
+		ct_dump_remote "$h" post
+		ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "
+			logread 2>/dev/null | grep ha-dhcpc | tail -n 300 >/tmp/ha-failover-${ts}-${PORT}-${h}-logread.log || true
+			dmesg 2>/dev/null | tail -n 120 >/tmp/ha-failover-${ts}-${PORT}-${h}-dmesg-tail.log || true
+		" >"$tmpdir/logdump.err" 2>&1 || { echo "  warning: log collection failed on $h: $(tr '\n' ' ' <"$tmpdir/logdump.err" 2>/dev/null)" >&2; FETCH_OK=0; }
+		printf '%s\n' "$h log /tmp/ha-failover-${ts}-${PORT}-${h}-logread.log" >>"$tmpdir/analysis.files"
+		printf '%s\n' "$h log /tmp/ha-failover-${ts}-${PORT}-${h}-dmesg-tail.log" >>"$tmpdir/analysis.files"
+	done
+	for h in $CURRENT_MASTER $TARGET; do
+		for kind in events samples; do
+			pfile="/tmp/ha-failover-${ts}-${PORT}-${h}-${kind}.pid"
+			ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" \
+				"if [ -f '$pfile' ]; then kill \"\$(cat '$pfile')\" 2>/dev/null || true; sleep 1; kill -9 \"\$(cat '$pfile')\" 2>/dev/null || true; fi" \
+				>/dev/null 2>&1 || true
+		done
+	done
+	if [ -f "$tmpdir/analysis.files" ]; then
+		while IFS=' ' read -r h kind a b; do
+			[ -n "$h" ] || continue
+			case "$kind" in
+			pre|post)
+				for ext in extended save plain nf_conntrack ip_default ip_r4 status.json status.err; do
+					fetch_remote_file "$h" "${a}.${ext}" "$CAP_DIR/analysis/${h}-${kind}.${ext}" "$h:${a}.${ext}" || true
+				done
+				;;
+			bg)
+				base=$(basename "$a")
+				fetch_remote_file "$h" "$a" "$CAP_DIR/analysis/$base" "$h:$a" || true
+				;;
+			log)
+				base=$(basename "$a")
+				fetch_remote_file "$h" "$a" "$CAP_DIR/analysis/${h}-${base}" "$h:$a" || true
+				;;
+			esac
+		done <"$tmpdir/analysis.files"
+	fi
+	if [ "$FETCH_OK" -eq 1 ]; then
+		for h in $ALL_HOSTS; do
+			ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "rm -f /tmp/ha-failover-${ts}-${PORT}-${h}-pre.* /tmp/ha-failover-${ts}-${PORT}-${h}-post.* /tmp/ha-failover-${ts}-${PORT}-${h}-events.* /tmp/ha-failover-${ts}-${PORT}-${h}-samples.* /tmp/ha-failover-${ts}-${PORT}-${h}-logread.log /tmp/ha-failover-${ts}-${PORT}-${h}-dmesg-tail.log" </dev/null >/dev/null 2>&1 || true
+		done
+		if [ -f "$tmpdir/captures.list" ]; then
+			while IFS=' ' read -r h iface rfile pfile logfile; do
+				[ -n "$h" ] || continue
+				ssh -n -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "rm -f '${rfile}'* '$pfile' '$logfile'" </dev/null >/dev/null 2>&1 || true
+			done <"$tmpdir/captures.list"
+		fi
+		echo "  saved: $CAP_DIR/analysis/ (remote artifacts cleaned)"
+	else
+		echo "  saved: $CAP_DIR/analysis/ (remote /tmp/ha-failover-${ts}-${PORT}-* preserved for diagnosis due to fetch warnings)" >&2
+	fi
+	# Always kill leftovers on all hosts
+	for h in $CAP_HOSTS $ALL_HOSTS; do
+		ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "killall tcpdump 2>/dev/null || true; killall conntrack 2>/dev/null || true" >/dev/null 2>&1 || true
+	done
+}
+capture_start
+analysis_start
 
 echo "== pre-failover =="
 for h in $ALL_HOSTS; do
@@ -147,13 +342,15 @@ done
 
 if [ "$converged" -ne 1 ]; then
 	echo "error: failover did not converge within ${TIMEOUT}s" >&2
-	for h in $PAIR_A $PAIR_B; do
+	for h in $ALL_HOSTS; do
 		echo "  $h: role=$(role_of "$h" 2>/dev/null || echo '?') master=$(master_of_view "$h" 2>/dev/null || echo '?')" >&2
 	done
+	capture_stop
+	analysis_stop_fetch
 	exit 1
 fi
 
-sleep 2
+sleep 15
 
 echo "== post-failover =="
 for h in $ALL_HOSTS; do
@@ -165,7 +362,25 @@ for h in $ALL_HOSTS; do
 	echo "  $h: established=$est total_tcp_port=$all"
 done
 
+capture_stop
+analysis_stop_fetch
+echo "captures: $CAP_DIR"
+if [ "$FETCH_OK" -ne 1 ]; then
+	echo "warning: some captures/analysis artifacts could not be fetched; see warnings above and preserved remote files" >&2
+fi
 ok=1
+if [ -f "$CAP_DIR/analysis/${TARGET}-post.status.json" ]; then
+	origin_state=$(cluster_json_field originating <"$CAP_DIR/analysis/${TARGET}-post.status.json" 2>/dev/null || true)
+	replica_state=$(cluster_json_field replica <"$CAP_DIR/analysis/${TARGET}-post.status.json" 2>/dev/null || true)
+	echo "post status (from $TARGET-post.status.json, may be truncated): conntrack_sync originating=${origin_state:-unknown} replica=${replica_state:-unknown}"
+	case "$origin_state" in
+		false)
+			echo "error: new master $TARGET reports conntrack_sync originating=false (expected true after failover)" >&2
+			ok=0
+			;;
+	esac
+fi
+
 if [ "$BASELINE_COUNT" -gt 0 ]; then
 	missing="$tmpdir/missing.tuples"
 	comm -23 "$BASELINE_TUPLES" "$tmpdir/post.$TARGET.tuples" >"$missing" || true

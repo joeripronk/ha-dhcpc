@@ -733,17 +733,24 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->apply.announce_gratuitous = true;
     out->apply.announce_gratuitous_duration_ms = 10;
     out->apply.handoff_hold_ms = 5000;
-    out->apply.slave_link_down = false;
-    out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
-    out->apply.gateway_probe = true;
-    out->apply.gateway_probe_interval_ms = 10000;
-    out->apply.gateway_probe_timeout_ms = 2000;
-    out->apply.gateway_probe_fail_threshold = 3;
-    out->apply.gateway_probe_start_delay_ms = 5000;
-    out->apply.abort_tcp_on_newip = false;
-    out->apply.disable_ipv6 = true;
-    out->apply.dhcp_disable_ipv6_set = false;
-    if (a) {
+        out->apply.slave_link_down = false;
+        out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
+        out->apply.slave_sync_wan = false;
+        out->apply.demote_route_via_new_master = false;
+        out->apply.demote_nat_bypass_mark = 0;
+        out->apply.demote_notrack = true;
+        out->apply.slave_wan_local_via_master = false;
+        out->apply.slave_wan_local_table = 0;
+        out->apply.gateway_probe = true;
+        out->apply.gateway_probe_interval_ms = 10000;
+        out->apply.gateway_probe_timeout_ms = 2000;
+        out->apply.gateway_probe_fail_threshold = 3;
+        out->apply.gateway_probe_start_delay_ms = 5000;
+        out->apply.abort_tcp_on_newip = false;
+        out->apply.disable_ipv6 = true;
+        out->apply.dhcp_disable_ipv6_set = false;
+        out->apply.disable_rp_filter = true;
+        if (a) {
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
@@ -783,6 +790,22 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             }
         }
         out->apply.slave_link_down = (out->apply.slave_isolation == HADC_SLAVE_ISO_DOWN);
+        if (get_bool(a, "slave_sync_wan", &out->apply.slave_sync_wan, false)) goto derr;
+        if (get_bool(a, "demote_route_via_new_master", &out->apply.demote_route_via_new_master, false)) goto derr;
+        if (get_int(a, "demote_nat_bypass_mark", &v, (long long)out->apply.demote_nat_bypass_mark, false, "apply")) goto derr;
+        if (v < 0 || v > 0xffffff) {
+            snprintf(err, errlen, "config: demote_nat_bypass_mark out of range 0..0xffffff");
+            goto derr;
+        }
+        out->apply.demote_nat_bypass_mark = (uint32_t)v;
+        if (get_bool(a, "demote_notrack", &out->apply.demote_notrack, true)) goto derr;
+        if (get_bool(a, "slave_wan_local_via_master", &out->apply.slave_wan_local_via_master, false)) goto derr;
+        if (get_int(a, "slave_wan_local_table", &v, out->apply.slave_wan_local_table, false, "apply")) goto derr;
+        if (v != 0 && (v < 1 || v > 252)) {
+            snprintf(err, errlen, "config: slave_wan_local_table out of range 0 or 1..252");
+            goto derr;
+        }
+        out->apply.slave_wan_local_table = (int)v;
         if (get_bool(a, "gateway_probe", &out->apply.gateway_probe, true)) goto derr;
         if (get_int(a, "gateway_probe_interval_ms", &v, 10000, false, "apply")) goto derr;
         if (v < 100 || v > 3600000) {
@@ -815,6 +838,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 goto derr;
             out->apply.dhcp_disable_ipv6_set = true;
         }
+        if (get_bool(a, "disable_rp_filter", &out->apply.disable_rp_filter, true)) goto derr;
     }
 
     if (get_str(root, "ctl_socket", out->ctl_socket, HADC_PATH_MAX, false, "config")) goto derr;
@@ -848,6 +872,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->conntrack_sync.helpers.cache_refresh_s = 30;
     out->conntrack_sync.apply.slave_apply = HADC_CT_APPLY_STAGED;
     out->conntrack_sync.apply.max_entry_age_s = 300;
+    out->conntrack_sync.apply.upsert_fixes = true;
     {
         json_t *r = json_object_get(root, "routing");
         if (r) {
@@ -1141,11 +1166,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     }
                 }
                 if (get_int(ap, "max_entry_age_s", &v, 300, false, "conntrack_sync.apply")) goto derr;
-                if (v < 1 || v > 86400) {
+                if (v < 0 || v > 86400) {
                     snprintf(err, errlen, "config: conntrack_sync.apply.max_entry_age_s out of range");
                     goto derr;
                 }
                 out->conntrack_sync.apply.max_entry_age_s = (uint32_t)v;
+                if (get_bool(ap, "upsert_fixes", &out->conntrack_sync.apply.upsert_fixes, true)) goto derr;
             }
         }
     }

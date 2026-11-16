@@ -53,6 +53,19 @@ typedef struct {
     size_t n_cluster_ifaces;
     uint8_t link_state;        /* 0 = leave as-is, 1 = ensure up, 2 = ensure down */
     bool slave_nft_block;      /* block all egress via nft while slave (link up) */
+    bool slave_sync_wan;       /* keep DHCP IP/default route synced on slaves */
+    bool slave_wan_local_via_master; /* add ip rule: local-originated traffic via table */
+    int slave_wan_local_table;/* policy table for local-origin traffic (0=off) */
+    struct in_addr steer_via;  /* seamless takeover: while demoting, additive split /1
+                                * routes (0.0.0.0/1 + 128.0.0.0/1) steer outbound and
+                                * forwarded traffic via this fabric nexthop; 0 = off */
+    bool vip_hold_suppress;    /* seamless takeover: keep VIPs assigned during the
+                                * demoting hold and suppress VIP ARP replies plus
+                                * locally-originated VIP-source traffic */
+    uint32_t nat_bypass_mark;  /* seamless takeover: mark steered packets so the
+                                * platform firewall skips NAT on this node (0 = off) */
+    bool nat_bypass_notrack;   /* seamless takeover: NOTRACK steered traffic at
+                                * prerouting so conntrack/NAT never run on this node */
     hadc_hash_t config_hash;   /* canonical desired-state digest */
 } hadc_desired_t;
 

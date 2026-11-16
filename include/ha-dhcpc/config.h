@@ -102,16 +102,28 @@ typedef struct {
         bool slave_link_down;          /* legacy alias for slave_isolation=down */
         hadc_slave_isolation_t slave_isolation; /* how a slave isolates the DHCP
                                                  * interface (none/down/nft) */
+        bool slave_sync_wan;           /* keep DHCP IP/default route synced on slaves (WAN IP + default route) */
+        bool demote_route_via_new_master; /* on demote, route return traffic via new master over fabric */
+        uint32_t demote_nat_bypass_mark;  /* fw mark for steered traffic during demote hold
+                                           * (0 = off; platform firewall must return on it) */
+        bool demote_notrack;             /* default on: NOTRACK steered traffic at
+                                          * prerouting (raw) so conntrack/NAT never run on
+                                          * this node during the hold; zone-based firewalls
+                                          * must accept untracked steered traffic (see
+                                          * SEAMLESS_FIREWALL_HOWTO.md) */
+        bool slave_wan_local_via_master; /* add ip rule: local-originated traffic uses policy table */
+        int slave_wan_local_table;     /* routing table id for local-origin traffic on slaves (0=off) */
         bool gateway_probe;            /* master: ping lease gateway for liveness */
         uint32_t gateway_probe_interval_ms; /* probe interval, ms */
         uint32_t gateway_probe_timeout_ms;  /* reply timeout, ms */
         uint32_t gateway_probe_fail_threshold; /* consecutive misses -> unreachable */
         uint32_t gateway_probe_start_delay_ms; /* delay first probe after promote */
         bool abort_tcp_on_newip;       /* after ctl newip obtains a lease, reset
-                                        * TCP connections bound to the old address */
+                                         * TCP connections bound to the old address */
         bool disable_ipv6;             /* global: disable IPv6 on managed ifaces (default on) */
         bool dhcp_disable_ipv6_set;    /* override for the DHCP interface */
         bool dhcp_disable_ipv6;
+        bool disable_rp_filter;        /* disable rp_filter on managed ifaces (default on for seamless takeover) */
     } apply;
     struct {
         bool enabled;
@@ -156,6 +168,7 @@ typedef struct {
         struct {
             enum { HADC_CT_APPLY_STAGED = 0, HADC_CT_APPLY_IMMEDIATE = 1 } slave_apply;
             uint32_t max_entry_age_s;
+            bool upsert_fixes; /* apply/report upsert fixes; false = log only */
         } apply;
     } conntrack_sync;
     char ctl_socket[HADC_PATH_MAX];

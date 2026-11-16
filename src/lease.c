@@ -37,5 +37,22 @@ void hadc_lease_prepare_for_promotion(hadc_lease_t *l)
         long long elapsed = (long long)time(NULL) - l->observed_at_utc;
         hadc_lease_adjust_elapsed(l, elapsed);
     }
+    /* Delay renew on the new master by 5 seconds (avoid churn/flaps during
+     * promotion handoff), clamped so T1 <= T2 <= T3. */
+    if (l->address.s_addr != 0 && l->state != HADC_LEASE_NONE) {
+        const uint32_t delay_s = 5;
+        if (l->t1_remaining_s > 0)
+            l->t1_remaining_s += delay_s;
+        else if (l->t2_remaining_s > 0)
+            l->t1_remaining_s = (l->t2_remaining_s > delay_s) ? delay_s : l->t2_remaining_s;
+        else if (l->t3_remaining_s > 0)
+            l->t1_remaining_s = (l->t3_remaining_s > delay_s) ? delay_s : l->t3_remaining_s;
+        if (l->t1_remaining_s > l->t2_remaining_s && l->t2_remaining_s > 0)
+            l->t1_remaining_s = l->t2_remaining_s;
+        if (l->t2_remaining_s > l->t3_remaining_s && l->t3_remaining_s > 0)
+            l->t2_remaining_s = l->t3_remaining_s;
+        if (l->t1_remaining_s > l->t3_remaining_s && l->t3_remaining_s > 0)
+            l->t1_remaining_s = l->t3_remaining_s;
+    }
     hadc_lease_mark_observed(l);
 }

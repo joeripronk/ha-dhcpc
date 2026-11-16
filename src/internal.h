@@ -4,6 +4,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/config.h"
+#include "ha-dhcpc/executor.h"
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/types.h"
@@ -55,6 +56,13 @@ struct hadc_ctx {
     bool handoff_forward_hold;
     uint64_t handoff_hold_until_ms;
     char handoff_target[HADC_NODE_ID_MAX];
+
+    /* Demote return-traffic steering over fabric to the new master (opt-in).
+     * Requires slave_sync_wan and OSPF on a non-VIP interface; invalid configs
+     * disable the behavior and are reported with an error. */
+    bool demote_route_via_new_master_active;
+    bool demote_route_via_new_master_invalid;
+    char demote_route_via_new_master_reason[128];
     /* Promotion completion deferred: do not advertise role=master/gwping until
      * dataplane+VIP announce is done (and optionally after start delay). */
     bool promotion_pending;
@@ -84,6 +92,20 @@ void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 
 bool executor_action_is_fatal(int action_rc, bool action_is_fatal);
 
+/* Seamless-takeover VIP splits (executor.c): the two sub-prefixes at
+ * prefixlen+1 covering each cluster address's CIDR subnet, used as steering
+ * routes. Addresses with a host prefix (>31) or whose subnet contains the
+ * steering nexthop are skipped. */
+typedef struct {
+	struct in_addr net;
+	unsigned plen;
+} vip_split_t;
+
+#define VIP_SPLIT_MAX (2 * HADC_CLUSTER_IF_MAX * HADC_CLUSTER_ADDR_MAX)
+
+size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
+    vip_split_t out[], size_t max);
+
 /* gateway-reachability probe (ping.c): master pings the lease gateway every
  * second after a promote and fails over after 3 consecutive misses; start sends
  * the first probe at once, tick drives the cadence and reply timeout, results
@@ -107,6 +129,8 @@ int  hadc_maint_post_fn(hadc_maint_fn_t fn, void *arg);
 void hadc_maint_lock(void);
 void hadc_maint_unlock(void);
 bool hadc_maint_running(void);
+
+void hadc_validate_demote_route_config(hadc_ctx_t *ctx, const char *why);
 
 /* OSPF self-LSA persistence hooks (implemented in ospf.c, called by persist.c;
  * arr is a jansson json_t* array, void* to keep this header dependency-free). */

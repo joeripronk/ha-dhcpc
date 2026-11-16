@@ -46,7 +46,7 @@
 #define HADC_CT_MAGIC1 'C'
 #define HADC_CT_MAGIC2 'T'
 #define HADC_CT_MAGIC3 '1'
-#define HADC_CT_VER 3
+#define HADC_CT_VER 4
 #define HADC_CT_MAX_FRAME 65536
 #define HADC_CT_MAX_OWNED 128
 #define HADC_CT_SHADOW_MAX 4096
@@ -103,10 +103,20 @@ typedef struct {
     uint32_t repl_dst;
     uint16_t repl_sport;
     uint16_t repl_dport;
-    uint8_t flags; /* 1=nated,2=related/helper,4=assured,8=delete */
+    uint8_t flags; /* 1=nated,2=related/helper,4=assured,8=delete,0x10=nat_src,0x20=nat_dst,0x40=seqadj_o,0x80=seqadj_r */
     uint8_t helper_id; /* 0 none, 1 sip */
     uint8_t ct_kind;  /* 0=conntrack, 1=expectation (best-effort v1) */
     uint8_t rsv;
+    uint32_t nat_src_ip;
+    uint32_t nat_dst_ip;
+    uint16_t nat_src_port;
+    uint16_t nat_dst_port;
+    uint32_t seqadj_orig_correction_pos;
+    int32_t  seqadj_orig_offset_before;
+    int32_t  seqadj_orig_offset_after;
+    uint32_t seqadj_repl_correction_pos;
+    int32_t  seqadj_repl_offset_before;
+    int32_t  seqadj_repl_offset_after;
 } hadc_ct_entry_v1_t;
 #pragma pack(pop)
 
@@ -213,6 +223,7 @@ struct hadc_conntrack {
     uint32_t helper_cache_refresh_s;
     int slave_apply_mode;
     uint32_t max_entry_age_s;
+    bool upsert_fixes;
 
     hadc_role_t role;
     char self[HADC_NODE_ID_MAX];
@@ -701,6 +712,43 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
         struct nlattr *name=nla_find(ha,hl,CTA_HELP_NAME);
         if(name){ int dl=HADC_NLA_DATALEN(name); if(dl>0){ char nb[32]; int c=dl<31?dl:31; memcpy(nb,HADC_NLA_DATA(name),c); nb[c]='\0'; if(strstr(nb,"sip")){ out->helper_id=1; out->flags|=2; } } }
     }
+    /* parse NAT manip and seqadj details for replication/apply */
+    if (nats) {
+        struct nlattr *na=(struct nlattr*)HADC_NLA_DATA(nats); int nl=HADC_NLA_DATALEN(nats);
+        struct nlattr *ip=nla_find(na,nl,CTA_NAT_V4_MINIP);
+        struct nlattr *pn=nla_find(na,nl,CTA_NAT_PROTO);
+        if (ip && HADC_NLA_DATALEN(ip)>=4) { memcpy(&out->nat_src_ip, HADC_NLA_DATA(ip), 4); out->flags |= 0x10; }
+        if (pn) { struct nlattr *pa=(struct nlattr*)HADC_NLA_DATA(pn); int pl=HADC_NLA_DATALEN(pn);
+            struct nlattr *pmin=nla_find(pa,pl,CTA_PROTONAT_PORT_MIN);
+            if (pmin) { out->nat_src_port = nla_get_u16(pmin); out->flags |= 0x10; }
+        }
+    }
+    if (natd) {
+        struct nlattr *na=(struct nlattr*)HADC_NLA_DATA(natd); int nl=HADC_NLA_DATALEN(natd);
+        struct nlattr *ip=nla_find(na,nl,CTA_NAT_V4_MINIP);
+        struct nlattr *pn=nla_find(na,nl,CTA_NAT_PROTO);
+        if (ip && HADC_NLA_DATALEN(ip)>=4) { memcpy(&out->nat_dst_ip, HADC_NLA_DATA(ip), 4); out->flags |= 0x20; }
+        if (pn) { struct nlattr *pa=(struct nlattr*)HADC_NLA_DATA(pn); int pl=HADC_NLA_DATALEN(pn);
+            struct nlattr *pmin=nla_find(pa,pl,CTA_PROTONAT_PORT_MIN);
+            if (pmin) { out->nat_dst_port = nla_get_u16(pmin); out->flags |= 0x20; }
+        }
+    }
+    if (sao) {
+        struct nlattr *sa=(struct nlattr*)HADC_NLA_DATA(sao); int sl=HADC_NLA_DATALEN(sao);
+        struct nlattr *cp=nla_find(sa,sl,CTA_SEQADJ_CORRECTION_POS), *ob=nla_find(sa,sl,CTA_SEQADJ_OFFSET_BEFORE), *oa=nla_find(sa,sl,CTA_SEQADJ_OFFSET_AFTER);
+        if (cp) out->seqadj_orig_correction_pos = ntohl(nla_get_u32(cp));
+        if (ob) out->seqadj_orig_offset_before = (int32_t)ntohl(nla_get_u32(ob));
+        if (oa) out->seqadj_orig_offset_after = (int32_t)ntohl(nla_get_u32(oa));
+        if (cp || ob || oa) out->flags |= 0x40;
+    }
+    if (sar) {
+        struct nlattr *sa=(struct nlattr*)HADC_NLA_DATA(sar); int sl=HADC_NLA_DATALEN(sar);
+        struct nlattr *cp=nla_find(sa,sl,CTA_SEQADJ_CORRECTION_POS), *ob=nla_find(sa,sl,CTA_SEQADJ_OFFSET_BEFORE), *oa=nla_find(sa,sl,CTA_SEQADJ_OFFSET_AFTER);
+        if (cp) out->seqadj_repl_correction_pos = ntohl(nla_get_u32(cp));
+        if (ob) out->seqadj_repl_offset_before = (int32_t)ntohl(nla_get_u32(ob));
+        if (oa) out->seqadj_repl_offset_after = (int32_t)ntohl(nla_get_u32(oa));
+        if (cp || ob || oa) out->flags |= 0x80;
+    }
     return true;
 }
 
@@ -714,7 +762,15 @@ static bool ct_entry_significant_change(const hadc_ct_entry_v1_t *o, const hadc_
            o->zone != n->zone ||
            o->helper_id != n->helper_id ||
            o->flags != n->flags ||
-           o->ct_kind != n->ct_kind;
+           o->ct_kind != n->ct_kind ||
+           o->nat_src_ip != n->nat_src_ip || o->nat_src_port != n->nat_src_port ||
+           o->nat_dst_ip != n->nat_dst_ip || o->nat_dst_port != n->nat_dst_port ||
+           o->seqadj_orig_correction_pos != n->seqadj_orig_correction_pos ||
+           o->seqadj_orig_offset_before != n->seqadj_orig_offset_before ||
+           o->seqadj_orig_offset_after != n->seqadj_orig_offset_after ||
+           o->seqadj_repl_correction_pos != n->seqadj_repl_correction_pos ||
+           o->seqadj_repl_offset_before != n->seqadj_repl_offset_before ||
+           o->seqadj_repl_offset_after != n->seqadj_repl_offset_after;
 }
 
 
@@ -965,6 +1021,54 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
             if (hn != (size_t)-1) {
                 (void)nla_put(buf, buflen, &off, CTA_HELP_NAME, "sip", 4);
                 nla_nest_end(buf, hn, off);
+            }
+        }
+        if (e->flags & 0x10) {
+            size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_SRC);
+            if (nn != (size_t)-1) {
+                if (e->nat_src_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_src_ip, 4);
+                if (e->nat_src_port || e->proto == IPPROTO_TCP || e->proto == IPPROTO_UDP || e->proto == IPPROTO_SCTP || e->proto == IPPROTO_UDPLITE || e->proto == IPPROTO_DCCP) {
+                    size_t pn = nla_nest_start(buf, buflen, &off, CTA_NAT_PROTO);
+                    if (pn != (size_t)-1) {
+                        (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MIN, e->nat_src_port);
+                        (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MAX, e->nat_src_port);
+                        nla_nest_end(buf, pn, off);
+                    }
+                }
+                nla_nest_end(buf, nn, off);
+            }
+        }
+        if (e->flags & 0x20) {
+            size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_DST);
+            if (nn != (size_t)-1) {
+                if (e->nat_dst_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_dst_ip, 4);
+                if (e->nat_dst_port || e->proto == IPPROTO_TCP || e->proto == IPPROTO_UDP || e->proto == IPPROTO_SCTP || e->proto == IPPROTO_UDPLITE || e->proto == IPPROTO_DCCP) {
+                    size_t pn = nla_nest_start(buf, buflen, &off, CTA_NAT_PROTO);
+                    if (pn != (size_t)-1) {
+                        (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MIN, e->nat_dst_port);
+                        (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MAX, e->nat_dst_port);
+                        nla_nest_end(buf, pn, off);
+                    }
+                }
+                nla_nest_end(buf, nn, off);
+            }
+        }
+        if (e->flags & 0x40) {
+            size_t sn = nla_nest_start(buf, buflen, &off, CTA_SEQ_ADJ_ORIG);
+            if (sn != (size_t)-1) {
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_CORRECTION_POS, htonl(e->seqadj_orig_correction_pos));
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_OFFSET_BEFORE, htonl((uint32_t)e->seqadj_orig_offset_before));
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_OFFSET_AFTER, htonl((uint32_t)e->seqadj_orig_offset_after));
+                nla_nest_end(buf, sn, off);
+            }
+        }
+        if (e->flags & 0x80) {
+            size_t sn = nla_nest_start(buf, buflen, &off, CTA_SEQ_ADJ_REPLY);
+            if (sn != (size_t)-1) {
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_CORRECTION_POS, htonl(e->seqadj_repl_correction_pos));
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_OFFSET_BEFORE, htonl((uint32_t)e->seqadj_repl_offset_before));
+                (void)nla_put_u32(buf, buflen, &off, CTA_SEQADJ_OFFSET_AFTER, htonl((uint32_t)e->seqadj_repl_offset_after));
+                nla_nest_end(buf, sn, off);
             }
         }
     }
@@ -1380,6 +1484,7 @@ static void snapshot_config_locked(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
     ct->helper_cache_refresh_s = ctx->conf.conntrack_sync.helpers.cache_refresh_s;
     ct->slave_apply_mode = (int)ctx->conf.conntrack_sync.apply.slave_apply;
     ct->max_entry_age_s = ctx->conf.conntrack_sync.apply.max_entry_age_s;
+    ct->upsert_fixes = ctx->conf.conntrack_sync.apply.upsert_fixes;
     ct->role = ctx->role;
     snprintf(ct->self, sizeof(ct->self), "%s", ctx->conf.self);
     snprintf(ct->interface, sizeof(ct->interface), "%s", ctx->conf.interface);
@@ -1701,25 +1806,29 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                 char desc[256];
                 ct_entry_log_tuple(desc, sizeof(desc), &s->e);
                 if (recent_handoff) {
-                    /* recent master handoff: keep/validate and report fix on first snapshot */
-                    hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
+                    /* recent master handoff: entry missing from master's snapshot */
                     s->seen_in_snapshot = true; /* avoid repeated reports for this snapshot cycle */
                     s->updated_ms = now_ms();
-                    if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
-                        if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
-                        (void)ctnl_apply_entry(ct, &s->e, false);
+                    if (ct->upsert_fixes) {
+                        hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
+                        if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
+                            if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
+                            (void)ctnl_apply_entry(ct, &s->e, false);
+                        }
+                        bool reported = false;
+                        for (size_t pi = 0; pi < ct->n_peers; pi++) {
+                            hadc_ct_peer_t *mp = &ct->peers[pi];
+                            if (!mp->connected || !mp->hello_ok || !mp->peer_is_master)
+                                continue;
+                            int rc = send_frame(ct, mp, HADC_CT_MSG_UPSERT, 0, &s->e, sizeof(s->e));
+                            if (rc >= 0)
+                                reported = true;
+                        }
+                        if (!reported)
+                            ct->st.dropped_entries++;
+                    } else {
+                        hadc_info("conntrack: master snapshot missing entry (upsert fix disabled, not fixed): %s", desc);
                     }
-                    bool reported = false;
-                    for (size_t pi = 0; pi < ct->n_peers; pi++) {
-                        hadc_ct_peer_t *mp = &ct->peers[pi];
-                        if (!mp->connected || !mp->hello_ok || !mp->peer_is_master)
-                            continue;
-                        int rc = send_frame(ct, mp, HADC_CT_MSG_UPSERT, 0, &s->e, sizeof(s->e));
-                        if (rc >= 0)
-                            reported = true;
-                    }
-                    if (!reported)
-                        ct->st.dropped_entries++;
                 } else {
                     /* normal snapshot: master is authority, remove stale local/shadow state */
                     hadc_dbg("conntrack: master snapshot omits entry, removing stale slave state: %s", desc);
@@ -1751,6 +1860,11 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
         if (ct->role == HADC_ROLE_SLAVE) {
             bool ok = classify_non_local(ct, e, &reason) || !ct->non_local_only;
             if (ok || del) {
+                char desc[256];
+                ct_entry_log_tuple(desc, sizeof(desc), e);
+                hadc_dbg("conntrack: synced %s from %s: %s",
+                         h->type == HADC_CT_MSG_SNAPSHOT_ENTRY ? "snapshot" : (del ? "delete" : "upsert"),
+                         p->id, desc);
                 if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
                     if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
                     (void)ctnl_apply_entry(ct, e, del);
@@ -1766,32 +1880,37 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             if (ok || del) {
                 char desc[256];
                 ct_entry_log_tuple(desc, sizeof(desc), e);
-                hadc_info("conntrack: master accepted %s fix from %s: %s",
-                          del ? "delete" : "upsert", p->id, desc);
-                if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
-                (void)ctnl_apply_entry(ct, e, del);
-                if (del) {
-                    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
-                    if (s) { shadow_unlink(ct, s); s->valid = false; s->timer_dirty = false; }
-                } else {
-                    hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
-                    if (s) {
-                        s->e = *e;
-                        s->timer_dirty = false;
-                        s->updated_ms = now_ms();
+                bool apply_fix = ct->upsert_fixes || del;
+                if (apply_fix) {
+                    hadc_info("conntrack: master accepted %s fix from %s: %s",
+                              del ? "delete" : "upsert", p->id, desc);
+                    if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
+                    (void)ctnl_apply_entry(ct, e, del);
+                    if (del) {
+                        hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
+                        if (s) { shadow_unlink(ct, s); s->valid = false; s->timer_dirty = false; }
                     } else {
-                        s = shadow_alloc_slot(ct, e);
+                        hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
                         if (s) {
                             s->e = *e;
-                            s->updated_ms = now_ms();
-                            s->valid = true;
-                            s->seen_in_snapshot = false;
                             s->timer_dirty = false;
-                            shadow_link(ct, s);
+                            s->updated_ms = now_ms();
+                        } else {
+                            s = shadow_alloc_slot(ct, e);
+                            if (s) {
+                                s->e = *e;
+                                s->updated_ms = now_ms();
+                                s->valid = true;
+                                s->seen_in_snapshot = false;
+                                s->timer_dirty = false;
+                                shadow_link(ct, s);
+                            }
                         }
                     }
+                    master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e, p);
+                } else {
+                    hadc_info("conntrack: master received upsert fix from %s (disabled, not fixed): %s", p->id, desc);
                 }
-                master_queue_entry_all(ct, del ? HADC_CT_MSG_DELETE : HADC_CT_MSG_UPSERT, e, p);
                 ct->st.rx_entries++;
             } else {
                 ct->st.dropped_entries++;

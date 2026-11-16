@@ -19,6 +19,7 @@
 #include <netlink/route/neighbour.h>
 #include <netlink/route/route.h>
 #include <netlink/route/addr.h>
+#include <netlink/route/rule.h>
 #include <netlink/socket.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
@@ -41,6 +42,8 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
                                  const char *reason, bool from_drift);
 static void monitor_ready(hadc_ctx_t *ctx, int fd);
 static void apply_slave_nft_block(const char *ifname, bool block, const char *reason);
+static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+    const hadc_desired_t *prev, const char *reason);
 
 static struct nl_sock *g_sk;
 
@@ -103,6 +106,23 @@ static bool cluster_if_disable_ipv6(const hadc_ctx_t *ctx, const char *ifname)
     return ctx->conf.apply.disable_ipv6;
 }
 
+static void set_rp_filter_value(const char *scope, const char *value)
+{
+    char path[128];
+    FILE *f;
+    if (!scope || strpbrk(scope, "./"))
+        return;
+    snprintf(path, sizeof(path), "/proc/sys/net/ipv4/conf/%s/rp_filter", scope);
+    f = fopen(path, "w");
+    if (!f) {
+        hadc_dbg("executor: set rp_filter=%s on %s: %s", value, scope, strerror(errno));
+        return;
+    }
+    if (fputs(value, f) < 0)
+        hadc_dbg("executor: set rp_filter=%s on %s: %s", value, scope, strerror(errno));
+    fclose(f);
+}
+
 static void apply_disable_ipv6(hadc_ctx_t *ctx)
 {
     bool dhcp = ctx->conf.apply.dhcp_disable_ipv6_set ?
@@ -111,6 +131,28 @@ static void apply_disable_ipv6(hadc_ctx_t *ctx)
     for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
         const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
         set_ipv6_disabled(ci->interface, cluster_if_disable_ipv6(ctx, ci->interface));
+    }
+}
+
+static void apply_rp_filter(hadc_ctx_t *ctx)
+{
+    if (!ctx->conf.apply.disable_rp_filter)
+        return;
+    /* Disable reverse-path filtering on managed paths to allow asymmetric
+     * forwarding during seamless takeover (stray WAN ingress forwarded over
+     * the fabric to the new master). */
+    set_rp_filter_value("all", "0");
+    set_rp_filter_value("default", "0");
+    if (ctx->conf.interface[0])
+        set_rp_filter_value(ctx->conf.interface, "0");
+    for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
+        const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
+        if (ci->interface[0])
+            set_rp_filter_value(ci->interface, "0");
+    }
+    for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++) {
+        if (ctx->conf.ospf.interfaces[i][0])
+            set_rp_filter_value(ctx->conf.ospf.interfaces[i], "0");
     }
 }
 
@@ -141,15 +183,28 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
     inet_ntop(AF_INET, &d->address, addr, sizeof(addr));
     inet_ntop(AF_INET, &d->gateway, gw, sizeof(gw));
     inet_ntop(AF_INET, &d->backup_gateway, backup, sizeof(backup));
+    char steer[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &d->default_via, via, sizeof(via));
     inet_ntop(AF_INET, &d->server_id, sid, sizeof(sid));
+    inet_ntop(AF_INET, &d->steer_via, steer, sizeof(steer));
     json_t *o = json_pack(
-        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b, s:s}",
+        "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b, s:b, s:b, s:I, s:s, "
+        "s:s, s:b, s:I, s:b}",
         "interface", d->interface, "present", d->present, "address", addr,
         "prefixlen", (json_int_t)d->prefixlen, "gateway", gw, "backup_gateway",
         backup, "backup_route", d->backup_route, "dns", "", "routes",
         d->add_routes ? "yes" : "no", "link_state", (json_int_t)d->link_state,
-        "default_via", via, "slave_nft_block", d->slave_nft_block, "server_id", sid);
+        "default_via", via, "slave_nft_block", d->slave_nft_block,
+        "slave_sync_wan", d->slave_sync_wan, "slave_wan_local_via_master", d->slave_wan_local_via_master,
+        "slave_wan_local_table", (json_int_t)d->slave_wan_local_table, "server_id", sid,
+        "steer_via", steer, "vip_hold_suppress", d->vip_hold_suppress,
+        "nat_bypass_mark", (json_int_t)d->nat_bypass_mark,
+        "nat_bypass_notrack", d->nat_bypass_notrack);
+    if (!o) {
+        /* A failed json_pack must never hash as the empty string: make it loud. */
+        snprintf(out, outsz, "UNHASHABLE");
+        return;
+    }
     json_t *dns = json_array();
     for (size_t i = 0; i < d->n_dns; i++)
         json_array_append_new(dns, json_string(inet_ntoa(d->dns[i])));
@@ -202,6 +257,26 @@ static bool server_needs_pin(const hadc_desired_t *d)
     return (d->server_id.s_addr & mask) != (d->address.s_addr & mask);
 }
 
+
+static struct in_addr demote_route_nexthop(hadc_ctx_t *ctx)
+{
+    struct in_addr none = {0};
+    if (!ctx || !ctx->demote_route_via_new_master_active)
+        return none;
+    if (!(ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold))
+        return none;
+    if (!ctx->conf.apply.slave_sync_wan)
+        return none;
+    const char *target = ctx->handoff_target[0] ? ctx->handoff_target : ctx->conf.designated_master;
+    if (!target || !*target)
+        return none;
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        if (!strcmp(ctx->conf.members[i].id, target))
+            return ctx->conf.members[i].sync_address;
+    }
+    return none;
+}
+
 void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desired_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -214,7 +289,14 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             out->backup_gateway = rgw;
     }
     bool master_like = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING);
-    out->cluster_addrs_present = master_like;
+    bool demote_hold = (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold);
+    struct in_addr demote_via = demote_route_nexthop(ctx);
+    bool steering = demote_via.s_addr != 0;
+    /* Seamless takeover: while steering is active during the demoting hold the VIPs
+     * stay assigned (ARP replies for them are suppressed and no VIP-source traffic
+     * leaves this node), so stray traffic can still be forwarded to the new master;
+     * the VIPs are removed only when the hold completes. */
+    out->cluster_addrs_present = master_like || (demote_hold && steering);
     out->n_cluster_ifaces = ctx->conf.cluster.n_ifaces;
     for (size_t i = 0; i < out->n_cluster_ifaces; i++)
         out->cluster_ifaces[i] = ctx->conf.cluster.ifaces[i];
@@ -238,12 +320,20 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             out->dns[i] = lease->dns[i];
         out->server_id = lease->server_id;
     }
-    /* Slaves do not own the DHCP default route: they reach the network through
-     * the master's VIP via the configured backup gateway. During handoff hold
-     * (DEMOTING) keep the public IP and default route so in-flight/stray
-     * traffic can still be forwarded until the new master is ready. */
-    if (ctx->role == HADC_ROLE_SLAVE)
-        out->gateway.s_addr = 0;
+    /* Slaves do not own the DHCP default route by default: they reach the network through
+     * the master's VIP via the configured backup gateway. Optional slave_sync_wan keeps
+     * the synced lease IP/default route on slaves (and still removes VIPs). */
+    if (ctx->role == HADC_ROLE_SLAVE) {
+        if (ctx->conf.apply.slave_sync_wan) {
+            /* Keep present/gateway/dns/routes from the synced lease (like master), but no VIPs. */
+            if (lease->address.s_addr == 0 || lease->state == HADC_LEASE_NONE)
+                out->present = false;
+        } else {
+            out->gateway.s_addr = 0;
+        }
+    } else if (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold &&
+             lease->state != HADC_LEASE_NONE)
+        out->gateway = lease->gateway;
     out->link_state = 0;
     out->slave_nft_block = false;
     if (master_like) {
@@ -253,8 +343,18 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         out->slave_nft_block = false; /* enabled only after new master ready */
         if (lease->address.s_addr != 0 && lease->state != HADC_LEASE_NONE)
             out->present = true;
+        if (ctx->handoff_forward_hold && lease->state != HADC_LEASE_NONE) {
+            /* Keep public IP and default route during handoff hold; VIPs removed. */
+            out->gateway = lease->gateway;
+            out->add_routes = ctx->conf.apply.routes;
+            out->backup_route = false;
+        }
     } else if (ctx->role == HADC_ROLE_SLAVE && !ctx->shutting_down) {
-        if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_DOWN) {
+        if (ctx->conf.apply.slave_sync_wan) {
+            out->link_state = 1;
+            out->slave_nft_block = false;
+            /* With sync, don't add the old slave backup route; we want the synced default. */
+        } else if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_DOWN) {
             out->link_state = 2;
             out->present = false;
         } else if (ctx->conf.apply.slave_isolation == HADC_SLAVE_ISO_NFT_EGRESS) {
@@ -263,6 +363,9 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             out->present = false;
         }
     }
+    out->slave_sync_wan = ctx->conf.apply.slave_sync_wan;
+    out->slave_wan_local_via_master = ctx->conf.apply.slave_wan_local_via_master;
+    out->slave_wan_local_table = ctx->conf.apply.slave_wan_local_table;
     /* Master-only failover: while the gateway probe is failing or we have no
      * lease IP yet, the default route goes to the configured backup router and
      * hands back to the lease gateway as soon as the gateway answers again. */
@@ -271,6 +374,15 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         ctx->conf.apply.master_backup_gateway.s_addr != 0 &&
         (hadc_gwping_unreachable() || lease->address.s_addr == 0))
         out->default_via = ctx->conf.apply.master_backup_gateway;
+    /* Seamless takeover steering: additive split /1 routes via the new master's
+     * fabric nexthop; the default route itself stays on the lease gateway. */
+    out->steer_via = demote_via;
+    out->nat_bypass_mark = steering ? ctx->conf.apply.demote_nat_bypass_mark : 0;
+    out->nat_bypass_notrack = steering ? ctx->conf.apply.demote_notrack : false;
+    out->vip_hold_suppress = demote_hold && steering;
+    /* For slaves with sync_wan, do not add slave backup route. */
+    if (ctx->role == HADC_ROLE_SLAVE && ctx->conf.apply.slave_sync_wan)
+        out->backup_route = false;
     char canon[8192]; /* 8 ifaces x 16 addrs, worst-case CIDR text */
     canonical_desired(out, canon, sizeof(canon));
     hadc_sha256(canon, strlen(canon), out->config_hash);
@@ -433,41 +545,6 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
     }
 }
 
-struct route_match {
-	const struct in_addr *gw;
-	struct rtnl_route *found;
-};
-
-static void route_match_cb(struct nl_object *obj, void *p)
-{
-	struct route_match *m = p;
-	struct rtnl_route *r = (struct rtnl_route *)obj;
-	struct nl_addr *dst = rtnl_route_get_dst(r);
-	static const struct in_addr any;
-	int i;
-
-	if (m->gw && rtnl_route_get_type(r) != RTN_UNICAST)
-		return; /* exact match is our own unicast route */
-	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
-		return;
-	if (nl_addr_get_prefixlen(dst) != 0 ||
-	    memcmp(nl_addr_get_binary_addr(dst), &any, 4) != 0)
-		return;
-	if (!m->gw) {
-		m->found = r; /* any default route, any type */
-		return;
-	}
-	for (i = 0; i < rtnl_route_get_nnexthops(r); i++) {
-		struct nl_addr *gw = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
-
-		if (gw && nl_addr_get_len(gw) == 4 &&
-		    memcmp(nl_addr_get_binary_addr(gw), m->gw, 4) == 0) {
-			m->found = r;
-			return;
-		}
-	}
-}
-
 /* All default-route entries that conflict with ours (any type, any gateway). */
 struct route_collect {
 	struct rtnl_route *out[16];
@@ -490,17 +567,10 @@ static void route_collect_cb(struct nl_object *obj, void *p)
 		c->out[c->n++] = r;
 }
 
-static struct rtnl_route *find_default(struct nl_cache *cache, const struct in_addr *gw)
-{
-	struct route_match m = { gw, NULL };
-
-	nl_cache_foreach(cache, route_match_cb, &m);
-	return m.found;
-}
-
 struct host_match {
 	const struct in_addr *dst;
 	const struct in_addr *gw;
+	int want_plen; /* -1: legacy (32 with dst, 0 without); else exact prefix */
 	struct rtnl_route *found;
 };
 
@@ -509,18 +579,39 @@ static void host_route_match_cb(struct nl_object *obj, void *p)
 	struct host_match *m = p;
 	struct rtnl_route *r = (struct rtnl_route *)obj;
 	struct nl_addr *dst = rtnl_route_get_dst(r);
+	struct nl_addr *gw;
 	int i;
 
 	if (rtnl_route_get_type(r) != RTN_UNICAST)
 		return;
-	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
-		return;
-	if (nl_addr_get_prefixlen(dst) != 32 ||
-	    memcmp(nl_addr_get_binary_addr(dst), m->dst, 4) != 0)
-		return;
+	if (m->dst == NULL) {
+		static const struct in_addr any;
+		unsigned want = m->want_plen >= 0 ? (unsigned)m->want_plen : 0;
+		if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
+			return;
+		if (nl_addr_get_prefixlen(dst) != want ||
+		    memcmp(nl_addr_get_binary_addr(dst), &any, 4) != 0)
+			return;
+	} else {
+		unsigned want = m->want_plen >= 0 ? (unsigned)m->want_plen : 32;
+		uint32_t base, got;
+		if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
+			return;
+		if (nl_addr_get_prefixlen(dst) != want)
+			return;
+		/* prefix comparison on the network address, not the raw row */
+		if (want >= 32) {
+			base = ntohl(m->dst->s_addr);
+		} else {
+			base = ntohl(m->dst->s_addr) & (want ? ~(0xffffffffu >> want) : 0xffffffffu);
+		}
+		got = ntohl(*(const uint32_t *)nl_addr_get_binary_addr(dst));
+		got &= want >= 32 ? 0xffffffffu : (want ? ~(0xffffffffu >> want) : 0xffffffffu);
+		if (got != base)
+			return;
+	}
 	for (i = 0; i < rtnl_route_get_nnexthops(r); i++) {
-		struct nl_addr *gw = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
-
+		gw = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
 		if (gw && nl_addr_get_len(gw) == 4 &&
 		    memcmp(nl_addr_get_binary_addr(gw), m->gw, 4) == 0) {
 			m->found = r;
@@ -529,13 +620,116 @@ static void host_route_match_cb(struct nl_object *obj, void *p)
 	}
 }
 
+static struct rtnl_route *find_default(struct nl_cache *cache, const struct in_addr *gw)
+{
+	struct host_match m;
+	memset(&m, 0, sizeof(m));
+	m.gw = gw;
+	nl_cache_foreach(cache, host_route_match_cb, &m);
+	return m.found;
+}
+
 static struct rtnl_route *find_host_route(struct nl_cache *cache, const struct in_addr *dst,
     const struct in_addr *gw)
 {
-	struct host_match m = { dst, gw, NULL };
-
+	struct host_match m;
+	memset(&m, 0, sizeof(m));
+	m.dst = dst;
+	m.gw = gw;
+	m.want_plen = 32;
 	nl_cache_foreach(cache, host_route_match_cb, &m);
 	return m.found;
+}
+
+static struct rtnl_route *find_prefix_route(struct nl_cache *cache, const struct in_addr *dst,
+    unsigned plen, const struct in_addr *gw)
+{
+	struct host_match m;
+	memset(&m, 0, sizeof(m));
+	m.dst = dst;
+	m.gw = gw;
+	m.want_plen = (int)plen;
+	nl_cache_foreach(cache, host_route_match_cb, &m);
+	return m.found;
+}
+
+/* Seamless-takeover VIP splits: for each cluster address with a CIDR prefix
+ * (prefixlen <= 31), the two sub-prefixes at prefixlen+1 covering its subnet.
+ * They beat the connected route for the subnet, so forwarded traffic for
+ * addresses inside it is steered to the new master instead of being processed
+ * on this node. Packets whose destination is the VIP address itself still hit
+ * the kernel's /32 local route (longest prefix) and are handled by the nft
+ * scoping chains. Addresses whose subnet contains the steering nexthop are
+ * skipped: the route to the nexthop would resolve through the splits. */
+size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
+    vip_split_t out[], size_t max)
+{
+	size_t n = 0;
+
+	for (size_t i = 0; i < d->n_cluster_ifaces; i++) {
+		for (size_t j = 0; j < d->cluster_ifaces[i].n_addrs; j++) {
+			const hadc_cluster_addr_t *a = &d->cluster_ifaces[i].addrs[j];
+			unsigned plen = a->prefixlen;
+			uint32_t mask, base, half;
+			vip_split_t s[2];
+
+			if (!a->address.s_addr || plen > 31)
+				continue;
+			mask = plen ? ~(0xffffffffu >> plen) : 0xffffffffu;
+			base = ntohl(a->address.s_addr) & mask;
+			if (via->s_addr && (ntohl(via->s_addr) & mask) == base)
+				continue;
+			half = 1u << (32 - (plen + 1));
+			s[0].net.s_addr = htonl(base);
+			s[0].plen = plen + 1;
+			s[1].net.s_addr = htonl(base + half);
+			s[1].plen = plen + 1;
+			for (size_t k = 0; k < 2 && n < max; k++) {
+				bool dup = false;
+				for (size_t m2 = 0; m2 < n; m2++) {
+					if (out[m2].net.s_addr == s[k].net.s_addr && out[m2].plen == s[k].plen) {
+						dup = true;
+						break;
+					}
+				}
+				if (!dup)
+					out[n++] = s[k];
+			}
+		}
+	}
+	return n;
+}
+
+static int nl_route_del_default_table(struct nl_sock *sk, uint32_t table, const struct in_addr *gw)
+{
+	struct nl_msg *m = nlmsg_alloc_simple(RTM_DELROUTE, NLM_F_REQUEST | NLM_F_ACK);
+	struct rtmsg *rt;
+
+	if (!m)
+		return -1;
+	rt = (struct rtmsg *) nlmsg_reserve(m, sizeof(*rt), NLA_ALIGNTO);
+	if (!rt) {
+		nlmsg_free(m);
+		return -1;
+	}
+	rt->rtm_family = AF_INET;
+	rt->rtm_dst_len = 0;
+	rt->rtm_src_len = 0;
+	rt->rtm_tos = 0;
+	if (table < 256) {
+		rt->rtm_table = (unsigned char)table;
+	} else {
+		rt->rtm_table = RT_TABLE_UNSPEC;
+	}
+	rt->rtm_protocol = RTPROT_STATIC;
+	rt->rtm_scope = RT_SCOPE_UNIVERSE;
+	rt->rtm_type = RTN_UNICAST;
+	nla_put(m, RTA_GATEWAY, 4, gw);
+	if (table >= 256) {
+		uint32_t t = table;
+		nla_put(m, RTA_TABLE, 4, &t);
+	}
+	return nl_send_sync(sk, m); /* consumes m */
 }
 
 /* dhclient-script compatible hook environment. */
@@ -624,8 +818,8 @@ static int nl_addr_add(struct nl_sock *sk, int ifindex, const struct in_addr *ip
 	return nl_send_sync(sk, m); /* consumes m */
 }
 
-static int nl_route_add_default(struct nl_sock *sk, int ifindex, const struct in_addr *gw,
-    uint32_t metric)
+static int nl_route_add_default_table(struct nl_sock *sk, int ifindex, const struct in_addr *gw,
+    uint32_t metric, uint32_t table)
 {
 	struct nl_msg *m = nlmsg_alloc_simple(RTM_NEWROUTE,
 	    NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK);
@@ -642,19 +836,32 @@ static int nl_route_add_default(struct nl_sock *sk, int ifindex, const struct in
 	rt->rtm_dst_len = 0;
 	rt->rtm_src_len = 0;
 	rt->rtm_tos = 0;
-	rt->rtm_table = RT_TABLE_MAIN;
-	rt->rtm_protocol = RTPROT_BOOT;
+	if (table < 256) {
+		rt->rtm_table = (unsigned char)table;
+	} else {
+		rt->rtm_table = RT_TABLE_UNSPEC;
+	}
+	rt->rtm_protocol = RTPROT_STATIC;
 	rt->rtm_scope = RT_SCOPE_UNIVERSE;
 	rt->rtm_type = RTN_UNICAST;
 	if (ifindex)
-		rt->rtm_flags = RTNH_F_ONLINK; /* the gateway is on-link even when no
-	                                    on-link route exists yet (slaves) */
-	if (metric) /* 0 = primary, >0 = backup */
+		rt->rtm_flags = RTNH_F_ONLINK;
+	if (metric)
 		nla_put(m, RTA_PRIORITY, 4, &metric);
 	nla_put(m, RTA_GATEWAY, 4, gw);
 	if (ifindex)
 		nla_put(m, RTA_OIF, 4, &ifindex);
+	if (table >= 256) {
+		uint32_t t = table;
+		nla_put(m, RTA_TABLE, 4, &t);
+	}
 	return nl_send_sync(sk, m); /* consumes m */
+}
+
+static int nl_route_add_default(struct nl_sock *sk, int ifindex, const struct in_addr *gw,
+    uint32_t metric)
+{
+	return nl_route_add_default_table(sk, ifindex, gw, metric, RT_TABLE_MAIN);
 }
 
 /* Pinned /32 host route to the DHCP server-id via the on-link lease gateway.
@@ -687,6 +894,58 @@ static int nl_route_add_host(struct nl_sock *sk, int ifindex, const struct in_ad
 	nla_put(m, RTA_GATEWAY, 4, gw);
 	nla_put(m, RTA_OIF, 4, &ifindex);
 	return nl_send_sync(sk, m); /* consumes m */
+}
+
+/* Split-prefix route for seamless-takeover steering: a more-specific prefix
+ * (e.g. 0.0.0.0/1 or 128.0.0.0/1) via the new master's fabric nexthop. The
+ * nexthop is on-link on the fabric, so no explicit device/ONLINK is pinned. */
+static int nl_route_add_prefix(struct nl_sock *sk, const struct in_addr *dst,
+    unsigned plen, const struct in_addr *gw)
+{
+	struct nl_msg *m = nlmsg_alloc_simple(RTM_NEWROUTE,
+	    NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK);
+	struct rtmsg *rt;
+
+	if (!m)
+		return -1;
+	rt = (struct rtmsg *) nlmsg_reserve(m, sizeof(*rt), NLA_ALIGNTO);
+	if (!rt) {
+		nlmsg_free(m);
+		return -1;
+	}
+	rt->rtm_family = AF_INET;
+	rt->rtm_dst_len = (unsigned char)plen;
+	rt->rtm_src_len = 0;
+	rt->rtm_tos = 0;
+	rt->rtm_table = RT_TABLE_MAIN;
+	rt->rtm_protocol = RTPROT_STATIC;
+	rt->rtm_scope = RT_SCOPE_UNIVERSE;
+	rt->rtm_type = RTN_UNICAST;
+	nla_put(m, RTA_DST, 4, dst);
+	nla_put(m, RTA_GATEWAY, 4, gw);
+	return nl_send_sync(sk, m); /* consumes m */
+}
+
+static int nl_rule_set_lookup_table(struct nl_sock *sk, uint32_t table, uint32_t prio, bool add)
+{
+	struct rtnl_rule *rule = rtnl_rule_alloc();
+	int rc;
+	if (!rule)
+		return -1;
+	rtnl_rule_set_family(rule, AF_INET);
+	rtnl_rule_set_table(rule, table);
+	if (prio)
+		rtnl_rule_set_prio(rule, prio);
+	if (add)
+		rc = rtnl_rule_add(sk, rule, NLM_F_CREATE | NLM_F_ACK);
+	else
+		rc = rtnl_rule_delete(sk, rule, 0);
+	if (rc == -NLE_EXIST && add)
+		rc = 0;
+	if (rc == -NLE_OBJ_NOTFOUND && !add)
+		rc = 0;
+	rtnl_rule_put(rule);
+	return rc;
 }
 
 /* Program the cached gateway hardware address as a permanent neighbor entry
@@ -1086,6 +1345,30 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 			if (server_needs_pin(d) &&
 			    !find_host_route(rcache, &d->server_id, &d->gateway))
 				drift++;
+		}
+		/* Seamless-takeover steering routes (split /1s plus VIP splits) are
+		 * ours while steering is on (must exist) and gone once it is off (must
+		 * not linger). */
+		if (d->steer_via.s_addr || (g_applied_valid && g_applied.steer_via.s_addr)) {
+			static const struct in_addr low;
+			struct in_addr high;
+			const struct in_addr *split[2] = { &low, &high };
+			const hadc_desired_t *eff = d->steer_via.s_addr ? d : &g_applied;
+			const struct in_addr *via = &eff->steer_via;
+			vip_split_t vips[VIP_SPLIT_MAX];
+			size_t n_vips;
+			high.s_addr = htonl(0x80000000u);
+			for (size_t i = 0; i < 2; i++) {
+				bool present = find_prefix_route(rcache, split[i], 1, via) != NULL;
+				if (d->steer_via.s_addr ? !present : present)
+					drift++;
+			}
+			n_vips = vip_splits(eff, via, vips, VIP_SPLIT_MAX);
+			for (size_t i = 0; i < n_vips; i++) {
+				bool present = find_prefix_route(rcache, &vips[i].net, vips[i].plen, via) != NULL;
+				if (d->steer_via.s_addr ? !present : present)
+					drift++;
+			}
 		}
 	}
 out:
@@ -1513,6 +1796,115 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 					    "(reason=%s)", inet_ntoa(prev->backup_gateway), reason);
 			}
 		}
+		/* Optional: slave local-origin policy routing via master */
+		if (desired->slave_sync_wan && desired->slave_wan_local_via_master && desired->slave_wan_local_table > 0 && desired->backup_gateway.s_addr != 0) {
+			if ((ar = nl_rule_set_lookup_table(g_sk, (uint32_t)desired->slave_wan_local_table, 100, true)) < 0)
+				hadc_warn("executor: adding policy rule for table %d failed: %s", desired->slave_wan_local_table, nl_geterror(ar));
+			else
+				hadc_info("executor: ensured policy rule lookup table %d (reason=%s)", desired->slave_wan_local_table, reason);
+			if ((ar = nl_route_add_default_table(g_sk, 0, &desired->backup_gateway, 0, (uint32_t)desired->slave_wan_local_table)) < 0) {
+				if (ar == -NLE_EXIST)
+					hadc_dbg("executor: policy table %d default via %s already present", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway));
+				else
+					hadc_warn("executor: adding default in table %d via %s failed: %s", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway), nl_geterror(ar));
+			} else
+				hadc_info("executor: added default route in table %d via %s (reason=%s)", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway), reason);
+		} else if (prev && prev->slave_sync_wan && prev->slave_wan_local_via_master && prev->slave_wan_local_table > 0) {
+			bool need_cleanup = false;
+			if (!desired->slave_sync_wan || !desired->slave_wan_local_via_master || desired->slave_wan_local_table != prev->slave_wan_local_table)
+				need_cleanup = true;
+			else if (desired->backup_gateway.s_addr != prev->backup_gateway.s_addr || desired->backup_gateway.s_addr == 0)
+				need_cleanup = true;
+			if (need_cleanup) {
+				if ((ar = nl_rule_set_lookup_table(g_sk, (uint32_t)prev->slave_wan_local_table, 100, false)) < 0)
+					hadc_dbg("executor: removing policy rule for table %d: %s", prev->slave_wan_local_table, nl_geterror(ar));
+				else
+					hadc_info("executor: removed policy rule lookup table %d (reason=%s)", prev->slave_wan_local_table, reason);
+				if (prev->backup_gateway.s_addr != 0) {
+					if ((ar = nl_route_del_default_table(g_sk, (uint32_t)prev->slave_wan_local_table, &prev->backup_gateway)) < 0) {
+						if (ar == -NLE_OBJ_NOTFOUND || ar == -NLE_NOADDR)
+							hadc_dbg("executor: policy table %d default route via %s not present", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway));
+						else
+							hadc_warn("executor: deleting policy table %d default route via %s failed: %s", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway), nl_geterror(ar));
+					} else
+						hadc_info("executor: removed policy table %d default route via %s (reason=%s)", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway), reason);
+				}
+			}
+		}
+	}
+
+	/* Seamless takeover steering routes: additive split /1s plus per-VIP-subnet
+	 * splits at prefixlen+1 via the new master's fabric nexthop. Longest-prefix
+	 * match beats the default route without touching it (and beats the
+	 * connected route for VIP subnets, steering their address space); the
+	 * kernel's /32 local route for the VIP address itself still wins, so the
+	 * nft scoping chains handle VIP-destination traffic. Explicit cleanup when
+	 * the demoting hold ends. */
+	{
+		static const struct in_addr split_low = { 0 };
+		struct in_addr split_high;
+		const struct in_addr *split[2];
+		vip_split_t vips[VIP_SPLIT_MAX];
+		size_t n_vips;
+		split_high.s_addr = htonl(0x80000000u);
+		split[0] = &split_low;
+		split[1] = &split_high;
+		if (desired->steer_via.s_addr) {
+			for (size_t i = 0; i < 2; i++) {
+				char dstbuf[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, split[i], dstbuf, sizeof(dstbuf));
+				if (find_prefix_route(rcache, split[i], 1, &desired->steer_via))
+					continue;
+				if ((ar = nl_route_add_prefix(g_sk, split[i], 1, &desired->steer_via)) < 0)
+					hadc_warn("executor: adding steering route %s/1 via %s failed: %s",
+					    dstbuf, inet_ntoa(desired->steer_via), nl_geterror(ar));
+				else
+					hadc_info("executor: added steering route %s/1 via %s (reason=%s)",
+					    dstbuf, inet_ntoa(desired->steer_via), reason);
+			}
+			n_vips = vip_splits(desired, &desired->steer_via, vips, VIP_SPLIT_MAX);
+			for (size_t i = 0; i < n_vips; i++) {
+				char dstbuf[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &vips[i].net, dstbuf, sizeof(dstbuf));
+				if (find_prefix_route(rcache, &vips[i].net, vips[i].plen, &desired->steer_via))
+					continue;
+				if ((ar = nl_route_add_prefix(g_sk, &vips[i].net, vips[i].plen,
+				        &desired->steer_via)) < 0)
+					hadc_warn("executor: adding steering route %s/%u via %s failed: %s",
+					    dstbuf, vips[i].plen, inet_ntoa(desired->steer_via), nl_geterror(ar));
+				else
+					hadc_info("executor: added steering route %s/%u via %s (reason=%s)",
+					    dstbuf, vips[i].plen, inet_ntoa(desired->steer_via), reason);
+			}
+		} else if (prev && prev->steer_via.s_addr) {
+			for (size_t i = 0; i < 2; i++) {
+				char dstbuf[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, split[i], dstbuf, sizeof(dstbuf));
+				sroute = find_prefix_route(rcache, split[i], 1, &prev->steer_via);
+				if (!sroute)
+					continue;
+				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
+					hadc_warn("executor: deleting steering route %s/1 via %s failed: %s",
+					    dstbuf, inet_ntoa(prev->steer_via), nl_geterror(ar));
+				else
+					hadc_info("executor: removed steering route %s/1 via %s (reason=%s)",
+					    dstbuf, inet_ntoa(prev->steer_via), reason);
+			}
+			n_vips = vip_splits(prev, &prev->steer_via, vips, VIP_SPLIT_MAX);
+			for (size_t i = 0; i < n_vips; i++) {
+				char dstbuf[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &vips[i].net, dstbuf, sizeof(dstbuf));
+				sroute = find_prefix_route(rcache, &vips[i].net, vips[i].plen, &prev->steer_via);
+				if (!sroute)
+					continue;
+				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
+					hadc_warn("executor: deleting steering route %s/%u via %s failed: %s",
+					    dstbuf, vips[i].plen, inet_ntoa(prev->steer_via), nl_geterror(ar));
+				else
+					hadc_info("executor: removed steering route %s/%u via %s (reason=%s)",
+					    dstbuf, vips[i].plen, inet_ntoa(prev->steer_via), reason);
+			}
+		}
 	}
 
 	if (desired->link_state == 2 && (rtnl_link_get_flags(link) & IFF_UP)) {
@@ -1525,6 +1917,8 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 	}
 
 	apply_slave_nft_block(desired->interface, desired->slave_nft_block, reason);
+
+	apply_demote_hold_nft(ctx, desired, prev, reason);
 
 	if (ctx->conf.apply.dns_hook[0]) {
 		char *argv[2] = { ctx->conf.apply.dns_hook, NULL };
@@ -1545,6 +1939,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 out:
 	if (!fatal) {
 		apply_disable_ipv6(ctx);
+		apply_rp_filter(ctx);
 		g_applied = *desired;
 		g_applied_valid = true;
 	}
@@ -1668,6 +2063,22 @@ int hadc_executor_announce_cluster(hadc_ctx_t *ctx)
 
 /* Block/unblock all egress on an interface via nft netdev hook while keeping
  * the link up (slave isolation alternative to bringing the link down). */
+/* Whitelist for interface names embedded in nft CLI arguments (the procfs
+ * strpbrk guard above rejects dots, which are normal in VLAN names and safe
+ * here: the name sits inside shell single quotes and nft's own quoting). */
+static bool nft_iface_ok(const char *ifname)
+{
+	if (!ifname[0])
+		return false;
+	for (const char *p = ifname; *p; p++) {
+		unsigned char c = (unsigned char)*p;
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		      (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+			return false;
+	}
+	return true;
+}
+
 static void nft_chain_name(const char *ifname, char *out, size_t outsz)
 {
 	size_t j = 0;
@@ -1713,6 +2124,201 @@ static void apply_slave_nft_block(const char *ifname, bool block, const char *re
 		else
 			hadc_dbg("executor: nft egress block clear for %s returned rc=%d (reason=%s)",
 			    ifname, rc, reason);
+	}
+}
+
+/* Seamless takeover, demoting-hold scoping (plan SEAMLESS_TAKEOVER.md):
+ *  - netdev egress chain per VIP interface dropping ARP replies whose sender IP
+ *    is a VIP (the demoting node keeps VIPs assigned during the hold but must
+ *    not claim them; the new master's GARPs are requests and pass untouched);
+ *  - ip-family output chain dropping locally-originated traffic sourced from a
+ *    VIP (forwarding only, no VIP-source traffic during the hold);
+ *  - NAT-bypass chains at prerouting/postrouting priority -300 (before the
+ *    firewall's conntrack/nat hooks) when NOTRACK is enabled: a fib rule
+ *    (daddr . iif lookup, so policy routing is respected) untracks exactly the
+ *    steered traffic whose FIB lookup exits via a fabric interface, plus the
+ *    return direction entering the fabric. NOTRACK must live here (prerouting):
+ *    state is created before the forward hook and SNAT runs after it, so a
+ *    NOTRACK rule on the outgoing interface alone would not bypass anything.
+ *    When a mark is configured it is set before the verdicts (it survives
+ *    untracking) as the firewall's scoping handle; the firewall must accept
+ *    untracked steered traffic in forward (ct state untracked accept) — see
+ *    SEAMLESS_FIREWALL_HOWTO.md.
+ * Scoped to the configured VIP set, active only while steering; reconciled on
+ * transitions only. */
+#define HADC_TAKEOVER_NFT_TABLE "ha_dhcpc_tk"
+
+static void demote_hold_signature(const hadc_desired_t *d, char *out, size_t outsz)
+{
+	size_t n;
+
+	if (!d) {
+		snprintf(out, outsz, "none");
+		return;
+	}
+	n = snprintf(out, outsz, "%d|%u|%d|", d->vip_hold_suppress ? 1 : 0,
+	    (unsigned)d->nat_bypass_mark, d->nat_bypass_notrack ? 1 : 0);
+	for (size_t i = 0; i < d->n_cluster_ifaces && n < outsz - 1; i++) {
+		const hadc_cluster_if_t *ci = &d->cluster_ifaces[i];
+		for (size_t j = 0; j < ci->n_addrs && n < outsz - 40; j++)
+			n += (size_t)snprintf(out + n, outsz - n, "%s%s/%u", j ? " " : "a=",
+			    inet_ntoa(ci->addrs[j].address), ci->addrs[j].prefixlen);
+		if (n < outsz - 1)
+			n += (size_t)snprintf(out + n, outsz - n, ";");
+	}
+}
+
+static int nft_run(const char *cmd, const char *reason, bool enable)
+{
+	int rc = system(cmd);
+	if (rc != 0 && enable)
+		hadc_warn("executor: takeover nft failed (rc=%d, cmd=%s, reason=%s)", rc, cmd, reason);
+	else if (rc != 0)
+		hadc_dbg("executor: takeover nft cleanup rc=%d (cmd=%s, reason=%s)", rc, cmd, reason);
+	return rc;
+}
+
+static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired,
+    const hadc_desired_t *prev, const char *reason)
+{
+	char sig_new[6144], sig_old[6144];
+	char cmd[512], chain[80], san[64];
+	bool was_active, is_active;
+
+	demote_hold_signature(desired, sig_new, sizeof(sig_new));
+	demote_hold_signature(prev, sig_old, sizeof(sig_old));
+	if (prev && !strcmp(sig_new, sig_old))
+		return; /* no transition, no delta */
+
+	was_active = prev && (prev->vip_hold_suppress || prev->nat_bypass_mark ||
+	    prev->nat_bypass_notrack);
+	is_active = desired->vip_hold_suppress || desired->nat_bypass_mark ||
+	    desired->nat_bypass_notrack;
+	if (!was_active && !is_active)
+		return;
+
+	/* Tear down the previous scoping first (only our own chains; the netdev
+	 * table is shared with the slave egress block lifecycle). */
+	if (was_active) {
+		if (prev->vip_hold_suppress) {
+			for (size_t i = 0; i < prev->n_cluster_ifaces; i++) {
+				if (!prev->cluster_ifaces[i].n_addrs)
+					continue;
+				nft_chain_name(prev->cluster_ifaces[i].interface, san, sizeof(san));
+				snprintf(cmd, sizeof(cmd), "nft 'delete chain netdev ha_dhcpc ar_%s' 2>/dev/null", san);
+				nft_run(cmd, reason, false);
+			}
+			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " out' 2>/dev/null", reason, false);
+		}
+		if (prev->nat_bypass_mark || prev->nat_bypass_notrack) {
+			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " pre' 2>/dev/null", reason, false);
+			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " post' 2>/dev/null", reason, false);
+		}
+		if (!is_active)
+			nft_run("nft 'delete table ip " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null", reason, false);
+	}
+
+	if (!is_active) {
+		hadc_dbg("executor: takeover ARP/NAT scoping cleared (reason=%s)", reason);
+		return;
+	}
+
+	if (desired->vip_hold_suppress) {
+		for (size_t i = 0; i < desired->n_cluster_ifaces; i++) {
+			const hadc_cluster_if_t *ci = &desired->cluster_ifaces[i];
+			if (!ci->n_addrs || !nft_iface_ok(ci->interface))
+				continue;
+			nft_chain_name(ci->interface, san, sizeof(san));
+			snprintf(chain, sizeof(chain), "ar_%s", san);
+			snprintf(cmd, sizeof(cmd),
+			    "nft 'add table netdev ha_dhcpc' 2>/dev/null; "
+			    "nft 'delete chain netdev ha_dhcpc %s' 2>/dev/null; "
+			    "nft 'add chain netdev ha_dhcpc %s { type filter hook egress device \"%s\" priority 0; policy accept; }'",
+			    chain, chain, ci->interface);
+			nft_run(cmd, reason, true);
+			for (size_t j = 0; j < ci->n_addrs; j++) {
+				snprintf(cmd, sizeof(cmd),
+				    "nft 'add rule netdev ha_dhcpc %s ether type arp arp operation reply arp saddr ip %s drop'",
+				    chain, inet_ntoa(ci->addrs[j].address));
+				nft_run(cmd, reason, true);
+			}
+		}
+		nft_run("nft 'add table ip " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null; "
+		          "nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " out' 2>/dev/null; "
+		          "nft 'add chain ip " HADC_TAKEOVER_NFT_TABLE " out { type filter hook output priority -150; policy accept; }'",
+		          reason, true);
+		for (size_t i = 0; i < desired->n_cluster_ifaces; i++) {
+			const hadc_cluster_if_t *ci = &desired->cluster_ifaces[i];
+			for (size_t j = 0; j < ci->n_addrs; j++) {
+				snprintf(cmd, sizeof(cmd),
+				    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " out ip saddr %s drop'",
+				    inet_ntoa(ci->addrs[j].address));
+				nft_run(cmd, reason, true);
+			}
+		}
+		hadc_info("executor: takeover VIP ARP/source scoping active (reason=%s)", reason);
+	}
+
+	if (desired->nat_bypass_mark || desired->nat_bypass_notrack) {
+		uint32_t m = desired->nat_bypass_mark;
+		nft_run("nft 'add table ip " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null; "
+		          "nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " pre' 2>/dev/null; "
+		          "nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " post' 2>/dev/null; "
+		          "nft 'add chain ip " HADC_TAKEOVER_NFT_TABLE " pre { type filter hook prerouting priority -300; policy accept; }'; "
+		          "nft 'add chain ip " HADC_TAKEOVER_NFT_TABLE " post { type filter hook postrouting priority -300; policy accept; }'",
+		          reason, true);
+		/* Mark first (it must survive untracking so the firewall can still
+		 * match it), then the NOTRACK verdicts. NOTRACK here (prerouting,
+		 * before conntrack) is what keeps state and NAT off this node: the
+		 * fib rule untracks exactly the packets whose FIB lookup (iif included
+		 * so policy routing is respected) exits via a fabric interface — the
+		 * steered transit — and the iifname rule untracks the return direction
+		 * entering the fabric. The platform firewall must accept untracked
+		 * steered traffic in forward (ct state untracked accept). */
+		{
+			const char *in_ifaces[1 + HADC_CLUSTER_IF_MAX + HADC_CLUSTER_IF_MAX];
+			size_t n_in = 0;
+			if (m != 0) {
+				if (ctx->conf.interface[0])
+					in_ifaces[n_in++] = ctx->conf.interface;
+				for (size_t i = 0; i < ctx->conf.cluster.n_ifaces && n_in < sizeof(in_ifaces) / sizeof(in_ifaces[0]); i++)
+					if (ctx->conf.cluster.ifaces[i].interface[0])
+						in_ifaces[n_in++] = ctx->conf.cluster.ifaces[i].interface;
+				for (size_t i = 0; i < ctx->conf.ospf.n_interfaces && n_in < sizeof(in_ifaces) / sizeof(in_ifaces[0]); i++)
+					if (ctx->conf.ospf.interfaces[i][0])
+						in_ifaces[n_in++] = ctx->conf.ospf.interfaces[i];
+				for (size_t i = 0; i < n_in; i++) {
+					if (!nft_iface_ok(in_ifaces[i]))
+						continue;
+					snprintf(cmd, sizeof(cmd),
+					    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " pre iifname \"%s\" meta mark set 0x%x'",
+					    in_ifaces[i], m);
+					nft_run(cmd, reason, true);
+					snprintf(cmd, sizeof(cmd),
+					    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " post oifname \"%s\" meta mark set 0x%x'",
+					    in_ifaces[i], m);
+					nft_run(cmd, reason, true);
+				}
+			}
+			if (desired->nat_bypass_notrack) {
+				for (size_t i = 0; i < ctx->conf.ospf.n_interfaces; i++) {
+					const char *f = ctx->conf.ospf.interfaces[i];
+					if (!nft_iface_ok(f))
+						continue;
+					snprintf(cmd, sizeof(cmd),
+					    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " pre fib daddr . iif oifname \"%s\" notrack'",
+					    f);
+					nft_run(cmd, reason, true);
+					snprintf(cmd, sizeof(cmd),
+					    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " pre iifname \"%s\" notrack'",
+					    f);
+					nft_run(cmd, reason, true);
+				}
+			}
+		}
+		hadc_info("executor: takeover NAT-bypass active (mark 0x%x, notrack %s; "
+		          "zone-based firewalls must accept marked/untracked steered traffic; "
+		          "reason=%s)", m, desired->nat_bypass_notrack ? "on" : "off", reason);
 	}
 }
 

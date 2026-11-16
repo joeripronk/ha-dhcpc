@@ -67,6 +67,12 @@ static json_t *status_object(hadc_ctx_t *ctx)
     json_object_set_new(o, "graceful_restart",
         json_pack("{s:b, s:I}", "active", gr_active, "until_ms",
                   (json_int_t)ctx->graceful_restart_until_ms));
+    json_object_set_new(o, "demote_route_via_new_master",
+        json_pack("{s:b, s:b, s:b, s:s}",
+                  "configured", ctx->conf.apply.demote_route_via_new_master,
+                  "active", ctx->demote_route_via_new_master_active,
+                  "invalid", ctx->demote_route_via_new_master_invalid,
+                  "reason", ctx->demote_route_via_new_master_reason));
     json_object_set_new(o, "members", members);
     json_t *cluster = json_array();
     for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {

@@ -121,6 +121,10 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.apply.backup_gateway.s_addr != ctx->conf.apply.backup_gateway.s_addr ||
         next.apply.master_backup_gateway.s_addr != ctx->conf.apply.master_backup_gateway.s_addr ||
         next.apply.slave_isolation != ctx->conf.apply.slave_isolation ||
+        next.apply.slave_sync_wan != ctx->conf.apply.slave_sync_wan ||
+        next.apply.demote_route_via_new_master != ctx->conf.apply.demote_route_via_new_master ||
+        next.apply.demote_nat_bypass_mark != ctx->conf.apply.demote_nat_bypass_mark ||
+        next.apply.demote_notrack != ctx->conf.apply.demote_notrack ||
         next.apply.gateway_probe != ctx->conf.apply.gateway_probe ||
         next.apply.gateway_probe_interval_ms != ctx->conf.apply.gateway_probe_interval_ms ||
         next.apply.gateway_probe_timeout_ms != ctx->conf.apply.gateway_probe_timeout_ms ||
@@ -129,6 +133,7 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         next.apply.disable_ipv6 != ctx->conf.apply.disable_ipv6 ||
         next.apply.dhcp_disable_ipv6_set != ctx->conf.apply.dhcp_disable_ipv6_set ||
         next.apply.dhcp_disable_ipv6 != ctx->conf.apply.dhcp_disable_ipv6 ||
+        next.apply.disable_rp_filter != ctx->conf.apply.disable_rp_filter ||
         routing_changed;
 
     if (heartbeat)
@@ -171,6 +176,7 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     hadc_ospf_unlock();
     hadc_log_set_level(ctx->conf.loglevel);
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);
+    hadc_validate_demote_route_config(ctx, why ? why : "reload");
 
     {
         /* Cluster maintenance cadence depends on election deadline (heartbeat send

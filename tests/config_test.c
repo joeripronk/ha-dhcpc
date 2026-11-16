@@ -463,6 +463,39 @@ int main(void)
         write_file(local, "self: node-b\npriority: 90\n");
     }
 
+    /* apply.demote_nat_bypass_mark: default off, parses, range guard;
+     * apply.demote_notrack: default on, parses */
+    {
+        char cbuf[2048];
+        write_file(base, BASE_NOMAC);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("demote_nat_bypass_mark default load");
+        else if (conf.apply.demote_nat_bypass_mark != 0)
+            fail("demote_nat_bypass_mark default is off");
+        else if (!conf.apply.demote_notrack)
+            fail("demote_notrack default is on");
+        else
+            ok("demote_nat_bypass_mark default is off; demote_notrack default is on");
+
+        snprintf(cbuf, sizeof(cbuf), "%sapply:\n  demote_nat_bypass_mark: 11781\n  demote_notrack: false\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("demote_nat_bypass_mark parse");
+        else if (conf.apply.demote_nat_bypass_mark != 11781)
+            fail("demote_nat_bypass_mark parsed");
+        else if (conf.apply.demote_notrack)
+            fail("demote_notrack parsed false");
+        else
+            ok("demote_nat_bypass_mark parsed; demote_notrack parsed false");
+
+        snprintf(cbuf, sizeof(cbuf), "%sapply:\n  demote_nat_bypass_mark: 16777216\n", BASE_NOMAC);
+        write_file(base, cbuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("demote_nat_bypass_mark out of range refused");
+        else
+            ok("demote_nat_bypass_mark out of range refused");
+    }
+
     /* cluster: quorum defaults to majority; failover priority is explicit */
     write_file(base, BASE_NOMAC);
     unlink(local);

@@ -642,20 +642,28 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     g_rs.n_remote_cands = hadc_ospf_default_candidates(ctx, g_rs.remote_cands, HADC_ROUTING_MAX_CANDIDATES);
 
     /* Desired advertisements: local owned prefixes only, edge-only. Never publish
-     * backup routes; withdraw default-route advertisement while on backup. */
+     * backup routes; withdraw default-route advertisement while on backup.
+     * During demotion handoff hold keep public /32 and default route advertised
+     * and kernel default route retained until hold completes (VIPs already gone). */
+    bool demote_hold = (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold);
+    bool hold_bound = demote_hold && ctx->lease.address.s_addr != 0 &&
+                      !hadc_gwping_unreachable() &&
+                      (ctx->lease.state == HADC_LEASE_BOUND ||
+                       ctx->lease.state == HADC_LEASE_RENEW ||
+                       ctx->lease.state == HADC_LEASE_REBIND);
     bool want_pub = false;
     if (enabled && ctx->conf.routing.advertise.public_ip32 != HADC_ADV_PUB_OFF && ctx->lease.address.s_addr != 0) {
         if (ctx->conf.routing.advertise.public_ip32 == HADC_ADV_PUB_ALWAYS)
             want_pub = true;
         else
-            want_pub = healthy_bound;
+            want_pub = healthy_bound || hold_bound;
     }
     bool want_def = false;
     if (enabled && ctx->conf.routing.advertise.default_route != HADC_ADV_DEF_OFF && ctx->lease.address.s_addr != 0) {
         if (ctx->conf.routing.advertise.default_route == HADC_ADV_DEF_ALWAYS)
             want_def = true;
         else
-            want_def = healthy_bound && !backup;
+            want_def = (healthy_bound && !backup) || (hold_bound && !backup);
     }
 
     if (!enabled) {

@@ -1169,8 +1169,13 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             } else {
                 snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
                 /* Adopt self-mastery via the full promotion flow so dataplane and
-                 * the DHCP engine are started; never jump straight to MASTER. */
-                set_role(ctx, ours ? HADC_ROLE_PROMOTING : HADC_ROLE_SLAVE);
+                 * the DHCP engine are started; never jump straight to MASTER.
+                 * When yielding mastership, enter DEMOTING so VIPs drop immediately
+                 * but public IP and default route are held for the handoff window. */
+                set_role(ctx, ours ? HADC_ROLE_PROMOTING
+                                   : (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
+                                         ? HADC_ROLE_DEMOTING
+                                         : HADC_ROLE_SLAVE);
                 hadc_persist_save(ctx);
             }
         }
@@ -1715,7 +1720,9 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
     const char *target = (new_master_id && *new_master_id) ? new_master_id : ctx->conf.self;
     bool handoff = strcmp(target, ctx->conf.self) != 0;
 
-    if (!strcmp(ctx->conf.designated_master, target) && ((handoff && ctx->role == HADC_ROLE_SLAVE) || (!handoff && (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)))) {
+    if (!strcmp(ctx->conf.designated_master, target) &&
+        ((handoff && (ctx->role == HADC_ROLE_SLAVE || ctx->role == HADC_ROLE_DEMOTING)) ||
+         (!handoff && (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)))) {
         hadc_dbg("cluster: promote(%s) is idempotent (already master/promoting)", target);
         return 0;
     }
@@ -1735,7 +1742,14 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
     }
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
     if (handoff) {
-        set_role(ctx, HADC_ROLE_SLAVE);
+        if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
+            /* Controlled handoff: keep public IP/routing and forwarding briefly so
+             * in-flight traffic and return paths survive until the new master is
+             * ready. cb_role_change enters DEMOTING hold for handoff_hold_ms. */
+            set_role(ctx, HADC_ROLE_DEMOTING);
+        } else {
+            set_role(ctx, HADC_ROLE_SLAVE);
+        }
         /* An operator handoff to a lower-ranked member must not be immediately
            undone by this node's own preempt/election; the authority push below
            carries it cluster-wide. Failover (a dead master) is never suppressed. */
