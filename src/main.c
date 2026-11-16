@@ -622,11 +622,11 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "usage: %s [--conf path] [--local-conf path] [--persist path] [--oneshot]\n"
-            "       %s ctl <cmd> [--conf path] [--local-conf path]\n"
+            "       %s ctl|c <cmd> [--conf path] [--local-conf path]\n"
             "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
-            "ctl cmds: status promote demote reload graceful-restart "
-            "conf-status conf-sync conntrack-status conntrack-resync\n",
+            "ctl cmds (unambiguous prefixes ok): status|s promote|p demote|d update|u "
+            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync\n",
             argv0, argv0, argv0, argv0);
 }
 
@@ -917,6 +917,39 @@ static bool status_tok(const char *t, const char *full, const char *abbr)
     return !strcmp(t, full) || !strcmp(t, abbr);
 }
 
+/* Resolve unambiguous literal prefixes of ctl commands (and of the fixed
+ * arguments of graceful-restart/conntrack); anything else passes through to
+ * the daemon unchanged. */
+static const char *ctl_resolve(const char *tok, const char *cmd)
+{
+    static const char *cmds[] = {"promote", "demote", "status", "update", "renew",
+                                 "newip", "graceful-restart", "conntrack"};
+    static const char *gr_args[] = {"enable", "disable", "on", "off", "cancel"};
+    static const char *ct_args[] = {"resync"};
+    const char **set = cmds;
+    size_t n = sizeof(cmds) / sizeof(cmds[0]);
+    const char *match = NULL;
+    size_t tl = strlen(tok);
+
+    if (cmd && !strcmp(cmd, "graceful-restart")) {
+        set = gr_args;
+        n = sizeof(gr_args) / sizeof(gr_args[0]);
+    } else if (cmd && !strcmp(cmd, "conntrack")) {
+        set = ct_args;
+        n = sizeof(ct_args) / sizeof(ct_args[0]);
+    }
+    for (size_t i = 0; i < n; i++)
+        if (!strcmp(tok, set[i]))
+            return set[i];
+    for (size_t i = 0; i < n; i++)
+        if (tl > 0 && tl < strlen(set[i]) && !strncmp(tok, set[i], tl)) {
+            if (match)
+                return tok; /* ambiguous prefix: pass through */
+            match = set[i];
+        }
+    return match ? match : tok;
+}
+
 int main(int argc, char **argv)
 {
     const char *conf_path = "/etc/ha-dhcpc/ha-dhcpc.conf";
@@ -940,12 +973,21 @@ int main(int argc, char **argv)
             local_path = argv[++i];
             continue;
         }
-        if (!strcmp(argv[i], "ctl") && i + 1 < argc) {
+        if (status_tok(argv[i], "ctl", "c") && i + 1 < argc) {
             char cmd[256] = "";
+            const char *resolved_cmd = NULL;
             for (int j = i + 1; j < argc; j++) {
+                const char *tok = argv[j];
+                if (j == i + 1) {
+                    resolved_cmd = ctl_resolve(tok, NULL);
+                    tok = resolved_cmd;
+                } else if (j == i + 2 && resolved_cmd &&
+                           (!strcmp(resolved_cmd, "graceful-restart") ||
+                            !strcmp(resolved_cmd, "conntrack")))
+                    tok = ctl_resolve(tok, resolved_cmd);
                 if (cmd[0])
                     strncat(cmd, " ", sizeof(cmd) - strlen(cmd) - 1);
-                strncat(cmd, argv[j], sizeof(cmd) - strlen(cmd) - 1);
+                strncat(cmd, tok, sizeof(cmd) - strlen(cmd) - 1);
             }
             return ctl_client(conf_path, local_path, cmd);
         }
