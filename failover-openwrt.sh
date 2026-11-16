@@ -20,7 +20,8 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 : "${CLUSTER_HOSTS:=studeerkamer woonkamer meterkast}"
 ALL_HOSTS="$CLUSTER_HOSTS"
 # Capture every cluster node so old/new master (and any other participant) are covered.
-CAP_IFACES="br-lan.5 br-lan.300"
+# br-lan.11 is the cluster/OSPF fabric (heartbeats, OSPF, conntrack sync); br-lan.5/.300 are the data paths.
+CAP_IFACES="br-lan.5 br-lan.11 br-lan.300"
 PORT=""
 FROM=""
 TO=""
