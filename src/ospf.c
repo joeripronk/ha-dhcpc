@@ -1464,10 +1464,15 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
     }
 
     if (n->state == NSTATE_FULL) {
-        /* Duplicates are ignored (retransmit on timer). Non-duplicate DBD in
-         * Full is a sequence mismatch: restart adjacency. */
-        if (seq == n->dd_last_recv_seq)
+        /* Duplicate: the slave resends its ack so a master whose retransmit
+         * timer is still running hears it; the master ignores, or the two
+         * echo forever. Non-duplicate DBD in Full is a sequence mismatch:
+         * restart adjacency. */
+        if (seq == n->dd_last_recv_seq) {
+            if (!n->dd_master)
+                nbr_send_dbdesc(n, 0, seq, true);
             return;
+        }
         nbr_reset_exchange(n);
         n->state = NSTATE_EXSTART;
         n->dd_seq = (uint32_t)time(NULL);
