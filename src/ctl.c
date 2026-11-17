@@ -282,11 +282,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
         }
     } else if (!strcmp(cmd, "shutdown") || !strcmp(cmd, "kill") || !strcmp(cmd, "quit") || !strcmp(cmd, "stop")) {
         bool force = !strcmp(cmd, "kill") || !strcmp(arg, "now") || !strcmp(arg, "force");
-        hadc_info("ctl: %s%s", cmd, (!strcmp(cmd, "kill") || force) && strcmp(cmd, "kill") ? " now" : (!strcmp(cmd, "kill") ? "" : ""));
-        if (!strcmp(cmd, "kill"))
-            hadc_info("ctl: kill");
-        else
-            hadc_info("ctl: %s%s", cmd, force ? " now" : "");
+        hadc_info("ctl: %s%s", cmd, force && strcmp(cmd, "kill") ? " now" : "");
         if (ctx->conf.n_members == 0) {
             hadc_info("ctl shutdown: standalone shutdown, leaving service intact");
             ctx->shutting_down = true;
@@ -300,7 +296,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             ctx->shutting_down = true;
             ctx->running = false;
         } else if (force) {
-            hadc_warn("ctl shutdown now: no live peer available for handoff; shutting down without handoff");
+            hadc_warn("ctl shutdown: no live peer available for handoff; shutting down without handoff");
             ctx->shutting_down = true;
             ctx->running = false;
         } else {
