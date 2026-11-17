@@ -336,7 +336,8 @@ static void ctl_ready(hadc_ctx_t *ctx, int fd)
 int hadc_ctl_init(hadc_ctx_t *ctx)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctx->conf.ctl_socket);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.*s", (int)sizeof(addr.sun_path) - 1,
+             ctx->conf.ctl_socket);
 
     ctx->ctl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (ctx->ctl_fd < 0) {
@@ -391,7 +392,8 @@ int hadc_ctl_init(hadc_ctx_t *ctx)
 int hadc_ctl_rebind(hadc_ctx_t *ctx)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", ctx->conf.ctl_socket);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.*s", (int)sizeof(addr.sun_path) - 1,
+             ctx->conf.ctl_socket);
     if (ctx->ctl_fd >= 0 && strcmp(addr.sun_path, g_ctl_path) == 0)
         return 0;
 

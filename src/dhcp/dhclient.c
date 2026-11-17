@@ -2335,7 +2335,8 @@ rewrite_client_leases(void)
 		write_client_lease(ifi, ifi->client->active, 1);
 
 	fflush(leaseFile);
-	ftruncate(fileno(leaseFile), ftello(leaseFile));
+	int trunc_ok = ftruncate(fileno(leaseFile), ftello(leaseFile)) == 0; /* best effort */
+	(void)trunc_ok;
 	fsync(fileno(leaseFile));
 }
 

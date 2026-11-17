@@ -120,10 +120,17 @@ Components:
 - **Cluster state machine** — role state (master/slave), heartbeats, lease-state
   versioning, dead-master detection, quorum + priority election, dual-master
   resolution.
-- **Control interface** — local unix socket + `ha-dhcpc ctl promote|demote|status|update|renew`
-  for operators (and optional external supervisors). Idempotent, logged,
-  auditable; role changes propagate cluster-wide over the UDP control path, so
-  every member always knows who the master is.
+- **Control interface** — local unix socket + `ha-dhcpc ctl` for operators (and
+  optional external supervisors). Supported commands include `status`,
+  `promote <id>` / `demote <id>`, `update`, `renew`, `newip`, `shutdown [now]`
+  (`kill`/`quit`/`stop` also accepted), `graceful-restart enable|disable`, and
+  `conntrack resync`. Commands and fixed arguments accept unambiguous prefixes.
+  Idempotent, logged, auditable; role changes propagate cluster-wide over the UDP
+  control path, so every member always knows who the master is. `shutdown`
+  attempts a graceful master handoff before exit (if handoff is not possible,
+  plain shutdown is refused while `shutdown now`/`kill` forces exit); on
+  `SIGINT`/`SIGTERM` the daemon follows its configured signal action (default:
+  handoff on `SIGINT`, immediate shutdown on `SIGTERM`).
 - **Cluster addresses (VIPs)** — configured per interface; only the master adds
   them, so the kernel answers ARP/NS for them. On promotion the master announces
   them with a gratuitous ARP (refreshing switch CAM/fdb, as VRRP does), so traffic
@@ -181,13 +188,17 @@ Components:
 - **Gateway probes:** after a promote (or master startup) the master pings the
   lease gateway when `apply.gateway_probe` is enabled (default true), using
   `apply.gateway_probe_interval_ms` (default 10000), `apply.gateway_probe_timeout_ms`
-  (default 2000), and `apply.gateway_probe_fail_threshold` (default 3). It
-  surfaces silent uplink outages in the log — warn on first failover-threshold
-  failure (repeats at debug), info when it answers again. While a probe verdict
-  is unreachable, or while there is no lease IP yet, the default route moves to
+  (default 2000), `apply.gateway_probe_fail_threshold` (default 3), and
+  `apply.gateway_probe_start_delay_ms` (default 5000) to delay the first probe
+  after promotion. Probing runs on the master only. It surfaces silent uplink
+  outages in the log — warn on first failover-threshold failure (repeats at
+  debug), info when it answers again. While a probe verdict is unreachable, or
+  while there is no lease IP yet, the default route moves to
   `apply.master_backup_gateway` if it is set, and hands back to the lease
-  gateway as soon as the gateway answers again. Gateways that filter ICMP echo
-  therefore also trigger the failover (routing/ARP is otherwise unaffected).
+  gateway as soon as the gateway answers again. The master also reacts with DHCP
+  recovery actions (renew, escalating to a forced DISCOVER after prolonged
+  unreachability) while retained. Gateways that filter ICMP echo therefore also
+  trigger the failover (routing/ARP is otherwise unaffected).
 - **Safety rules:** only the master sends DHCP packets; only the master may
   DECLINE/RELEASE; slaves never expire the lease; a node in the minority partition
   keeps its config (retention) and does not self-promote (`quorum: majority`);
@@ -270,36 +281,39 @@ cluster:
     br-lan: [192.168.10.1/24]  # CIDR or dotted netmask (192.168.10.1/255.255.255.0)
     br-guest: [192.168.20.1/24]
 default_role: slave            # master = bootstrap election when no master is known
-dhcp:
-  retention: forever          # forever | max_duration | until_carrier_loss | off
-  rediscover_in_retention: true
-  rate_limit_ms: 10000       # min ms between DHCP packets we send (0=off);
-                             # required for Odido NL fiber (>= 10 s spacing)
-  renew_retry_interval_s: 30 # retry interval after a failed RENEW/REBIND
-                             # (0 = exponential backoff)
-  request_options: [1, 3, 6, 15, 26, 28, 42, 121]
-apply:
-  routes: true
-  backup_gateway: ""          # optional; slave-only backup default route (e.g.
-                              # 192.168.10.1 on the OpenWrt routers). Installed
-                              # with a higher metric while the node is a slave
-                              # and removed again on promotion; usually set per
-                              # node in ha-dhcpc-local.conf.
-  master_backup_gateway: ""   # optional; master-only: this nexthop takes over
-                              # the default route while the gateway probe is
-                              # unanswered or there is no lease IP yet, and hands
-                              # back when the gateway answers again.
-  dns_hook: /usr/lib/ha-dhcpc/hooks/resolvconf   # optional
-  ddclient: /usr/bin/ddclient   # optional; run as a one-shot (ddclient -daemon=0
-                                # -syslog) when the applied address changes, on the
-                                # master only (the node that owns the public IP)
-  suppress_member_dad: true  # compatibility no-op (only the master owns the VIP)
-  arp_responder: true        # compatibility no-op (the kernel answers on the owner)
-  announce_gratuitous: true  # gratuitous ARP to the switch on promotion
-  # slave_isolation: down    # slave behavior: none|down|nft (nft blocks all
-                             # egress via netdev hook while link stays up;
-                             # tcpdump still sees outbound). slave_link_down: true
-                             # remains a legacy alias for down.
+  dhcp:
+    retention: forever          # forever | max_duration | until_carrier_loss | off
+    rediscover_in_retention: true
+    rate_limit_ms: 10000       # min ms between DHCPDISCOVER packets we send (0=off);
+                               # other packets (e.g. REQUEST) are not paced.
+                               # Required for some ISPs/fiber (>= 10 s spacing)
+    renew_retry_interval_s: 30 # retry interval after a failed RENEW/REBIND
+                               # (0 = exponential backoff)
+    request_options: [1, 3, 6, 15, 26, 28, 42, 121]
+   apply:
+     routes: true
+     backup_gateway: ""          # optional; slave-only backup default route (e.g.
+                                 # 192.168.10.1 on the OpenWrt routers). Installed
+                                 # with a higher metric while the node is a slave
+                                 # and removed again on promotion; usually set per
+                                 # node in ha-dhcpc-local.conf.
+     gateway_probe: true         # master-only ping probe of the lease gateway
+     gateway_probe_start_delay_ms: 5000
+     master_backup_gateway: ""   # optional; master-only: this nexthop takes over
+                                 # the default route while the gateway probe is
+                                 # unanswered or there is no lease IP yet, and hands
+                                 # back when the gateway answers again.
+     dns_hook: /usr/lib/ha-dhcpc/hooks/resolvconf   # optional
+     ddclient: /usr/bin/ddclient   # optional; run as a one-shot (ddclient -daemon=0
+                                   # -syslog) when the applied address changes, on the
+                                   # master only (the node that owns the public IP)
+     suppress_member_dad: true  # compatibility no-op (only the master owns the VIP)
+     arp_responder: true        # compatibility no-op (the kernel answers on the owner)
+     announce_gratuitous: true  # gratuitous ARP to the switch on promotion
+     # slave_isolation: down    # slave behavior: none|down|nft (nft blocks all
+                                # egress via netdev hook while link stays up;
+                                # tcpdump still sees outbound). slave_link_down: true
+                                # remains a legacy alias for down.
 ctl_socket: /run/ha-dhcpc.ctl
 lease_file: dhclient.leases  # optional; relative names resolve against this
                              # file's directory (/etc/ha-dhcpc/); none/off opts
@@ -326,13 +340,14 @@ apply:
 
 **What a reload applies live:** the heartbeat timer, the cluster transport bind
 (port or this node's sync address), the ctl socket, the DHCP send knobs
-(retention, rate limit, renew retry), members, priority, `default_role`, the
-election timers/quorum, the cluster addresses, and an executor re-apply — an
-interface change moves the address on the new interface and the engine re-enters
-there (master-only). **What needs a
-restart:** requested DHCP options and the hook script (read at engine start). A
-file that no longer parses is refused and the config in use is kept, so a bad edit
-never takes a live node down.
+(retention, rate limit, renew retry, rediscover-in-retention, lease DB path),
+members, priority, `default_role`, the election timers/quorum/preempt, cluster
+and neighbor-sync settings, cluster addresses, routing/OSPF/conntrack-sync
+settings, and an executor/routing re-apply. An interface change restarts the
+DHCP engine on the new interface (master-only). **What needs a restart:**
+requested DHCP options and the hook/DNS script (read at engine start). A file
+that no longer parses, or an identity-inconsistent config, is refused and the
+config in use is kept, so a bad edit never takes a live node down.
 
 The node's state file (cluster view + full lease information, JSON, fsynced)
 defaults to **`state.json` next to the shared config** — `/etc/ha-dhcpc/state.json`
@@ -351,8 +366,11 @@ roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault
   cluster/sync/ctl. Config application via libnl/netlink. Minimal deps.
 - **Deployment:** systemd unit on all members (role is runtime state, not
   config); failover and the VIP are built in, so keepalived is optional.
-- **Observability:** `ha-dhcpc status` + JSON over the local control socket
-  (role, versions, apply-acks, retention state, timers); structured logs.
+- **Observability:** `ha-dhcpc status`/`ha-dhcpc ctl status` + JSON over the
+  local control socket (role, versions, apply-acks, retention state, timers,
+  executor/drift/monitor state, gateway-probe, conntrack/routing status, etc.);
+  the CLI can render human-readable section views (`cluster`, `ip`, `ospf`) and
+  `detailed`; structured logs.
 - **Compat mode:** single-node operation = cluster of one (no election needed),
   retention still applies — useful as a standalone hardened dhclient.
 
@@ -360,15 +378,15 @@ roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault
 
 - Slaves must not apply state older than their last acked version (versioned
   full-state transfer closes the gap atomically).
-- Clock jumps / monotonic timers: all lease timers are monotonic, persisted as
-  remaining time, not wall-clock deadlines. The persisted remainders are the
-  values at save time; on restart they are recalculated from UTC
-  (`saved_at_utc` in state.json minus the downtime, clamped at zero), so a node
-  down through its renewal window acts at boot instead of waiting the stale
-  value. Adopted peer state and promotions age the same remainders from the last
-  observed lease time before arming timers. Sanity check: a `saved_at_utc` ahead
-  of the clock, or downtime beyond `min(2 × t3, 24 h)`, is not trusted and the
-  stored remainders are kept as they are.
+- Clock jumps / monotonic timers: lease timers are persisted and exchanged as
+  absolute UTC anchors (`t1_at_utc`/`t2_at_utc`/`t3_at_utc`) together with the
+  saved/observed time, so remaining time is derived from the current UTC clock
+  rather than from a stale countdown. On restart the state is aged from
+  `saved_at_utc` (clamped at zero), so a node down through its renewal window
+  acts at boot instead of waiting a stale interval. Adopted peer state and
+  promotions age timers from the last observed lease time before arming them.
+  Sanity checks reject implausible saved timestamps/downtime so bad clocks do
+  not rewind timers.
 - Master restart: rejoin via persistence + full-state exchange; the persisted
   `master_id` restores the agreed master, so a restarting master either resumes
   its role or follows the current master. A startup gate makes "never a second

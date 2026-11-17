@@ -204,7 +204,7 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
         size_t n = snprintf(conf, sizeof(conf),
                             "request subnet-mask, routers, domain-name-servers, "
                             "dhcp-server-identifier;\n");
-        snprintf(conf + n, sizeof(conf) - n, "script \"%s\";\n",
+        snprintf(conf + n, sizeof(conf) - n, "script \"%.*s\";\n", (int)sizeof(conf) - 16 - (int)n,
                  ctx->conf.apply.dns_hook[0] != '\0' ? ctx->conf.apply.dns_hook
                                                     : "");
         dhcp_core_set_conf_text(conf);
@@ -382,7 +382,6 @@ int hadc_dhcpcore_force_renew(hadc_ctx_t *ctx)
 int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
     char path[PATH_MAX], tmp[PATH_MAX + 8], buf[64], buf2[64];
-    time_t now = time(NULL);
     FILE *f;
 
     if (lease->address.s_addr == 0)

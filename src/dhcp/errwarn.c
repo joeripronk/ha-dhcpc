@@ -211,7 +211,8 @@ parse_warn(const char *fmt, ...)
 	    "                                        "; /* 80 spaces */
 
 	do_percentm(mbuf, sizeof(mbuf), fmt);
-	snprintf(fbuf, sizeof(fbuf), "%s line %d: %s", tlname, lexline, mbuf);
+	snprintf(fbuf, sizeof(fbuf), "%.*s line %d: %.*s", (int)sizeof(fbuf) / 4 - 8, tlname, lexline,
+	         (int)sizeof(fbuf) / 4 * 3 - 16, mbuf);
 	va_start(list, fmt);
 	vsnprintf(mbuf, sizeof(mbuf), fbuf, list);
 	va_end(list);

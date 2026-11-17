@@ -24,7 +24,7 @@ Passwordless sudo is available on this machine. Use the provided deploy scripts 
 - Script: `./deploy-openwrt.sh` (builds package with `./build-openwrt.sh`/OpenWrt SDK and deploys via `ssh`/`scp` to cluster nodes as `root@<host>`, installs apk, restarts service).
 - **Graceful deploy flow**: identifies master, enables graceful-restart window, deploys to hosts (slaves then master), then disables; aborts if a single master cannot be identified/enabled to avoid VIP loss.
 - Dry-run (no build/install/restart side effects): `./deploy-openwrt.sh --dry-run`
-- Useful options: `--no-build` (deploy newest existing SDK apk), `--with-valgrind`, or pass an explicit `apk-path` (implies `--no-build`).
+- Useful options: `--no-build` (deploy newest existing SDK apk) or pass an explicit `apk-path` (implies `--no-build`). Valgrind is toggled per node via `/etc/ha-dhcpc/valgrind.enabled` (the init script honors it).
 - Requires OpenWrt SDK/toolchain access as configured by `build-openwrt.sh`/`OPENWRT_SDK` and SSH reachability to the configured hosts.
 
 ## Guidelines

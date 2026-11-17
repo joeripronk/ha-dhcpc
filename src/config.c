@@ -1219,7 +1219,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             *slash = '\0';
             snprintf(dir, sizeof(dir), "%s", out->base_path);
             *slash = '/';
-            snprintf(out->lease_file, HADC_PATH_MAX, "%s/%s", dir, lf);
+            snprintf(out->lease_file, HADC_PATH_MAX, "%.*s/%.*s", (HADC_PATH_MAX - 2) / 2, dir,
+                     (HADC_PATH_MAX - 2) / 2, lf);
         } else {
             snprintf(out->lease_file, HADC_PATH_MAX, "./%s", lf);
         }

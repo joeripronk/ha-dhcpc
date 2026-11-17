@@ -665,7 +665,8 @@ static int ctl_client(const char *conf_path, const char *local_path, const char 
     }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", conf.ctl_socket);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.*s", (int)sizeof(addr.sun_path) - 1,
+             conf.ctl_socket);
     if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr, "ha-dhcpc ctl: connect %s: %s\n", conf.ctl_socket, strerror(errno));
         return 1;
@@ -909,7 +910,8 @@ static int status_client(const char *conf_path, const char *local_path,
     }
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", conf.ctl_socket);
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.*s", (int)sizeof(addr.sun_path) - 1,
+             conf.ctl_socket);
     if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         fprintf(stderr, "ha-dhcpc status: connect %s: %s\n", conf.ctl_socket, strerror(errno));
         return 1;
@@ -1095,7 +1097,8 @@ int main(int argc, char **argv)
         char *slash = strrchr(dir, '/');
         if (slash) {
             *slash = '\0';
-            snprintf(persist_default, sizeof(persist_default), "%s/state.json", dir);
+            snprintf(persist_default, sizeof(persist_default), "%.*s/state.json",
+                     (int)sizeof(persist_default) - 12, dir);
         } else {
             snprintf(persist_default, sizeof(persist_default), "/var/lib/ha-dhcpc/state.json");
         }

@@ -22,7 +22,7 @@ Actively developed and used in deployment-specific setups. Core HA DHCP function
 
 - **Cluster & roles:** heartbeat-based membership, quorum/priority election and preemption controls, master/slave/promoting/demoting states, role propagation, manual `ctl promote|demote`, graceful restart handling, startup/join state restore from persisted cluster/lease view.
 - **DHCP & lease handling:** vendored FreeBSD-derived dhclient engine (`src/dhcp/`), master-only DHCP protocol/timers, shared MAC identity, lease persistence, retention behavior, renew/rebind flow and `ctl renew`.
-- **Config & control:** shared `ha-dhcpc.conf` + local overlay merge, config digest/sync, `ctl status|update|shutdown`, JSON status, unix control socket.
+- **Config & control:** shared `ha-dhcpc.conf` + local overlay merge, config digest/sync, `ctl` for status, update, renew, promote/demote, graceful restart, shutdown (`shutdown now`/`kill` to force), and `conntrack resync`, JSON status over a unix control socket.
 - **Executor/apply:** idempotent netlink-based reconcile of addresses/routes, VIP ownership and gratuitous ARP, slave isolation behavior, hook/DNS/ddclient integration points, gateway probe and backup-gateway handling, drift reconciliation/monitoring.
 - **Neighbor sync:** optional sync of REACHABLE VIP/interface neighbors to peers for smoother takeover.
 - **Conntrack sync (v1, IPv4):** optional master-push TCP replication worker (`conntrack_sync`) with snapshot/incremental updates, staged apply on replicas, non-local classification, helper/SIP awareness (best-effort/capability-gated), status and `ctl conntrack resync`.
@@ -40,7 +40,7 @@ Actively developed and used in deployment-specific setups. Core HA DHCP function
 
 ## Repository layout
 
-- `src/`, `include/ha-dhcpc/` — daemon implementation (`src/dhcp/` contains the vendored DHCP client engine)
+- `src/`, `include/ha-dhcpc/` — daemon implementation (`src/dhcp/` contains the vendored FreeBSD/ISC-derived DHCP client engine)
 - `tests/` — unit/integration test sources and scripts
 - `production/` — deployment-specific configs/units (host router, OpenWrt examples)
 - `HA-DHCPC.md` — primary design document
@@ -69,12 +69,17 @@ make CROSS_COMPILE=/path/to/toolchain/bin/<target>- \
 Typical runtime operations (exact commands/options depend on build/config):
 
 ```sh
-ha-dhcpc --help
 ha-dhcpc ctl status
 ha-dhcpc ctl promote <id> | ha-dhcpc ctl demote <id>
 ha-dhcpc ctl update
 ha-dhcpc ctl renew
+ha-dhcpc ctl newip                  # master: force a fresh DISCOVER
+ha-dhcpc ctl graceful-restart enable|disable
+ha-dhcpc ctl shutdown [now]         # kill/quit/stop also accepted
+ha-dhcpc ctl conntrack resync
 ```
+
+`status` also works without `ctl` and accepts section/detail arguments (e.g. `ha-dhcpc status cluster`, `status ip`, `status ospf routes|neighbors`, `status detailed`). Unambiguous command/argument prefixes are accepted.
 
 ## Testing and deployment notes
 
