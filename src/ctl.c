@@ -280,19 +280,29 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
         } else {
             reply = "{\"ok\":false,\"error\":\"usage: conntrack resync\"}";
         }
-    } else if (!strcmp(cmd, "shutdown") || !strcmp(cmd, "quit") || !strcmp(cmd, "stop")) {
-        hadc_info("ctl: shutdown");
-        if (hadc_cluster_graceful_active(ctx)) {
+    } else if (!strcmp(cmd, "shutdown") || !strcmp(cmd, "kill") || !strcmp(cmd, "quit") || !strcmp(cmd, "stop")) {
+        bool force = !strcmp(arg, "now") || !strcmp(arg, "force");
+        hadc_info("ctl: %s%s", cmd, force ? " now" : "");
+        if (ctx->conf.n_members == 0) {
+            hadc_info("ctl shutdown: standalone shutdown, leaving service intact");
+            ctx->shutting_down = true;
+            ctx->running = false;
+        } else if (hadc_cluster_graceful_active(ctx)) {
             hadc_info("ctl shutdown: graceful restart active, shutting down without handoff/teardown");
+            ctx->shutting_down = true;
+            ctx->running = false;
         } else if ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && hadc_cluster_handoff(ctx)) {
             hadc_info("ctl shutdown: handed off before shutdown");
-        } else if (ctx->conf.n_members == 0) {
-            hadc_info("ctl shutdown: standalone shutdown, leaving service intact");
+            ctx->shutting_down = true;
+            ctx->running = false;
+        } else if (force) {
+            hadc_warn("ctl shutdown now: no live peer available for handoff; shutting down without handoff");
+            ctx->shutting_down = true;
+            ctx->running = false;
         } else {
-            hadc_info("ctl shutdown: shutting down");
+            hadc_warn("ctl shutdown: no live peer available for handoff; shutdown cancelled (use 'shutdown now')");
+            reply = "{\"ok\":false,\"error\":\"no live peer for handoff\"}";
         }
-        ctx->shutting_down = true;
-        ctx->running = false;
     } else {
         hadc_warn("ctl: unknown command '%s'", cmd);
         reply = "{\"ok\":false}";

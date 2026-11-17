@@ -27,6 +27,11 @@
 #define HADC_CONF_SHA_HEX 65 /* sha256 hex + NUL */
 #define HADC_CONF_MAX_BYTES 16384 /* shared-document file cap (plan §6 sync) */
 
+typedef enum {
+    HADC_SHUTDOWN_HANDOFF = 0,
+    HADC_SHUTDOWN_NOW = 1,
+} hadc_shutdown_action_t;
+
 /* Effective (merged) configuration. */
 typedef struct {
     /* identity: per-node fields come from the local overlay */
@@ -125,6 +130,10 @@ typedef struct {
         bool dhcp_disable_ipv6;
         bool disable_rp_filter;        /* disable rp_filter on managed ifaces (default on for seamless takeover) */
     } apply;
+    struct {
+        hadc_shutdown_action_t sigint_action;
+        hadc_shutdown_action_t sigterm_action;
+    } signal;
     struct {
         bool enabled;
         struct {

@@ -219,31 +219,43 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
     struct signalfd_siginfo si;
     (void)!read(fd, &si, sizeof(si));
     if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
-        {
-            uint32_t t1, t2, t3;
-            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
-            hadc_info("shutdown: role=master lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
-                      hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
-        }
+        uint32_t t1, t2, t3;
+        hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
+        hadc_info("shutdown: role=master lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                  hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
     }
-    /* Graceful exit: a master hands the role to the best live peer so the
-     * cluster elects a new master immediately. With no live peer (or not the
-     * master) it just shuts down and leaves service intact — a lone/partitioned
-     * master must not withdraw the VIP. During graceful cluster restart the
-     * master must not hand off and service (VIP/lease config) is left applied. */
+
+    bool force = false;
+    if (si.ssi_signo == SIGTERM)
+        force = (ctx->conf.signal.sigterm_action == HADC_SHUTDOWN_NOW);
+    else
+        force = (ctx->conf.signal.sigint_action == HADC_SHUTDOWN_NOW);
+
+    if (ctx->conf.n_members == 0) {
+        hadc_info("signal %u received; standalone shutdown, leaving service intact", si.ssi_signo);
+        ctx->shutting_down = true;
+        ctx->running = false;
+        return;
+    }
     if (hadc_cluster_graceful_active(ctx)) {
-        hadc_info("signal %u received; graceful restart active, shutting down "
-                  "without handoff/teardown", si.ssi_signo);
-    } else if ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && hadc_cluster_handoff(ctx)) {
-        hadc_info("signal %u received; handed off before shutdown", si.ssi_signo);
-    } else {
-        if (ctx->conf.n_members == 0)
-            hadc_info("signal %u received; standalone shutdown, leaving service intact", si.ssi_signo);
-        else
-            hadc_info("signal %u received; shutting down", si.ssi_signo);
+        hadc_info("signal %u received; graceful restart active, shutting down without handoff/teardown", si.ssi_signo);
+        ctx->shutting_down = true;
+        ctx->running = false;
+        return;
     }
-    ctx->shutting_down = true;
-    ctx->running = false;
+    if ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && hadc_cluster_handoff(ctx)) {
+        hadc_info("signal %u received; handed off before shutdown", si.ssi_signo);
+        ctx->shutting_down = true;
+        ctx->running = false;
+        return;
+    }
+    if (force) {
+        hadc_warn("signal %u received; no live peer available for handoff, shutting down without handoff", si.ssi_signo);
+        ctx->shutting_down = true;
+        ctx->running = false;
+        return;
+    }
+    hadc_warn("signal %u received; no live peer available for handoff, shutdown cancelled", si.ssi_signo);
 }
 
 /* DHCP engine callbacks (dhcpcore adapter -> daemon). */
@@ -622,7 +634,7 @@ static void usage(const char *argv0)
             "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
             "ctl cmds (unambiguous prefixes ok): status|s promote|p demote|d update|u "
-            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown\n",
+            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown|kill [now]\n",
             argv0, argv0, argv0, argv0);
 }
 
@@ -944,9 +956,10 @@ static bool status_tok(const char *t, const char *full, const char *abbr)
 static const char *ctl_resolve(const char *tok, const char *cmd)
 {
     static const char *cmds[] = {"promote", "demote", "status", "update", "renew",
-                                 "newip", "graceful-restart", "conntrack", "shutdown"};
+                                 "newip", "graceful-restart", "conntrack", "shutdown", "kill"};
     static const char *gr_args[] = {"enable", "disable", "on", "off", "cancel"};
     static const char *ct_args[] = {"resync"};
+    static const char *sd_args[] = {"now", "force"};
     const char **set = cmds;
     size_t n = sizeof(cmds) / sizeof(cmds[0]);
     const char *match = NULL;
@@ -958,6 +971,9 @@ static const char *ctl_resolve(const char *tok, const char *cmd)
     } else if (cmd && !strcmp(cmd, "conntrack")) {
         set = ct_args;
         n = sizeof(ct_args) / sizeof(ct_args[0]);
+    } else if (cmd && (!strcmp(cmd, "shutdown") || !strcmp(cmd, "kill"))) {
+        set = sd_args;
+        n = sizeof(sd_args) / sizeof(sd_args[0]);
     }
     for (size_t i = 0; i < n; i++)
         if (!strcmp(tok, set[i]))

@@ -764,6 +764,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         out->apply.disable_ipv6 = true;
         out->apply.dhcp_disable_ipv6_set = false;
         out->apply.disable_rp_filter = true;
+        out->signal.sigint_action = HADC_SHUTDOWN_HANDOFF;
+        out->signal.sigterm_action = HADC_SHUTDOWN_NOW;
         if (a) {
         if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
         if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
