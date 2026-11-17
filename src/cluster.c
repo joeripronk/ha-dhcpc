@@ -582,7 +582,7 @@ static void parse_vip_neighs(json_t *vn, hadc_ctx_t *ctx)
 
 static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
 {
-    json_t *m = json_pack("{s:s, s:s, s:s, s:I, s?:s}", "type", type, "origin", ctx->conf.self,
+    json_t *m = json_pack("{s:s, s:s, s:s, s:I, s:s?}", "type", type, "origin", ctx->conf.self,
                            "master_id", ctx->conf.designated_master, "lease_version",
                            (json_int_t)ctx->lease.version, "role", hadc_role_name(ctx->role));
     if (!m)
