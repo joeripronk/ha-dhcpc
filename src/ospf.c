@@ -1380,6 +1380,7 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         n->state = NSTATE_EXCHANGE;
         n->dd_master = false;
         n->dd_seq = seq;
+        n->dd_last_recv_seq = seq;
         send_lsreq_missing(n, pkt, len);
         nbr_send_dbdesc(n, 0, seq, true);
         if (!nbr_has_lsreq(n)) {
