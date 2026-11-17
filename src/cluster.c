@@ -53,6 +53,7 @@ static void (*g_role_hook)(void *arg, hadc_role_t old_role, hadc_role_t new_role
 static void *g_role_hook_arg;
 static uint64_t g_cluster_start_ms;
 static uint64_t g_no_elect_until_ms; /* manual demote cooldown */
+static uint64_t g_handoff_until_ms;  /* authoritative handoff: suppress preempt/election, not failover */
 static struct sockaddr_in g_bound; /* what udp_fd is bound to (rebind check) */
 
 static void propagate_role(hadc_ctx_t *ctx);
@@ -1180,7 +1181,11 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                           ctx->conf.designated_master[0] ? ctx->conf.designated_master : "(none)");
                 propagate_role(ctx);
             } else {
+                bool handoff = authority && strcmp(msg.origin, ctx->conf.self) != 0 &&
+                               strcmp(msg.new_master, msg.origin) != 0;
                 snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
+                if (handoff)
+                    g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000;
                 /* Adopt self-mastery via the full promotion flow so dataplane and
                  * the DHCP engine are started; never jump straight to MASTER.
                  * When yielding mastership, enter DEMOTING so VIPs drop immediately
@@ -1450,7 +1455,8 @@ static void preempt_check(hadc_ctx_t *ctx)
         return;
     if (ctx->role != HADC_ROLE_SLAVE)
         return;
-    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
+    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms ||
+        (uint64_t)hadc_now_ms() < g_handoff_until_ms)
         return;
     if (!ctx->conf.designated_master[0] ||
         !strcmp(ctx->conf.designated_master, ctx->conf.self))
@@ -1580,7 +1586,8 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     }
     if (!ctx->conf.default_role_master)
         return;
-    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms)
+    if ((uint64_t)hadc_now_ms() < g_no_elect_until_ms ||
+        (uint64_t)hadc_now_ms() < g_handoff_until_ms)
         return;
     if (ctx->conf.designated_master[0] != '\0')
         return; /* a master is known: configured or elected */
@@ -1767,6 +1774,7 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
            undone by this node's own preempt/election; the authority push below
            carries it cluster-wide. Failover (a dead master) is never suppressed. */
         g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
+        g_handoff_until_ms = g_no_elect_until_ms;
     } else {
         /* self-promote: enter PROMOTING; cb_role_change will complete and flip to MASTER
          * only after dataplane+VIP+GARP are ready so heartbeats announce readiness. */
