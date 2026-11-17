@@ -531,14 +531,19 @@ static void send_to(struct in_addr dst, unsigned ifindex, const uint8_t *pkt, si
     da.sin_addr = dst;
 
     if (ifindex) {
-        /* prefer interface addr as multicast source when possible */
         for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
             if (g_ospf.ifaces[i].ifindex == ifindex && g_ospf.ifaces[i].up) {
-                struct ip_mreqn mreq;
-                memset(&mreq, 0, sizeof(mreq));
-                mreq.imr_address = g_ospf.ifaces[i].addr;
-                mreq.imr_ifindex = (int)ifindex;
-                setsockopt(g_ospf.fd, IPPROTO_IP, IP_MULTICAST_IF, &mreq, sizeof(mreq));
+                static unsigned last_ifindex;
+                static uint32_t last_addr;
+                if (last_ifindex != ifindex || last_addr != g_ospf.ifaces[i].addr.s_addr) {
+                    struct ip_mreqn mreq;
+                    memset(&mreq, 0, sizeof(mreq));
+                    mreq.imr_address = g_ospf.ifaces[i].addr;
+                    mreq.imr_ifindex = (int)ifindex;
+                    (void)setsockopt(g_ospf.fd, IPPROTO_IP, IP_MULTICAST_IF, &mreq, sizeof(mreq));
+                    last_ifindex = ifindex;
+                    last_addr = g_ospf.ifaces[i].addr.s_addr;
+                }
                 break;
             }
         }
@@ -1383,7 +1388,6 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
         } else {
             n->state = NSTATE_LOADING;
         }
-        flood_lsas_to_neighbor(n, false);
         return;
     }
 
@@ -1403,7 +1407,6 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
             } else if (!(flags & OSPF_DD_FLAG_M)) {
                 n->state = NSTATE_LOADING;
             }
-            flood_lsas_to_neighbor(n, false);
             return;
         } else if (!(flags & OSPF_DD_FLAG_I) && (flags & OSPF_DD_FLAG_MS) &&
                    g_ospf.router_id < n->router_id) {
@@ -1419,12 +1422,9 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
     }
 
     if (n->state == NSTATE_EXCHANGE || n->state == NSTATE_LOADING) {
-        /* duplicate: retransmit last DBD */
-        if (seq == n->dd_last_recv_seq) {
-            if (n->last_dbd_len)
-                send_to(n->ip, n->ifindex, n->last_dbd, n->last_dbd_len);
+        /* duplicate: retransmit on timer, not per packet */
+        if (seq == n->dd_last_recv_seq)
             return;
-        }
 
         send_lsreq_missing(n, pkt, len);
         n->dd_last_recv_seq = seq;
@@ -1459,16 +1459,19 @@ static void handle_dbdesc(const uint8_t *pkt, size_t len, struct in_addr src, os
                 n->state = nbr_has_lsreq(n) ? NSTATE_LOADING : NSTATE_EXCHANGE;
             }
         }
-        flood_lsas_to_neighbor(n, false);
         return;
     }
 
     if (n->state == NSTATE_FULL) {
-        /* in full state, duplicates are possible; if master DBD maybe retransmit ack */
-        if (seq == n->dd_last_recv_seq && n->last_dbd_len)
-            send_to(n->ip, n->ifindex, n->last_dbd, n->last_dbd_len);
-        n->dd_last_recv_seq = seq;
-        flood_lsas_to_neighbor(n, false);
+        /* Duplicates are ignored (retransmit on timer). Non-duplicate DBD in
+         * Full is a sequence mismatch: restart adjacency. */
+        if (seq == n->dd_last_recv_seq)
+            return;
+        nbr_reset_exchange(n);
+        n->state = NSTATE_EXSTART;
+        n->dd_seq = (uint32_t)time(NULL);
+        n->dd_master = (g_ospf.router_id > n->router_id);
+        nbr_send_dbdesc(n, OSPF_DD_FLAG_I | OSPF_DD_FLAG_M | OSPF_DD_FLAG_MS, n->dd_seq, false);
         return;
     }
 
@@ -1816,10 +1819,15 @@ static void ospf_tick_locked(void)
     hadc_ctx_t *ctx = g_ospf.ctx;
     if (!g_ospf.enabled || g_ospf.fd < 0)
         return;
-    refresh_ifaces(ctx);
-    expire_neighbors();
 
     time_t now = time(NULL);
+    static time_t last_if_refresh;
+    if (last_if_refresh == 0 || now != last_if_refresh) {
+        refresh_ifaces(ctx);
+        last_if_refresh = now;
+    }
+    expire_neighbors();
+
     if (now - g_ospf.last_hello_sent >= OSPF_HELLO_INTERVAL) {
         for (size_t i = 0; i < g_ospf.n_ifaces; i++)
             send_hello_on(&g_ospf.ifaces[i]);
