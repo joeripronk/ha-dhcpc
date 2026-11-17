@@ -1845,7 +1845,8 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
     /* Record live master claims seen during the window (startup gate). */
     for (size_t j = 0; j < n_seen; j++)
         if (seen[j].claims_master && !g_startup_claim[0])
-            snprintf(g_startup_claim, sizeof(g_startup_claim), "%s", seen[j].id);
+            snprintf(g_startup_claim, sizeof(g_startup_claim), "%.*s",
+                     (int)sizeof(g_startup_claim) - 1, seen[j].id);
 
     if (n_seen == 0) {
         hadc_info("timesync: no cluster clocks seen, keeping ours");
