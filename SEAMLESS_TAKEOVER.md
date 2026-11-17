@@ -30,7 +30,7 @@ This is an opt-in, best-effort forwarding bridge during handoff — not a guaran
 1. **Separate non-VIP fabric** for cluster sync/OSPF/routing (e.g. dedicated VLAN/interface). `sync_address` peers and `ospf.interfaces` must remain reachable when VIP interfaces/addresses change. An interface used for OSPF in this mode must not host VIP/cluster addresses.
 2. **L3 forwarding enabled** on the demoting node for the relevant families/paths; firewall must permit forwarding between WAN/VIP-facing ingress and the fabric toward the new master during the hold.
 3. **Conntrack/state replication** (`conntrack_sync`) healthy enough for the new master to continue existing flows where applicable; helper/expectation coverage and replication lag are limiting factors.
-4. **Timely promotion** of the new master (VIP add + GARP + route/neighbor readiness) within/around `apply.handoff_hold_ms`.
+4. **Timely promotion** of the new master (VIP add + GARP + route/neighbor readiness) within/around `apply.handoff_hold_ms` (default 5000 ms).
 
 ## Routing strategies
 

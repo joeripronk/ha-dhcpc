@@ -227,10 +227,11 @@ INIT-SELECT --ACK--> BOUND --T1--> RENEW --ACK--> BOUND
   and only acts when a timer is due (the renewal goes unicast to the pinned
   server-id). It exits RETAINED on the first successful ACK. A node down through
   its renewal window therefore acts at boot (see clock jumps in §8).
-- **RETAINED**: config stays applied, retention flag propagates to slaves;
-  master keeps attempting RENEW → REBIND → (configurable) fresh DISCOVER with
-  exponential backoff (e.g., 30 s → cap 10 min); logs/alerts at entry and exit.
-  No DECLINE, no RELEASE, no config teardown. On first successful ACK the state
+- **RETAINED**: config stays applied, retention flag propagates to slaves; the
+  master keeps attempting RENEW/REBIND using `dhcp.renew_retry_interval_s`
+  (default 30 s; 0 = exponential backoff) and, when `dhcp.rediscover_in_retention`
+  is enabled (default), may re-enter discovery to obtain a new lease. No
+  DECLINE, no RELEASE, no config teardown. On first successful ACK the state
   machine returns to BOUND and pushes the updated state.
 - Retention policy (per config): `forever` (default) | `max-duration` |
   `until-carrier-loss` | `off` (dhclient-like expiry behavior).
@@ -251,6 +252,8 @@ member, and the master is authoritative for it.
   configured DHCP interface using the active lease and pinned server-id; when
   there is no active lease to renew it falls back to a fresh DISCOVER. On a
   slave it is refused.
+- `ha-dhcpc ctl newip` (master-only) forces a fresh DISCOVER (abandoning the
+  current lease) to obtain a new address. On a slave it is refused.
 - A receiver verifies the sha256 the master claims, writes the pushed copy to its
   own copy of this path (atomic, digest-verified) so the cluster converges across
   restarts, then reloads and acks. Convergence is push-driven (on join and on
@@ -369,8 +372,8 @@ roles, `notify.sh` still maps master → `ha-dhcpc ctl promote` and backup/fault
 - **Observability:** `ha-dhcpc status`/`ha-dhcpc ctl status` + JSON over the
   local control socket (role, versions, apply-acks, retention state, timers,
   executor/drift/monitor state, gateway-probe, conntrack/routing status, etc.);
-  the CLI can render human-readable section views (`cluster`, `ip`, `ospf`) and
-  `detailed`; structured logs.
+  the CLI can render human-readable section views (`cluster`, `ip`, `ospf` with
+  `routes|neighbors`) and `detailed`; structured logs.
 - **Compat mode:** single-node operation = cluster of one (no election needed),
   retention still applies — useful as a standalone hardened dhclient.
 
