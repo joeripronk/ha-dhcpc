@@ -219,12 +219,12 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
     struct signalfd_siginfo si;
     (void)!read(fd, &si, sizeof(si));
     if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
-        hadc_lease_t rl = ctx->lease;
-        if (rl.observed_at_utc != 0)
-            hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
-        hadc_info("shutdown: role=master lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
-                  hadc_lease_state_name(rl.state),
-                  rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+        {
+            uint32_t t1, t2, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
+            hadc_info("shutdown: role=master lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
+                      hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
+        }
     }
     /* Graceful exit: a master hands the role to the best live peer so the
      * cluster elects a new master immediately. With no live peer (or not the
@@ -426,11 +426,14 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         ctx->lease = *lease;
         ctx->lease.retention_active = retention;
         hadc_cluster_unlock();
-        hadc_info("lease update v%llu state=%s addr=%s t1=%us t3=%us",
-                  (unsigned long long)ctx->lease.version,
-                  hadc_lease_state_name(ctx->lease.state),
-                  inet_ntoa(*(struct in_addr *)&ctx->lease.address),
-                  ctx->lease.t1_remaining_s, ctx->lease.t3_remaining_s);
+        {
+            uint32_t t1, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, NULL, &t3);
+            hadc_info("lease update v%llu state=%s addr=%s t1=%us t3=%us",
+                      (unsigned long long)ctx->lease.version,
+                      hadc_lease_state_name(ctx->lease.state),
+                      inet_ntoa(*(struct in_addr *)&ctx->lease.address), t1, t3);
+        }
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired,
                             lease->state == HADC_LEASE_RENEW ? HADC_REASON_RENEW
@@ -523,12 +526,10 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
         hadc_lease_prepare_for_promotion(&ctx->lease);
         {
-            hadc_lease_t rl = ctx->lease;
-            if (rl.observed_at_utc != 0)
-                hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+            uint32_t t1, t2, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
             hadc_info("promotion: lease state=%s renew_in=%us rebind_in=%us expire_in=%us (setup in progress)",
-                      hadc_lease_state_name(rl.state),
-                      rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+                      hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
         }
         /* Promote dataplane but do NOT announce role=master yet: apply lease/public
          * address and routes, then VIPs, then GARP burst; only after that mark ready. */
@@ -568,14 +569,9 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         ctx->handoff_forward_hold = true;
         ctx->handoff_hold_until_ms = (uint64_t)hadc_now_ms() + ctx->conf.apply.handoff_hold_ms;
         snprintf(ctx->handoff_target, sizeof(ctx->handoff_target), "%s", ctx->conf.designated_master);
-        {
-            hadc_lease_t rl = ctx->lease;
-            if (rl.observed_at_utc != 0)
-                hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
-            hadc_info("demotion: entering handoff hold to %s for up to %ums (forwarding kept, egress block deferred), lease state=%s",
-                      ctx->handoff_target, ctx->conf.apply.handoff_hold_ms,
-                      hadc_lease_state_name(rl.state));
-        }
+        hadc_info("demotion: entering handoff hold to %s for up to %ums (forwarding kept, egress block deferred), lease state=%s",
+                  ctx->handoff_target, ctx->conf.apply.handoff_hold_ms,
+                  hadc_lease_state_name(ctx->lease.state));
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         /* Seamless takeover: when steering is active the VIPs stay assigned for the
          * whole hold (ARP replies suppressed, no VIP-source traffic) and are removed
@@ -718,18 +714,20 @@ static void r_ip(json_t *st, bool detail)
     json_t *gwp = jobj(st, "gwping");
     json_t *rs = jobj(jobj(st, "routing"), "state");
     const char *gwp_state = "off";
+    long long t1 = jint(dhcp, "t1_remaining_s", -1);
+    long long t2 = jint(dhcp, "t2_remaining_s", -1);
+    long long t3 = jint(dhcp, "t3_remaining_s", -1);
 
     if (gwp) {
         if (jbool(gwp, "enabled", 0))
             gwp_state = jbool(gwp, "unreachable", 0) ? "UNREACHABLE" : "reachable";
     }
-    printf("ip       public %s  dhcp %s lease %s gw %s  gwping %s\n",
+    printf("ip       public %s  dhcp %s lease %s gw %s  gwping %s  renew in %llds\n",
            str_or_null(jsget(rs, "public_ip32")), str_or_null(jsget(dhcp, "state")),
-           str_or_null(jsget(dhcp, "address")), str_or_null(jsget(dhcp, "gateway")), gwp_state);
+           str_or_null(jsget(dhcp, "address")), str_or_null(jsget(dhcp, "gateway")), gwp_state, t1);
     if (detail && dhcp) {
-        printf("         t1 %llds t2 %llds t3 %llds  server %s  retention %s  lease v%lld\n",
-               jint(dhcp, "t1_remaining_s", -1), jint(dhcp, "t2_remaining_s", -1),
-               jint(dhcp, "t3_remaining_s", -1), str_or_null(jsget(dhcp, "server_id")),
+        printf("         renew in %llds  rebind in %llds  expire in %llds  server %s  retention %s  lease v%lld\n",
+               t1, t2, t3, str_or_null(jsget(dhcp, "server_id")),
                yns(jbool(st, "retention", -1)), jint(st, "lease_version", -1));
         json_t *dns = jarr(dhcp, "dns");
         if (dns && json_array_size(dns) > 0) {
@@ -1116,13 +1114,16 @@ int main(int argc, char **argv)
         inet_ntop(AF_INET, &ctx->lease.address, a, sizeof(a));
         inet_ntop(AF_INET, &ctx->lease.netmask, nm, sizeof(nm));
         inet_ntop(AF_INET, &ctx->lease.gateway, gw, sizeof(gw));
-        hadc_info("persist: restored role=%s lease_version=%llu state=%s addr=%s "
-                  "mask=%s gateway=%s dns=%zu t1=%us t2=%us t3=%us acked=%llu",
-                  ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
-                  (unsigned long long)pv.lease_version, hadc_lease_state_name(ctx->lease.state),
-                  a, nm, gw, ctx->lease.n_dns, ctx->lease.t1_remaining_s,
-                  ctx->lease.t2_remaining_s, ctx->lease.t3_remaining_s,
-                  (unsigned long long)ctx->acked_version);
+        {
+            uint32_t t1, t2, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
+            hadc_info("persist: restored role=%s lease_version=%llu state=%s addr=%s "
+                      "mask=%s gateway=%s dns=%zu t1=%us t2=%us t3=%us acked=%llu",
+                      ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
+                      (unsigned long long)pv.lease_version, hadc_lease_state_name(ctx->lease.state),
+                      a, nm, gw, ctx->lease.n_dns, t1, t2, t3,
+                      (unsigned long long)ctx->acked_version);
+        }
     }
 
     char macstr[32];
@@ -1246,13 +1247,11 @@ int main(int argc, char **argv)
     ctx->running = true;
     hadc_info("ha-dhcpc %s (built %s)", HADC_VERSION, HADC_BUILD_TIME);
     {
-        hadc_lease_t rl = ctx->lease;
-        if (rl.observed_at_utc != 0)
-            hadc_lease_adjust_elapsed(&rl, (long long)time(NULL) - rl.observed_at_utc);
+        uint32_t t1, t2, t3;
+        hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
         hadc_info("startup: role=%s lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
                   ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
-                  hadc_lease_state_name(rl.state),
-                  rl.t1_remaining_s, rl.t2_remaining_s, rl.t3_remaining_s);
+                  hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
     }
     if (ctx->conf.n_members == 0)
         hadc_info("running standalone (no cluster members; heartbeat transport disabled, role master)");

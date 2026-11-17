@@ -60,11 +60,11 @@ static void core_timer_ready(hadc_ctx_t *ctx, int fd)
 
 static void fill_lease(hadc_lease_t *out, const struct client_lease *l)
 {
-    struct timespec mono;
     const struct option_data *dns;
+    struct timespec mono;
+    long long now_utc = (long long)time(NULL);
 
     clock_gettime(CLOCK_MONOTONIC, &mono);
-    time_t now = mono.tv_sec;
 
     memset(out, 0, sizeof(*out));
     out->state = HADC_LEASE_BOUND;
@@ -83,10 +83,16 @@ static void fill_lease(hadc_lease_t *out, const struct client_lease *l)
     for (size_t off = 0; dns->data != NULL && off + 4 <= dns->len &&
          out->n_dns < HADC_DNS_MAX; off += 4)
         memcpy(&out->dns[out->n_dns++], dns->data + off, 4);
-    out->t1_remaining_s = l->renewal > now ? (uint32_t)(l->renewal - now) : 0;
-    out->t2_remaining_s = l->rebind > now ? (uint32_t)(l->rebind - now) : 0;
-    out->t3_remaining_s = l->expiry > now ? (uint32_t)(l->expiry - now) : 0;
-    out->observed_at_utc = (long long)time(NULL);
+
+    /* Core deadlines are monotonic (cur_time). Convert to absolute UTC anchors
+     * so every node/restart derives identical remaining time from the clock. */
+    out->obtained_at_utc = now_utc;
+    if (l->renewal > 0)
+        out->t1_at_utc = now_utc + (long long)(l->renewal - mono.tv_sec);
+    if (l->rebind > 0)
+        out->t2_at_utc = now_utc + (long long)(l->rebind - mono.tv_sec);
+    if (l->expiry > 0)
+        out->t3_at_utc = now_utc + (long long)(l->expiry - mono.tv_sec);
 }
 
 static int is_lease_reason(const char *reason)
@@ -214,6 +220,8 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
          * the renewal that is actually due (plan §3/§5/§8). */
         if (!ctx->conf.lease_file[0] && ctx->lease.address.s_addr != 0) {
             struct dhcp_core_lease p;
+            uint32_t t1, t2, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
             memset(&p, 0, sizeof(p));
             memcpy(p.address, &ctx->lease.address, 4);
             memcpy(p.netmask, &ctx->lease.netmask, 4);
@@ -221,9 +229,9 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
             memcpy(p.server_id, &ctx->lease.server_id, 4);
             for (size_t i = 0; i < ctx->lease.n_dns && p.n_dns < 8; i++)
                 memcpy(p.dns[p.n_dns++], &ctx->lease.dns[i], 4);
-            p.t1_remaining_s = (time_t)ctx->lease.t1_remaining_s;
-            p.t2_remaining_s = (time_t)ctx->lease.t2_remaining_s;
-            p.t3_remaining_s = (time_t)ctx->lease.t3_remaining_s;
+            p.t1_remaining_s = (time_t)t1;
+            p.t2_remaining_s = (time_t)t2;
+            p.t3_remaining_s = (time_t)t3;
             dhcp_core_preset_lease(&p);
         }
 
@@ -246,10 +254,13 @@ int hadc_dhcpcore_start(hadc_ctx_t *ctx)
          * the clock to now, and re-enter on the held lease with the daemon's
          * aged timers so the next action is the renewal that is due now, not a
          * stale-reboot DISCOVER. */
-        if (dhcp_core_resume(ctx->conf.interface, (long)ctx->lease.t1_remaining_s,
-              (long)ctx->lease.t2_remaining_s, (long)ctx->lease.t3_remaining_s) != 0)
-            hadc_warn("dhcpcore: resume on %s failed; re-registering as-is",
-                      ctx->conf.interface);
+        {
+            uint32_t t1, t2, t3;
+            hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
+            if (dhcp_core_resume(ctx->conf.interface, (long)t1, (long)t2, (long)t3) != 0)
+                hadc_warn("dhcpcore: resume on %s failed; re-registering as-is",
+                          ctx->conf.interface);
+        }
     }
 
     if (hadc_loop_add(ctx, ctx->core_timerfd, core_timer_ready, 0) != 0) {
@@ -406,10 +417,11 @@ int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
                 inet_ntop(AF_INET, &lease->server_id, buf, sizeof(buf)));
     /* Same format the fork's write_client_lease produces (gmtime). */
     static const char *field[3] = { "renew", "rebind", "expire" };
-    uint32_t rem[3] = { lease->t1_remaining_s, lease->t2_remaining_s,
-                        lease->t3_remaining_s };
+    long long at[3] = { lease->t1_at_utc, lease->t2_at_utc, lease->t3_at_utc };
     for (int i = 0; i < 3; i++) {
-        time_t when = now + (time_t)rem[i];
+        if (at[i] <= 0)
+            continue;
+        time_t when = (time_t)at[i];
         struct tm tm;
         gmtime_r(&when, &tm);
         fprintf(f, "  %s %d %d/%d/%d %02d:%02d:%02d;\n", field[i], tm.tm_wday,

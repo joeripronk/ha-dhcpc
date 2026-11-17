@@ -67,15 +67,22 @@ int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN])
     return -1;
 }
 
-void hadc_lease_adjust_elapsed(hadc_lease_t *l, long long elapsed_s)
+uint32_t hadc_lease_remaining_one(long long at_utc, long long now_utc)
 {
-    (void)l; (void)elapsed_s;
+    if (at_utc <= 0 || now_utc >= at_utc) return 0;
+    long long d = at_utc - now_utc;
+    return d > 0xffffffffLL ? 0xffffffffu : (uint32_t)d;
 }
 
-void hadc_lease_mark_observed(hadc_lease_t *l)
+void hadc_lease_remaining(const hadc_lease_t *l, long long now_utc,
+                          uint32_t *t1, uint32_t *t2, uint32_t *t3)
 {
-    (void)l;
+    if (t1) *t1 = hadc_lease_remaining_one(l->t1_at_utc, now_utc);
+    if (t2) *t2 = hadc_lease_remaining_one(l->t2_at_utc, now_utc);
+    if (t3) *t3 = hadc_lease_remaining_one(l->t3_at_utc, now_utc);
 }
+
+void hadc_lease_prepare_for_promotion(hadc_lease_t *l) { (void)l; }
 
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
 {

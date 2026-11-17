@@ -556,11 +556,11 @@ static json_t *lease_json(const hadc_lease_t *l)
     json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
                            "state", hadc_lease_state_name(l->state), "retention_active",
                            (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
-                           "server_id", "", "dns", dns, "t1_remaining_s",
-                           (json_int_t)l->t1_remaining_s, "t2_remaining_s",
-                           (json_int_t)l->t2_remaining_s, "t3_remaining_s",
-                           (json_int_t)l->t3_remaining_s, "observed_at_utc",
-                           (json_int_t)l->observed_at_utc, "config_hash", hex);
+                           "server_id", "", "dns", dns, "obtained_at_utc",
+                           (json_int_t)l->obtained_at_utc, "t1_at_utc",
+                           (json_int_t)l->t1_at_utc, "t2_at_utc",
+                           (json_int_t)l->t2_at_utc, "t3_at_utc",
+                           (json_int_t)l->t3_at_utc, "config_hash", hex);
     if (!o) {
         json_decref(dns);
         return NULL;
@@ -684,14 +684,33 @@ static void parse_lease(json_t *lj, hadc_lease_t *out)
                 out->n_dns++;
         }
     }
-    if ((v = json_object_get(lj, "t1_remaining_s")) && json_is_integer(v))
-        out->t1_remaining_s = (uint32_t)json_integer_value(v);
-    if ((v = json_object_get(lj, "t2_remaining_s")) && json_is_integer(v))
-        out->t2_remaining_s = (uint32_t)json_integer_value(v);
-    if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
-        out->t3_remaining_s = (uint32_t)json_integer_value(v);
-    if ((v = json_object_get(lj, "observed_at_utc")) && json_is_integer(v))
-        out->observed_at_utc = (long long)json_integer_value(v);
+    if ((v = json_object_get(lj, "obtained_at_utc")) && json_is_integer(v))
+        out->obtained_at_utc = (long long)json_integer_value(v);
+    if ((v = json_object_get(lj, "t1_at_utc")) && json_is_integer(v))
+        out->t1_at_utc = (long long)json_integer_value(v);
+    if ((v = json_object_get(lj, "t2_at_utc")) && json_is_integer(v))
+        out->t2_at_utc = (long long)json_integer_value(v);
+    if ((v = json_object_get(lj, "t3_at_utc")) && json_is_integer(v))
+        out->t3_at_utc = (long long)json_integer_value(v);
+    /* Backward compat: old remaining-second snapshots -> derive anchors now. */
+    {
+        json_t *oat = json_object_get(lj, "observed_at_utc");
+        json_t *r1 = json_object_get(lj, "t1_remaining_s");
+        if (out->t3_at_utc == 0 && oat && json_is_integer(oat) && r1 && json_is_integer(r1)) {
+            long long now = (long long)time(NULL);
+            long long base = json_integer_value(oat);
+            json_t *r2 = json_object_get(lj, "t2_remaining_s");
+            json_t *r3 = json_object_get(lj, "t3_remaining_s");
+            long long age = now - base;
+            if (age < 0) age = 0;
+            if (out->obtained_at_utc == 0)
+                out->obtained_at_utc = base;
+            out->t1_at_utc = base + json_integer_value(r1);
+            out->t2_at_utc = base + (r2 && json_is_integer(r2) ? json_integer_value(r2) : 0);
+            out->t3_at_utc = base + (r3 && json_is_integer(r3) ? json_integer_value(r3) : 0);
+            (void)age;
+        }
+    }
     if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
         strlen(json_string_value(v)) == 64) {
         for (size_t i = 0; i < 32; i++) {
@@ -950,13 +969,7 @@ static void slave_adopt_and_ack(hadc_ctx_t *ctx, const hadc_msg_t *msg, json_t *
     else
         ctx->n_vip_neighs = 0;
     hadc_maint_unlock();
-    if (msg->ts_ms != 0) {
-        uint64_t now_ms = realtime_ms();
-        long long elapsed_s = now_ms > msg->ts_ms ? (long long)((now_ms - msg->ts_ms) / 1000) : 0;
-        if (elapsed_s > 0)
-            hadc_lease_adjust_elapsed(&ctx->lease, elapsed_s);
-    }
-    hadc_lease_mark_observed(&ctx->lease);
+    /* Lease timers are absolute UTC anchors: no transit/snapshot aging needed. */
     hadc_executor_desired(ctx, &ctx->lease, &desired);
     hadc_executor_apply(ctx, &desired, hadc_lease_state_name(ctx->lease.state));
     ctx->acked_version = ctx->lease.version;
@@ -1836,14 +1849,8 @@ int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
         const hadc_member_t *m = &ctx->conf.members[i];
         if (!strcmp(m->id, ctx->conf.self))
             continue;
-        json_t *msg = json_pack("{s:s, s:s, s:s, s:I}", "type", HADC_MSG_STATE_PUSH, "origin",
-                                ctx->conf.self, "master_id", ctx->conf.designated_master,
-                                "lease_version", (json_int_t)lease->version);
-        json_t *lj = msg ? lease_json(lease) : NULL;
-        if (lj)
-            json_object_set_new(msg, "lease", lj);
-        if (msg)
-            json_object_set_new(msg, "vip_neighbors", vip_neighs_json(ctx));
+        /* Lease timers are absolute UTC anchors; push the full lease state. */
+        json_t *msg = build_msg(ctx, HADC_MSG_STATE_PUSH, 1);
         if (msg && send_to_member(ctx, m, msg) == 0)
             hadc_info("sync: state_push v%llu sent to %s",
                       (unsigned long long)lease->version, m->id);

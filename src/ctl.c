@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <poll.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
@@ -75,24 +76,31 @@ static json_t *status_object(hadc_ctx_t *ctx)
                   "reason", ctx->demote_route_via_new_master_reason));
     json_object_set_new(o, "members", members);
     {
+        hadc_lease_t rl = ctx->lease;
+        uint32_t t1, t2, t3;
+        hadc_lease_remaining(&rl, (long long)time(NULL), &t1, &t2, &t3);
         char la[64], ln[64], lg[64], ls[64];
-        snprintf(la, sizeof(la), "%s", inet_ntoa(ctx->lease.address));
-        snprintf(ln, sizeof(ln), "%s", inet_ntoa(ctx->lease.netmask));
-        snprintf(lg, sizeof(lg), "%s", inet_ntoa(ctx->lease.gateway));
-        snprintf(ls, sizeof(ls), "%s", inet_ntoa(ctx->lease.server_id));
+        snprintf(la, sizeof(la), "%s", inet_ntoa(rl.address));
+        snprintf(ln, sizeof(ln), "%s", inet_ntoa(rl.netmask));
+        snprintf(lg, sizeof(lg), "%s", inet_ntoa(rl.gateway));
+        snprintf(ls, sizeof(ls), "%s", inet_ntoa(rl.server_id));
         json_t *dns = json_array();
-        for (size_t i = 0; i < ctx->lease.n_dns; i++) {
+        for (size_t i = 0; i < rl.n_dns; i++) {
             char b[64];
-            snprintf(b, sizeof(b), "%s", inet_ntoa(ctx->lease.dns[i]));
+            snprintf(b, sizeof(b), "%s", inet_ntoa(rl.dns[i]));
             json_array_append_new(dns, json_string(b));
         }
         json_object_set_new(o, "dhcp",
-            json_pack("{s:s, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I}",
-                      "state", hadc_lease_state_name(ctx->lease.state),
+            json_pack("{s:s, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:I, s:I, s:I}",
+                      "state", hadc_lease_state_name(rl.state),
                       "address", la, "netmask", ln, "gateway", lg, "server_id", ls,
-                      "dns", dns, "t1_remaining_s", (json_int_t)ctx->lease.t1_remaining_s,
-                      "t2_remaining_s", (json_int_t)ctx->lease.t2_remaining_s,
-                      "t3_remaining_s", (json_int_t)ctx->lease.t3_remaining_s));
+                      "dns", dns, "t1_remaining_s", (json_int_t)t1,
+                      "t2_remaining_s", (json_int_t)t2,
+                      "t3_remaining_s", (json_int_t)t3,
+                      "obtained_at_utc", (json_int_t)rl.obtained_at_utc,
+                      "t1_at_utc", (json_int_t)rl.t1_at_utc,
+                      "t2_at_utc", (json_int_t)rl.t2_at_utc,
+                      "t3_at_utc", (json_int_t)rl.t3_at_utc));
         json_object_set_new(o, "gwping",
             json_pack("{s:b, s:b}", "enabled", ctx->conf.apply.gateway_probe,
                       "unreachable", hadc_gwping_unreachable()));

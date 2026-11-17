@@ -55,11 +55,11 @@ static json_t *lease_json(const hadc_lease_t *l)
     json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
                            "state", hadc_lease_state_name(l->state), "retention_active",
                            (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
-                           "server_id", "", "dns", dns, "t1_remaining_s",
-                           (json_int_t)l->t1_remaining_s, "t2_remaining_s",
-                           (json_int_t)l->t2_remaining_s, "t3_remaining_s",
-                           (json_int_t)l->t3_remaining_s, "observed_at_utc",
-                           (json_int_t)l->observed_at_utc, "config_hash", hex);
+                           "server_id", "", "dns", dns, "obtained_at_utc",
+                           (json_int_t)l->obtained_at_utc, "t1_at_utc",
+                           (json_int_t)l->t1_at_utc, "t2_at_utc",
+                           (json_int_t)l->t2_at_utc, "t3_at_utc",
+                           (json_int_t)l->t3_at_utc, "config_hash", hex);
     if (!o) {
         json_decref(dns);
         return NULL;
@@ -146,14 +146,29 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
                     l->n_dns++;
             }
         }
-        if ((v = json_object_get(lj, "t1_remaining_s")) && json_is_integer(v))
-            l->t1_remaining_s = (uint32_t)json_integer_value(v);
-        if ((v = json_object_get(lj, "t2_remaining_s")) && json_is_integer(v))
-            l->t2_remaining_s = (uint32_t)json_integer_value(v);
-        if ((v = json_object_get(lj, "t3_remaining_s")) && json_is_integer(v))
-            l->t3_remaining_s = (uint32_t)json_integer_value(v);
-        if ((v = json_object_get(lj, "observed_at_utc")) && json_is_integer(v))
-            l->observed_at_utc = (long long)json_integer_value(v);
+        if ((v = json_object_get(lj, "obtained_at_utc")) && json_is_integer(v))
+            l->obtained_at_utc = (long long)json_integer_value(v);
+        if ((v = json_object_get(lj, "t1_at_utc")) && json_is_integer(v))
+            l->t1_at_utc = (long long)json_integer_value(v);
+        if ((v = json_object_get(lj, "t2_at_utc")) && json_is_integer(v))
+            l->t2_at_utc = (long long)json_integer_value(v);
+        if ((v = json_object_get(lj, "t3_at_utc")) && json_is_integer(v))
+            l->t3_at_utc = (long long)json_integer_value(v);
+        /* Backward compat: old remaining-second snapshots. */
+        if (l->t3_at_utc == 0) {
+            json_t *oat = json_object_get(lj, "observed_at_utc");
+            json_t *r3 = json_object_get(lj, "t3_remaining_s");
+            if (oat && json_is_integer(oat) && r3 && json_is_integer(r3)) {
+                long long base = json_integer_value(oat);
+                json_t *r1 = json_object_get(lj, "t1_remaining_s");
+                json_t *r2 = json_object_get(lj, "t2_remaining_s");
+                if (l->obtained_at_utc == 0)
+                    l->obtained_at_utc = base;
+                l->t1_at_utc = base + (r1 && json_is_integer(r1) ? json_integer_value(r1) : 0);
+                l->t2_at_utc = base + (r2 && json_is_integer(r2) ? json_integer_value(r2) : 0);
+                l->t3_at_utc = base + json_integer_value(r3);
+            }
+        }
         if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
             strlen(json_string_value(v)) == 64) {
             for (size_t i = 0; i < 32; i++) {
@@ -180,33 +195,8 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
         }
     }
 
-    json_t *sa = json_object_get(root, "saved_at_utc");
-    if (sa && json_is_integer(sa) && out->lease.address.s_addr != 0) {
-        long long elapsed = (long long)time(NULL) - json_integer_value(sa);
-        long long cap = 2 * (long long)out->lease.t3_remaining_s;
-        if (cap > 86400)
-            cap = 86400;
-        if (elapsed < 0)
-            hadc_warn("persist: saved_at_utc is %lld s ahead of the clock (jump); keeping "
-                      "the stored timers",
-                      -elapsed);
-        else if (elapsed > cap)
-            hadc_warn("persist: downtime %lld s exceeds the %lld s sanity cap; keeping the "
-                      "stored timers",
-                      elapsed, cap);
-        else if (elapsed > 0) {
-            uint32_t *rem[3] = { &out->lease.t1_remaining_s, &out->lease.t2_remaining_s,
-                                  &out->lease.t3_remaining_s };
-            for (int i = 0; i < 3; i++)
-                *rem[i] = (long long)*rem[i] > elapsed ? (uint32_t)((long long)*rem[i] -
-                                                                    elapsed)
-                                                       : 0;
-            hadc_info("persist: timers recalculated from UTC (downtime %lld s)", elapsed);
-        }
-    }
-
-    if (out->found)
-        hadc_lease_mark_observed(&out->lease);
+    /* Absolute UTC anchors need no downtime recalculation; clocks are the
+     * source of truth on restart. Legacy snapshots are converted on parse. */
 
     json_decref(root);
     return 0;
@@ -217,14 +207,8 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
  * file IO is offloaded to the maintenance worker. */
 static char *persist_build_json(hadc_ctx_t *ctx)
 {
-    /* t1/t2/t3 are remaining seconds at observed_at_utc and can be stale between
-     * lease events; persist a snapshot aged to now so restarts resume correctly. */
-    hadc_lease_t snap = ctx->lease;
-    if (snap.observed_at_utc != 0)
-        hadc_lease_adjust_elapsed(&snap, (long long)time(NULL) - snap.observed_at_utc);
-    snap.observed_at_utc = (long long)time(NULL);
-
-    json_t *lj = lease_json(&snap);
+    /* Timers are absolute UTC anchors; persist them as-is. */
+    json_t *lj = lease_json(&ctx->lease);
     if (!lj)
         return NULL;
     json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:o}", "role",

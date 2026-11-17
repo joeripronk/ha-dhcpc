@@ -1,5 +1,3 @@
-/* Round-trip test: everything needed to re-apply interface state at boot
- * must survive save -> load (plan §3/§8 cache). */
 #define _GNU_SOURCE
 
 #include <arpa/inet.h>
@@ -28,6 +26,7 @@ int main(void)
     unlink(path);
 
     hadc_ctx_t *a = &g_a;
+    long long now = (long long)time(NULL);
     a->role = HADC_ROLE_MASTER;
     a->lease.version = 7;
     a->acked_version = 5;
@@ -46,9 +45,10 @@ int main(void)
         memcpy(a->lease.gw_mac, want_mac, HADC_MAC_LEN);
     }
     a->lease.gw_mac_valid = true;
-    a->lease.t1_remaining_s = 8000;
-    a->lease.t2_remaining_s = 10000;
-    a->lease.t3_remaining_s = 12000;
+    a->lease.obtained_at_utc = now - 100;
+    a->lease.t1_at_utc = now + 8000;
+    a->lease.t2_at_utc = now + 10000;
+    a->lease.t3_at_utc = now + 12000;
     for (size_t i = 0; i < 32; i++)
         a->lease.config_hash[i] = (uint8_t)(i * 3);
 
@@ -84,30 +84,29 @@ int main(void)
     if (pv.lease.n_dns != 2 ||
         memcmp(&pv.lease.dns, &a->lease.dns, 2 * sizeof(pv.lease.dns[0])) != 0)
         rc |= fail("dns");
-    if (pv.lease.t1_remaining_s != 8000 || pv.lease.t2_remaining_s != 10000 ||
-        pv.lease.t3_remaining_s != 12000)
-        rc |= fail("timers");
+    if (pv.lease.obtained_at_utc != a->lease.obtained_at_utc ||
+        pv.lease.t1_at_utc != a->lease.t1_at_utc ||
+        pv.lease.t2_at_utc != a->lease.t2_at_utc ||
+        pv.lease.t3_at_utc != a->lease.t3_at_utc)
+        rc |= fail("timer anchors");
     if (memcmp(pv.lease.config_hash, a->lease.config_hash, 32) != 0)
         rc |= fail("config_hash");
     if (!pv.lease.gw_mac_valid || memcmp(pv.lease.gw_mac, a->lease.gw_mac, HADC_MAC_LEN) != 0)
         rc |= fail("gw_mac");
 
-    /* Restart recalculates remaining time from UTC (plan §8), with a sanity cap
-     * min(2*t3, 24 h) on crazy jumps. */
+    /* Restart: absolute anchors remain the source of truth (even across large
+     * downtime/clock jumps of saved_at_utc); remaining is derived from now. */
     {
-        static const struct {
-            long long saved_delta; /* saved_at_utc = now + delta */
-            uint32_t t1, t2, t3;   /* expected after load */
-            const char *what;
-        } cases[] = {
-            { -300, 7700, 9700, 11700, "recalc within cap" },
-            { 300, 8000, 10000, 12000, "clock jump keeps stored timers" },
-            { -(long long)86401, 8000, 10000, 12000, "downtime beyond cap keeps stored timers" },
-            { -(long long)24000, 0, 0, 0, "downtime past expiry clamps to zero" },
+        static const struct { long long saved_delta; const char *what; } cases[] = {
+            { -300, "recalc within cap" },
+            { 300, "clock jump keeps stored anchors" },
+            { -(long long)86401, "downtime beyond cap keeps stored anchors" },
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             json_error_t jerr;
-            json_t *root = json_loadf(fopen(path, "r"), 0, &jerr);
+            FILE *rf = fopen(path, "r");
+            json_t *root = json_loadf(rf, 0, &jerr);
+            if (rf) fclose(rf);
             if (!root)
                 return fail("reopen");
             json_object_set_new(root, "saved_at_utc",
@@ -119,10 +118,43 @@ int main(void)
             hadc_persist_view_t v;
             if (hadc_persist_load(b, &v) != 0)
                 return fail("recalc load");
-            if (v.lease.t1_remaining_s != cases[i].t1 || v.lease.t2_remaining_s != cases[i].t2 ||
-                v.lease.t3_remaining_s != cases[i].t3)
+            if (v.lease.t1_at_utc != a->lease.t1_at_utc || v.lease.t2_at_utc != a->lease.t2_at_utc ||
+                v.lease.t3_at_utc != a->lease.t3_at_utc)
                 rc |= fail(cases[i].what);
         }
+    }
+
+    /* Backward compat: legacy remaining-second snapshot is converted. */
+    {
+        json_error_t jerr;
+        FILE *rf = fopen(path, "r");
+        json_t *root = json_loadf(rf, 0, &jerr);
+        if (rf) fclose(rf);
+        if (!root)
+            return fail("reopen legacy");
+        json_t *lj = json_object_get(root, "lease");
+        json_object_del(lj, "obtained_at_utc");
+        json_object_del(lj, "t1_at_utc");
+        json_object_del(lj, "t2_at_utc");
+        json_object_del(lj, "t3_at_utc");
+        long long base = (long long)time(NULL) - 10;
+        json_object_set_new(lj, "observed_at_utc", json_integer(base));
+        json_object_set_new(lj, "t1_remaining_s", json_integer(100));
+        json_object_set_new(lj, "t2_remaining_s", json_integer(200));
+        json_object_set_new(lj, "t3_remaining_s", json_integer(300));
+        FILE *f = fopen(path, "w");
+        json_dumpf(root, f, 0);
+        fclose(f);
+        json_decref(root);
+        hadc_persist_view_t v;
+        if (hadc_persist_load(b, &v) != 0)
+            return fail("legacy load");
+        if (v.lease.t1_at_utc != base + 100 || v.lease.t2_at_utc != base + 200 ||
+            v.lease.t3_at_utc != base + 300)
+            rc |= fail("legacy conversion");
+        /* remaining derived from anchors now, not snapshotted */
+        if (hadc_lease_remaining_one(v.lease.t3_at_utc, base + 50) != 250)
+            rc |= fail("legacy remaining derived");
     }
 
     unlink(path);

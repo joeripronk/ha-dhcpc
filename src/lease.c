@@ -1,58 +1,58 @@
-/* Lease timer helpers. Remaining seconds are only trustworthy relative to the
- * moment they were last observed; promotions must age them before arming. */
+/* Lease timer helpers. Timers are absolute UTC anchors so every node and a
+ * restart derive identical remaining time from the clock (no snapshot aging). */
 #define _GNU_SOURCE
 
-#include <limits.h>
 #include <stdint.h>
 #include <time.h>
 
 #include "ha-dhcpc/lease.h"
 
-void hadc_lease_adjust_elapsed(hadc_lease_t *l, long long elapsed_s)
+uint32_t hadc_lease_remaining_one(long long at_utc, long long now_utc)
 {
-    long long cap = 2 * (long long)l->t3_remaining_s;
-    uint32_t *rem[3] = { &l->t1_remaining_s, &l->t2_remaining_s, &l->t3_remaining_s };
-
-    if (cap > 86400)
-        cap = 86400;
-    if (elapsed_s < 0 || elapsed_s > cap)
-        return;
-
-    for (int i = 0; i < 3; i++) {
-        if ((long long)*rem[i] > elapsed_s)
-            *rem[i] = (uint32_t)((long long)*rem[i] - elapsed_s);
-        else
-            *rem[i] = 0;
-    }
+    if (at_utc <= 0)
+        return 0;
+    if (now_utc >= at_utc)
+        return 0;
+    long long d = at_utc - now_utc;
+    if (d > (long long)UINT32_MAX)
+        return UINT32_MAX;
+    return (uint32_t)d;
 }
 
-void hadc_lease_mark_observed(hadc_lease_t *l)
+void hadc_lease_remaining(const hadc_lease_t *l, long long now_utc,
+                          uint32_t *t1, uint32_t *t2, uint32_t *t3)
 {
-    l->observed_at_utc = (long long)time(NULL);
+    if (t1)
+        *t1 = hadc_lease_remaining_one(l->t1_at_utc, now_utc);
+    if (t2)
+        *t2 = hadc_lease_remaining_one(l->t2_at_utc, now_utc);
+    if (t3)
+        *t3 = hadc_lease_remaining_one(l->t3_at_utc, now_utc);
 }
 
 void hadc_lease_prepare_for_promotion(hadc_lease_t *l)
 {
-    if (l->observed_at_utc != 0) {
-        long long elapsed = (long long)time(NULL) - l->observed_at_utc;
-        hadc_lease_adjust_elapsed(l, elapsed);
-    }
     /* Delay renew on the new master by 5 seconds (avoid churn/flaps during
-     * promotion handoff), clamped so T1 <= T2 <= T3. */
-    if (l->address.s_addr != 0 && l->state != HADC_LEASE_NONE) {
-        const uint32_t delay_s = 5;
-        if (l->t1_remaining_s > 0)
-            l->t1_remaining_s += delay_s;
-        else if (l->t2_remaining_s > 0)
-            l->t1_remaining_s = (l->t2_remaining_s > delay_s) ? delay_s : l->t2_remaining_s;
-        else if (l->t3_remaining_s > 0)
-            l->t1_remaining_s = (l->t3_remaining_s > delay_s) ? delay_s : l->t3_remaining_s;
-        if (l->t1_remaining_s > l->t2_remaining_s && l->t2_remaining_s > 0)
-            l->t1_remaining_s = l->t2_remaining_s;
-        if (l->t2_remaining_s > l->t3_remaining_s && l->t3_remaining_s > 0)
-            l->t2_remaining_s = l->t3_remaining_s;
-        if (l->t1_remaining_s > l->t3_remaining_s && l->t3_remaining_s > 0)
-            l->t1_remaining_s = l->t3_remaining_s;
-    }
-    hadc_lease_mark_observed(l);
+     * promotion handoff), clamped so T1 <= T2 <= T3, without accelerating or
+     * making an expired/unknown timer active. */
+    if (l->address.s_addr == 0 || l->state == HADC_LEASE_NONE)
+        return;
+    const long long delay_s = 5;
+    long long now = (long long)time(NULL);
+
+    if (l->t1_at_utc > now)
+        l->t1_at_utc += delay_s;
+    else if (l->t2_at_utc > now)
+        l->t1_at_utc = (l->t2_at_utc - now > delay_s) ? now + delay_s : l->t2_at_utc;
+    else if (l->t3_at_utc > now)
+        l->t1_at_utc = (l->t3_at_utc - now > delay_s) ? now + delay_s : l->t3_at_utc;
+    else
+        return;
+
+    if (l->t2_at_utc > 0 && l->t1_at_utc > l->t2_at_utc)
+        l->t1_at_utc = l->t2_at_utc;
+    if (l->t3_at_utc > 0 && l->t2_at_utc > 0 && l->t2_at_utc > l->t3_at_utc)
+        l->t2_at_utc = l->t3_at_utc;
+    if (l->t3_at_utc > 0 && l->t1_at_utc > l->t3_at_utc)
+        l->t1_at_utc = l->t3_at_utc;
 }

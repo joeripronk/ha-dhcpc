@@ -1,4 +1,4 @@
-/* HA-DHCPC lease state (M0, frozen). Mirrors plan §5. */
+/* HA-DHCPC lease state. Mirrors plan §5. */
 #ifndef HA_DHCPC_LEASE_H
 #define HA_DHCPC_LEASE_H
 
@@ -16,8 +16,11 @@ typedef enum {
     HADC_LEASE_RETAINED,   /* keep last-known-good (plan §5) */
 } hadc_lease_state_t;
 
-/* The versioned, cluster-synced unit of truth. version is monotonic;
- * timers are monotonic remaining seconds, never wall-clock deadlines. */
+/* The versioned, cluster-synced unit of truth. version is monotonic.
+ * Timer anchors are absolute UTC seconds (time_t) when the lease was
+ * obtained/refreshed: renew/rebind/expire deadlines are derived from them so
+ * every node computes the same remaining time from its clock, and restarts do
+ * not rely on snapshot aging. 0 means unknown/unset. */
 typedef struct {
     uint64_t version;
     hadc_lease_state_t state;
@@ -36,20 +39,21 @@ typedef struct {
     struct in_addr dns[HADC_DNS_MAX];
     size_t n_dns;
 
-    uint32_t t1_remaining_s;
-    uint32_t t2_remaining_s;
-    uint32_t t3_remaining_s;
-
-    /* Wall-clock time (UTC) when these remaining-second timers were last
-     * observed fresh: generated locally, adopted from a peer, or recalculated
-     * from persisted state. 0 means no trustworthy observation time. */
-    long long observed_at_utc;
+    /* Absolute UTC seconds (as returned by time(2)). */
+    long long obtained_at_utc;
+    long long t1_at_utc; /* renew */
+    long long t2_at_utc; /* rebind */
+    long long t3_at_utc; /* expire */
 
     hadc_hash_t config_hash;     /* executor-computed */
 } hadc_lease_t;
 
-void hadc_lease_adjust_elapsed(hadc_lease_t *l, long long elapsed_s);
-void hadc_lease_mark_observed(hadc_lease_t *l);
+/* Compute remaining seconds to each absolute timer (clamped to >= 0). */
+void hadc_lease_remaining(const hadc_lease_t *l, long long now_utc,
+                          uint32_t *t1, uint32_t *t2, uint32_t *t3);
+uint32_t hadc_lease_remaining_one(long long at_utc, long long now_utc);
+/* On promotion, delay renew on the new master by 5s (handoff churn), clamped
+ * so T1 <= T2 <= T3, without accelerating or making an expired lease active. */
 void hadc_lease_prepare_for_promotion(hadc_lease_t *l);
 
 static inline const char *hadc_lease_state_name(hadc_lease_state_t s)
