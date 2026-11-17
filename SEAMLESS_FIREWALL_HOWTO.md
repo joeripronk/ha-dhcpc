@@ -1,6 +1,6 @@
 # Seamless takeover: firewall cooperation howto
 
-Companion to `SEAMLESS_TAKEOVER.md` / `SEAMLESS_TODO.md`.
+Companion to `SEAMLESS_TAKEOVER.md`.
 
 During a steered demoting hold the old master keeps VIPs assigned (ARP replies
 suppressed), installs split /1 steering routes via the new master's fabric

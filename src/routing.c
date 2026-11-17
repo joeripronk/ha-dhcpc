@@ -1,8 +1,8 @@
 /* Inter-cluster routing (edge-only, local-prefix origination). Modular core:
  * compute desired advertisement/accept state from ha-dhcpc role+lease+health,
  * select fabric-learned backup defaults from attributed candidates, apply through
- * a backend interface (stub/no-op here), and expose status. Backup routes and
- * fabric-learned defaults are never published. */
+ * the local/native backend, and expose status. Backup routes and fabric-learned
+ * defaults are never published. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>

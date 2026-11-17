@@ -63,25 +63,21 @@ Purpose: forward traffic destined to the VIP subnet toward the new master even i
 
 If WAN ingress continues to hit the demoting node while its best route to the packet source points out the fabric (asymmetric path), strict reverse-path filtering can drop packets.
 
-Plan:
-- Add `apply.disable_rp_filter` (default **enabled behavior**: disable rp_filter on managed interfaces) to set `net.ipv4.conf.all.rp_filter=0` and/or per-interface `rp_filter=0` (and `default`) as appropriate for managed paths so asymmetric forwarding during takeover is permitted.
-- Provide config to disable this management for environments that require strict rp_filter.
-- Document security/anti-spoofing tradeoff; prefer scoping and firewall controls on the fabric/WAN edges.
+- `apply.disable_rp_filter` (default **on**): reconciles rp_filter on managed interfaces and `all`/`default` to `0` so asymmetric forwarding during takeover is permitted. Set to `false` to disable this management for environments that require strict rp_filter.
+- Tradeoff: disabling rp_filter weakens anti-spoofing; prefer scoping and firewall controls on the fabric/WAN edges. Sysctl management is idempotent and reconciled like existing IPv6 sysctl handling.
 
-(Implementation note: sysctl management should be idempotent and reconciled like existing IPv6 sysctl handling, without clobbering unrelated interfaces unnecessarily unless explicitly configured.)
-
-## VIP ARP behavior during demotion (planned)
+## VIP ARP behavior during demotion
 
 Problem: after VIP ownership moves, stale ARP/cache or L2 flooding may still deliver frames for VIP IPs to the demoting node. The demoting node still holds the VIP address during the hold (so it can forward), but it must not claim the VIP (no ARP replies) and must not originate traffic from it, while still forwarding legitimate stray IP packets it receives toward the new master.
 
-Planned mechanism (during demoting hold / while steering active):
+Mechanism (while the demoting hold is steering):
 - **Keep the VIP address assigned** throughout the hold; only remove it when the hold completes and the node transitions to SLAVE.
-- **Suppress ARP replies for VIP addresses** on VIP interfaces on the demoting node (e.g. nftables arp/netdev ingress/egress rules dropping ARP replies for specific target protocol addresses, or equivalent netlink/neighbor policy). Do not suppress IPv4 forwarding of already-received packets.
-- **Do not send locally-originated traffic from VIP sources** during the hold.
-- Keep forwarding and fabric routes active; optionally install per-VIP /32 (or split) routes via the new master to ensure forwarded delivery.
-- Remove suppression (and then the VIP addresses) when hold completes/is aborted or when the node is no longer in the demoting-forwarding state.
+- **Suppress ARP replies for VIP addresses** on VIP interfaces on the demoting node (scoped nftables rules dropping replies for the configured VIP target addresses). IPv4 forwarding of received packets is not suppressed.
+- **Drop locally-originated traffic from VIP sources** during the hold.
+- Keep forwarding and fabric routes active; per-VIP-subnet split routes via the new master steer stray traffic as described above.
+- Remove suppression (and then the VIP addresses) when the hold completes/is aborted or steering is no longer active.
 
-Constraints: requires nft/netlink capabilities and careful rule scoping (only VIP IPs, only while demoting). Must not interfere with the new master’s GARP/ownership.
+Constraints: requires nft/netlink capabilities and careful rule scoping (only VIP IPs, only while demoting/steering). Must not interfere with the new master’s GARP/ownership.
 
 ## NAT / masquerading considerations
 
@@ -114,7 +110,7 @@ Steady state (master owns VIP/WAN NAT):
        clients   [SLAVE(s)] (no VIP ownership, isolated as configured)
 ```
 
-Demotion/handoff hold (seamless forwarding, planned/partial today):
+Demotion/handoff hold (seamless forwarding):
 ```
           Internet
               |
@@ -150,22 +146,11 @@ Notes:
 - **PMTU/ICMP:** forwarded/asymmetric paths may expose PMTU issues; ICMP errors must be routable to the correct state owner.
 - **State scope:** return-traffic steering is most relevant while the demoting node can still receive stray traffic (WAN/public path or stale L2); once upstream/L2 fully converges, traffic should go directly to the new master.
 
-## Rollout / implementation steps
+## Implementation notes
 
-Progress is tracked in `SEAMLESS_TODO.md`; integration test `tests/seamless-takeover-netns.sh`.
-
-1. Keep/require separate non-VIP fabric and validate config (done for base opt-in).
-2. Add `apply.disable_rp_filter` (default on) and reconcile sysctls on managed interfaces. (done)
-3. Add optional split /1 (and/or VIP split/host) steering during demoting hold, with explicit
-   cleanup. Implemented as split /1 only (VIP split routes remain the optional/advanced part);
-   the split /1s replace the earlier default_via override as the steering mechanism. (done)
-4. Keep VIP addresses assigned throughout the demoting hold (no removal at demote); add temporary VIP ARP-reply suppression and no VIP-source traffic during the hold (nft/netlink), scoped and auditable; remove the VIPs only when the hold completes and the node becomes SLAVE. (done)
-5. Add NAT-bypass safeguards/policy hooks for demoting-forwarding state (platform/firewall
-   integration): `apply.demote_nat_bypass_mark` marks steered ingress (prerouting) and fabric
-   egress (postrouting) at raw priority so the platform firewall can `return` on the mark;
-   `apply.demote_notrack` (default on) NOTRACKs steered traffic at prerouting so conntrack/NAT
-   never run on the demoting node (NOTRACK on the outgoing interface alone would not bypass
-   anything). Cooperation snippets: `SEAMLESS_FIREWALL_HOWTO.md`. (done)
-6. Integration tests: controlled handoff under load, rp_filter modes, conntrack sync,
-   WAN-ingress-during-hold cases. Implemented as a netns two-node handoff test (unit tests +
-   16 netns checks incl. nft); load/WAN-ingress scenarios remain manual. (done)
+- Opt-in and validated at startup/reload: `apply.slave_sync_wan: true`, at least one non-VIP `ospf.interfaces` entry (fabric must not carry VIPs); invalid config disables the behavior and reports it in status/logs.
+- `apply.disable_rp_filter` (default on) reconciles rp_filter on managed/all/default interfaces.
+- Steering uses additive split /1 routes via the new master's fabric nexthop during the demoting hold (the lease default route stays in place); per-VIP-subnet splits are installed where applicable.
+- VIP addresses remain assigned through the hold; ARP replies for VIPs are suppressed and locally-originated VIP-source traffic is dropped (scoped nftables), then VIPs are removed at hold completion. nft rules are reconciled on state transitions.
+- NAT/conntrack bypass: `apply.demote_nat_bypass_mark` (default 0) marks steered traffic (prerouting/postrouting, raw priority); `apply.demote_notrack` (default on) NOTRACKs steered traffic at prerouting so conntrack/NAT do not run on the demoting node. Zone-based forward policies may need cooperation (see `SEAMLESS_FIREWALL_HOWTO.md`).
+- Tests: unit coverage for steering/suppression/mark and config parsing; netns integration `tests/seamless-takeover-netns.sh` (root; nft checks when available). Load and WAN-ingress-under-load cases remain manual.
