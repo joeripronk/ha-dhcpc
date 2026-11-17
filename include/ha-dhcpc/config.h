@@ -99,12 +99,9 @@ typedef struct {
         char dns_hook[HADC_PATH_MAX];  /* empty = no hook */
         char ddclient[HADC_PATH_MAX];  /* empty = off; run as a one-shot when the
                                         * applied address changes (master-only) */
-        bool suppress_member_dad;      /* compatibility no-op */
-        bool arp_responder;            /* compatibility no-op (VIP owner answers) */
         bool announce_gratuitous;      /* gratuitous ARP on promotion */
         uint32_t announce_gratuitous_duration_ms; /* GARP burst duration on promotion */
         uint32_t handoff_hold_ms;      /* keep old master forwarding before egress block */
-        bool slave_link_down;          /* legacy alias for slave_isolation=down */
         hadc_slave_isolation_t slave_isolation; /* how a slave isolates the DHCP
                                                  * interface (none/down/nft) */
         bool slave_sync_wan;           /* keep DHCP IP/default route synced on slaves (WAN IP + default route) */

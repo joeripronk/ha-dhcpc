@@ -1,6 +1,5 @@
 /* DHCP core control-path tests. These run the vendored state machine without
  * sockets; send failures are expected and ignored by the core. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <stdio.h>

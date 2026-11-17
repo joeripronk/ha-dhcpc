@@ -3,7 +3,6 @@
  * the per-node local overlay (ha-dhcpc-local.conf), overlay wins. The digest we
  * carry is the digest of the shared document only — that is the value that is
  * stable cluster-wide and the value conf_sync carries (plan §6). */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -17,6 +16,7 @@
 #include <yaml.h>
 
 #include "ha-dhcpc/config.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
 #include "internal.h"
 
@@ -366,13 +366,12 @@ static int parse_cidr4(const char *s, struct in_addr *out, unsigned *prefixlen)
     const char *p = slash + 1;
     if (strchr(p, '.')) {
         struct in_addr mask;
+        bool ok = false;
         if (inet_pton(AF_INET, p, &mask) != 1)
             return -1;
-        uint32_t m = ntohl(mask.s_addr);
-        uint32_t inv = ~m;
-        if (inv & (inv + 1))
+        *prefixlen = hadc_ipv4_mask_to_prefix(mask, &ok);
+        if (!ok)
             return -1; /* non-contiguous netmask */
-        *prefixlen = (unsigned)__builtin_popcount(m);
     } else {
         char *end;
         unsigned long v = strtoul(p, &end, 10);
@@ -742,13 +741,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
              (a && json_object_get(a, "ddclient") && json_is_string(json_object_get(a, "ddclient")))
                  ? json_string_value(json_object_get(a, "ddclient"))
                  : "");
-    out->apply.suppress_member_dad = true;
-    out->apply.arp_responder = true;
     out->apply.announce_gratuitous = true;
     out->apply.announce_gratuitous_duration_ms = 10;
     out->apply.handoff_hold_ms = 5000;
-        out->apply.slave_link_down = false;
-        out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
+    out->apply.slave_isolation = HADC_SLAVE_ISO_NONE;
         out->apply.slave_sync_wan = false;
         out->apply.demote_route_via_new_master = false;
         out->apply.demote_nat_bypass_mark = 0;
@@ -767,8 +763,6 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         out->signal.sigint_action = HADC_SHUTDOWN_HANDOFF;
         out->signal.sigterm_action = HADC_SHUTDOWN_NOW;
         if (a) {
-        if (get_bool(a, "suppress_member_dad", &out->apply.suppress_member_dad, true)) goto derr;
-        if (get_bool(a, "arp_responder", &out->apply.arp_responder, true)) goto derr;
         if (get_bool(a, "announce_gratuitous", &out->apply.announce_gratuitous, true)) goto derr;
         if (get_int(a, "announce_gratuitous_duration_ms", &v, (int)out->apply.announce_gratuitous_duration_ms, false, "apply")) goto derr;
         if (v < 0 || v > 10000) {
@@ -782,7 +776,6 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
             goto derr;
         }
         out->apply.handoff_hold_ms = (uint32_t)v;
-        if (get_bool(a, "slave_link_down", &out->apply.slave_link_down, false)) goto derr;
         {
             json_t *iso = json_object_get(a, "slave_isolation");
             if (iso) {
@@ -801,11 +794,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     snprintf(err, errlen, "config: unknown slave_isolation %s", s);
                     goto derr;
                 }
-            } else if (out->apply.slave_link_down) {
-                out->apply.slave_isolation = HADC_SLAVE_ISO_DOWN;
             }
         }
-        out->apply.slave_link_down = (out->apply.slave_isolation == HADC_SLAVE_ISO_DOWN);
         if (get_bool(a, "slave_sync_wan", &out->apply.slave_sync_wan, false)) goto derr;
         if (get_bool(a, "demote_route_via_new_master", &out->apply.demote_route_via_new_master, false)) goto derr;
         if (get_int(a, "demote_nat_bypass_mark", &v, (long long)out->apply.demote_nat_bypass_mark, false, "apply")) goto derr;

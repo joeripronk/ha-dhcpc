@@ -1,5 +1,4 @@
 /* Linux compat shims for the vendored FreeBSD dhclient fork (see dhcpcompat.h). */
-#define _GNU_SOURCE
 
 #include <errno.h>
 #include <stdarg.h>

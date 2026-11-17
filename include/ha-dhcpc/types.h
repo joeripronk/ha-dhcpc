@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #define HADC_NODE_ID_MAX   64
 #define HADC_IFNAME_MAX    16
@@ -24,6 +25,28 @@ typedef enum {
     HADC_ROLE_PROMOTING, /* master setup in progress; not announced as master yet */
     HADC_ROLE_DEMOTING,  /* handing off; forwarding held, egress block pending */
 } hadc_role_t;
+
+static inline const char *hadc_role_name(hadc_role_t r)
+{
+    switch (r) {
+    case HADC_ROLE_MASTER:    return "master";
+    case HADC_ROLE_SLAVE:     return "slave";
+    case HADC_ROLE_PROMOTING: return "promoting";
+    case HADC_ROLE_DEMOTING:  return "demoting";
+    default:                  return "unknown";
+    }
+}
+
+static inline hadc_role_t hadc_role_from_name(const char *s)
+{
+    if (!s)
+        return HADC_ROLE_UNKNOWN;
+    if (!strcmp(s, "master"))    return HADC_ROLE_MASTER;
+    if (!strcmp(s, "slave"))     return HADC_ROLE_SLAVE;
+    if (!strcmp(s, "promoting")) return HADC_ROLE_PROMOTING;
+    if (!strcmp(s, "demoting"))  return HADC_ROLE_DEMOTING;
+    return HADC_ROLE_UNKNOWN;
+}
 
 typedef enum {
     HADC_RETENTION_FOREVER = 0,

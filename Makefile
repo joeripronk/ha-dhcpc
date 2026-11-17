@@ -59,8 +59,8 @@ tests_executor: tests/executor_test.c tests/stubs_routing.c tests/stubs_maintena
 tests_dhcp: tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c
 	$(CC) $(CFLAGS) -o $@ tests/dhcp_test.c tests/stubs_dhcp.c $(wildcard src/dhcp/*.c) src/log.c src/sha256.c $(LDLIBS)
 
-tests_cluster: tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/log.c src/sha256.c
-	$(CC) $(CFLAGS) -o $@ tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/log.c src/sha256.c $(LDLIBS)
+tests_cluster: tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/lease.c src/log.c src/sha256.c
+	$(CC) $(CFLAGS) -o $@ tests/cluster_test.c tests/stubs_cluster.c src/cluster.c src/lease.c src/log.c src/sha256.c $(LDLIBS)
 
 tests_conntrack: tests/conntrack_test.c src/conntrack.c include/ha-dhcpc/conntrack.h
 	$(CC) $(CFLAGS) -o $@ tests/conntrack_test.c $(LDLIBS)

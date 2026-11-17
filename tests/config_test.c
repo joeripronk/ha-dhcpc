@@ -1,6 +1,5 @@
 /* Config merge test: the shared document plus the per-node overlay, overlay
  * wins (plan §6), and the digest we sync on is the shared file's bytes only. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <jansson.h>
@@ -396,33 +395,33 @@ int main(void)
             ok("bad master_backup_gateway rejected");
     }
 
-    /* slave_link_down/slave_isolation: defaults off, parses and aliases */
+    /* slave_isolation: defaults off, parses modes */
     {
         char with_sld[2048];
 
         write_file(base, BASE_NOMAC);
         unlink(local);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
-            fail("slave_link_down default load");
-        else if (conf.apply.slave_link_down || conf.apply.slave_isolation != HADC_SLAVE_ISO_NONE)
-            fail("slave_link_down default is off");
+            fail("slave_isolation default load");
+        else if (conf.apply.slave_isolation != HADC_SLAVE_ISO_NONE)
+            fail("slave_isolation default is off");
         else
-            ok("slave_link_down default is off");
+            ok("slave_isolation default is off");
 
-        snprintf(with_sld, sizeof(with_sld), "%sapply:\n  slave_link_down: true\n", BASE_NOMAC);
+        snprintf(with_sld, sizeof(with_sld), "%sapply:\n  slave_isolation: down\n", BASE_NOMAC);
         write_file(base, with_sld);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
-            fail("slave_link_down parse");
-        else if (!conf.apply.slave_link_down || conf.apply.slave_isolation != HADC_SLAVE_ISO_DOWN)
-            fail("slave_link_down parsed from the shared document");
+            fail("slave_isolation down parse");
+        else if (conf.apply.slave_isolation != HADC_SLAVE_ISO_DOWN)
+            fail("slave_isolation down parsed");
         else
-            ok("slave_link_down parsed from the shared document");
+            ok("slave_isolation down parsed");
 
         snprintf(with_sld, sizeof(with_sld), "%sapply:\n  slave_isolation: nft\n", BASE_NOMAC);
         write_file(base, with_sld);
         if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
             fail("slave_isolation nft parse");
-        else if (conf.apply.slave_isolation != HADC_SLAVE_ISO_NFT_EGRESS || conf.apply.slave_link_down)
+        else if (conf.apply.slave_isolation != HADC_SLAVE_ISO_NFT_EGRESS)
             fail("slave_isolation nft parsed");
         else
             ok("slave_isolation nft parsed");

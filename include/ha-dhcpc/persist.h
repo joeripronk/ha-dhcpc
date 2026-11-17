@@ -1,8 +1,7 @@
 /* HA-DHCPC persistence (M0, frozen). Mirrors plan §3/§8.
  * Cluster view (role, last lease-state version, last acked version) as JSON,
  * fsynced, so a reboot resumes via INIT-REBOOT and a restarting node rejoins
- * with its last state. Lease files themselves stay under the DHCP engine's
- * dhclient-compatible handling. All timers persisted as remaining time.
+ * with its last state. Lease timers are persisted as absolute UTC anchors.
  */
 #ifndef HA_DHCPC_PERSIST_H
 #define HA_DHCPC_PERSIST_H

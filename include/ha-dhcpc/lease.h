@@ -2,6 +2,9 @@
 #ifndef HA_DHCPC_LEASE_H
 #define HA_DHCPC_LEASE_H
 
+#include <jansson.h>
+#include <string.h>
+
 #include "types.h"
 
 /* State machine states. Slaves mirror the master's; only the master drives
@@ -69,5 +72,22 @@ static inline const char *hadc_lease_state_name(hadc_lease_state_t s)
     }
     return "?";
 }
+
+static inline hadc_lease_state_t hadc_lease_state_from_name(const char *n)
+{
+    if (!n)
+        return HADC_LEASE_NONE;
+    if (!strcmp(n, "NONE"))         return HADC_LEASE_NONE;
+    if (!strcmp(n, "INIT-SELECT"))  return HADC_LEASE_INIT_SELECT;
+    if (!strcmp(n, "INIT-REBOOT"))  return HADC_LEASE_INIT_REBOOT;
+    if (!strcmp(n, "BOUND"))        return HADC_LEASE_BOUND;
+    if (!strcmp(n, "RENEW"))        return HADC_LEASE_RENEW;
+    if (!strcmp(n, "REBIND"))       return HADC_LEASE_REBIND;
+    if (!strcmp(n, "RETAINED"))     return HADC_LEASE_RETAINED;
+    return HADC_LEASE_NONE;
+}
+
+json_t *hadc_lease_to_json(const hadc_lease_t *l);
+void hadc_lease_from_json(json_t *lj, hadc_lease_t *out);
 
 #endif /* HA_DHCPC_LEASE_H */

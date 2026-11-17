@@ -81,8 +81,6 @@ dhcp:
   request_options: [1, 3, 6, 15, 28]
 apply:
   routes: true
-  suppress_member_dad: true
-  arp_responder: false
   announce_gratuitous: false
   disable_ipv6: true
 routing:

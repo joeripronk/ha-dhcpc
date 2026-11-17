@@ -2,7 +2,6 @@
  * Adds/removes only on delta; addresses and routes we did not apply ourselves
  * (per-node sync secondaries) are left alone. dhclient-script compatible
  * dns_hook dispatch with the standard reasons. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -30,6 +29,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
@@ -57,6 +57,34 @@ static uint64_t g_last_vip_neigh_collect_ms;
 static uint64_t g_last_audit_ms;
 static uint64_t g_drift_reconciled;
 static int g_last_verify = -1; /* -1 = unverified, 0 = matches, 1 = drift */
+
+static void nl_cache_drop(struct nl_cache **c)
+{
+	if (c && *c) {
+		nl_cache_put(*c);
+		*c = NULL;
+	}
+}
+
+static int hadc_nl_alloc_caches(struct nl_sock *sk, struct nl_cache **lcache,
+    struct nl_cache **acache, struct nl_cache **rcache, struct nl_cache **ncache)
+{
+	if (lcache && rtnl_link_alloc_cache(sk, AF_UNSPEC, lcache) < 0)
+		goto fail;
+	if (acache && rtnl_addr_alloc_cache(sk, acache) < 0)
+		goto fail;
+	if (rcache && rtnl_route_alloc_cache(sk, AF_INET, 0, rcache) < 0)
+		goto fail;
+	if (ncache && rtnl_neigh_alloc_cache(sk, ncache) < 0)
+		goto fail;
+	return 0;
+fail:
+	nl_cache_drop(ncache);
+	nl_cache_drop(rcache);
+	nl_cache_drop(acache);
+	nl_cache_drop(lcache);
+	return -1;
+}
 
 bool executor_action_is_fatal(int action_rc, bool action_is_fatal)
 {
@@ -178,15 +206,14 @@ int hadc_executor_init(hadc_ctx_t *ctx)
 static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
 {
     char addr[INET_ADDRSTRLEN], gw[INET_ADDRSTRLEN], backup[INET_ADDRSTRLEN];
-    char via[INET_ADDRSTRLEN], sid[INET_ADDRSTRLEN];
+    char via[INET_ADDRSTRLEN], sid[INET_ADDRSTRLEN], steer[INET_ADDRSTRLEN];
 
-    inet_ntop(AF_INET, &d->address, addr, sizeof(addr));
-    inet_ntop(AF_INET, &d->gateway, gw, sizeof(gw));
-    inet_ntop(AF_INET, &d->backup_gateway, backup, sizeof(backup));
-    char steer[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &d->default_via, via, sizeof(via));
-    inet_ntop(AF_INET, &d->server_id, sid, sizeof(sid));
-    inet_ntop(AF_INET, &d->steer_via, steer, sizeof(steer));
+    hadc_ipv4_format(d->address, addr, sizeof(addr));
+    hadc_ipv4_format(d->gateway, gw, sizeof(gw));
+    hadc_ipv4_format(d->backup_gateway, backup, sizeof(backup));
+    hadc_ipv4_format(d->default_via, via, sizeof(via));
+    hadc_ipv4_format(d->server_id, sid, sizeof(sid));
+    hadc_ipv4_format(d->steer_via, steer, sizeof(steer));
     json_t *o = json_pack(
         "{s:s, s:b, s:s, s:I, s:s, s:s, s:b, s:s, s:s, s:I, s:s, s:b, s:b, s:b, s:I, s:s, "
         "s:s, s:b, s:I, s:b}",
@@ -206,8 +233,10 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
         return;
     }
     json_t *dns = json_array();
-    for (size_t i = 0; i < d->n_dns; i++)
-        json_array_append_new(dns, json_string(inet_ntoa(d->dns[i])));
+    for (size_t i = 0; i < d->n_dns; i++) {
+        char dbuf[INET_ADDRSTRLEN];
+        json_array_append_new(dns, json_string(hadc_ipv4_format(d->dns[i], dbuf, sizeof(dbuf))));
+    }
     json_object_set_new(o, "dns", dns);
     json_object_set_new(o, "cluster_present", json_boolean(d->cluster_addrs_present));
     json_t *cifs = json_array();
@@ -217,7 +246,7 @@ static void canonical_desired(const hadc_desired_t *d, char *out, size_t outsz)
         for (size_t j = 0; j < ci->n_addrs; j++) {
             char caddr[INET_ADDRSTRLEN + 8];
             char ipbuf[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ci->addrs[j].address, ipbuf, sizeof(ipbuf));
+            hadc_ipv4_format(ci->addrs[j].address, ipbuf, sizeof(ipbuf));
             snprintf(caddr, sizeof(caddr), "%s/%u", ipbuf, ci->addrs[j].prefixlen);
             json_array_append_new(as, json_string(caddr));
         }
@@ -253,7 +282,7 @@ static bool server_needs_pin(const hadc_desired_t *d)
         return false;
     if (d->prefixlen >= 32)
         return true;
-    mask = htonl(~(0xffffffffu >> d->prefixlen));
+    mask = hadc_ipv4_prefix_mask(d->prefixlen).s_addr;
     return (d->server_id.s_addr & mask) != (d->address.s_addr & mask);
 }
 
@@ -310,7 +339,7 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
     } else {
         out->present = true;
         out->address = lease->address;
-        out->prefixlen = (unsigned)__builtin_popcount(ntohl(lease->netmask.s_addr));
+        out->prefixlen = hadc_ipv4_netmask_prefix(lease->netmask);
         out->gateway = lease->gateway;
         out->gw_mac_valid = lease->gw_mac_valid && lease->gateway.s_addr != 0;
         if (out->gw_mac_valid)
@@ -468,42 +497,42 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
             const hadc_cluster_addr_t *a = &ci->addrs[j];
             struct rtnl_addr *cur = find_addr(acache, ifindex, &a->address, -1);
 
-            if (present) {
-                if (cur && (unsigned)rtnl_addr_get_prefixlen(cur) != a->prefixlen) {
-                    if ((rc = rtnl_addr_delete(g_sk, cur, 0)) < 0)
-                        hadc_warn("executor: replacing cluster address %s/%u on %s failed: %s",
-                            inet_ntoa(a->address),
-                            (unsigned)rtnl_addr_get_prefixlen(cur), ci->interface,
-                            nl_geterror(rc));
-                    else
-                        hadc_info("executor: replaced cluster address %s/%u on %s (reason=%s)",
-                            inet_ntoa(a->address),
-                            (unsigned)rtnl_addr_get_prefixlen(cur), ci->interface, reason);
-                    cur = NULL;
-                }
-                if (!cur) {
-                    if ((rc = nl_addr_add(g_sk, ifindex, &a->address, a->prefixlen)) < 0)
-                        hadc_warn("executor: adding cluster address %s/%u on %s failed: %s",
-                            inet_ntoa(a->address), a->prefixlen, ci->interface,
-                            nl_geterror(rc));
-                    else
-                        hadc_info("executor: added cluster address %s/%u on %s (reason=%s)",
-                            inet_ntoa(a->address), a->prefixlen, ci->interface, reason);
-                }
-            } else if (cur) {
-                /* Graceful restart: keep VIPs in place across shutdown/restart. */
-                if (graceful) {
-                    hadc_dbg("executor: graceful restart active; keeping cluster address %s/%u on %s",
-                        inet_ntoa(a->address), a->prefixlen, ci->interface);
-                } else {
-                    /* Any prefix left behind by a previous master is stale. */
-                    if ((rc = rtnl_addr_delete(g_sk, cur, 0)) < 0)
-                        hadc_warn("executor: removing cluster address %s/%u from %s failed: %s",
-                            inet_ntoa(a->address), a->prefixlen, ci->interface,
-                            nl_geterror(rc));
-                    else
-                        hadc_info("executor: removed cluster address %s/%u from %s (reason=%s)",
-                            inet_ntoa(a->address), a->prefixlen, ci->interface, reason);
+            {
+                char abuf[INET_ADDRSTRLEN];
+                hadc_ipv4_format(a->address, abuf, sizeof(abuf));
+                if (present) {
+                    if (cur && (unsigned)rtnl_addr_get_prefixlen(cur) != a->prefixlen) {
+                        if ((rc = rtnl_addr_delete(g_sk, cur, 0)) < 0)
+                            hadc_warn("executor: replacing cluster address %s/%u on %s failed: %s",
+                                abuf, (unsigned)rtnl_addr_get_prefixlen(cur), ci->interface,
+                                nl_geterror(rc));
+                        else
+                            hadc_info("executor: replaced cluster address %s/%u on %s (reason=%s)",
+                                abuf, (unsigned)rtnl_addr_get_prefixlen(cur), ci->interface, reason);
+                        cur = NULL;
+                    }
+                    if (!cur) {
+                        if ((rc = nl_addr_add(g_sk, ifindex, &a->address, a->prefixlen)) < 0)
+                            hadc_warn("executor: adding cluster address %s/%u on %s failed: %s",
+                                abuf, a->prefixlen, ci->interface, nl_geterror(rc));
+                        else
+                            hadc_info("executor: added cluster address %s/%u on %s (reason=%s)",
+                                abuf, a->prefixlen, ci->interface, reason);
+                    }
+                } else if (cur) {
+                    /* Graceful restart: keep VIPs in place across shutdown/restart. */
+                    if (graceful) {
+                        hadc_dbg("executor: graceful restart active; keeping cluster address %s/%u on %s",
+                            abuf, a->prefixlen, ci->interface);
+                    } else {
+                        /* Any prefix left behind by a previous master is stale. */
+                        if ((rc = rtnl_addr_delete(g_sk, cur, 0)) < 0)
+                            hadc_warn("executor: removing cluster address %s/%u from %s failed: %s",
+                                abuf, a->prefixlen, ci->interface, nl_geterror(rc));
+                        else
+                            hadc_info("executor: removed cluster address %s/%u from %s (reason=%s)",
+                                abuf, a->prefixlen, ci->interface, reason);
+                    }
                 }
             }
         }
@@ -531,14 +560,16 @@ static void apply_cluster_addrs(hadc_ctx_t *ctx, struct nl_cache *lcache,
                                   (int)a->prefixlen);
                 if (!stale)
                     continue;
-                if ((rc = rtnl_addr_delete(g_sk, stale, 0)) < 0)
-                    hadc_warn("executor: removing stale cluster address %s/%u from %s "
-                        "failed: %s", inet_ntoa(a->address), a->prefixlen, ci->interface,
-                        nl_geterror(rc));
-                else
-                    hadc_info("executor: removed stale cluster address %s/%u from %s "
-                        "(reason=%s)", inet_ntoa(a->address), a->prefixlen, ci->interface,
-                        reason);
+                {
+                    char abuf[INET_ADDRSTRLEN];
+                    hadc_ipv4_format(a->address, abuf, sizeof(abuf));
+                    if ((rc = rtnl_addr_delete(g_sk, stale, 0)) < 0)
+                        hadc_warn("executor: removing stale cluster address %s/%u from %s "
+                            "failed: %s", abuf, a->prefixlen, ci->interface, nl_geterror(rc));
+                    else
+                        hadc_info("executor: removed stale cluster address %s/%u from %s "
+                            "(reason=%s)", abuf, a->prefixlen, ci->interface, reason);
+                }
             }
             rtnl_link_put(link);
         }
@@ -570,7 +601,7 @@ static void route_collect_cb(struct nl_object *obj, void *p)
 struct host_match {
 	const struct in_addr *dst;
 	const struct in_addr *gw;
-	int want_plen; /* -1: legacy (32 with dst, 0 without); else exact prefix */
+	unsigned want_plen;
 	struct rtnl_route *found;
 };
 
@@ -586,27 +617,20 @@ static void host_route_match_cb(struct nl_object *obj, void *p)
 		return;
 	if (m->dst == NULL) {
 		static const struct in_addr any;
-		unsigned want = m->want_plen >= 0 ? (unsigned)m->want_plen : 0;
 		if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
 			return;
-		if (nl_addr_get_prefixlen(dst) != want ||
+		if (nl_addr_get_prefixlen(dst) != m->want_plen ||
 		    memcmp(nl_addr_get_binary_addr(dst), &any, 4) != 0)
 			return;
 	} else {
-		unsigned want = m->want_plen >= 0 ? (unsigned)m->want_plen : 32;
 		uint32_t base, got;
 		if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4)
 			return;
-		if (nl_addr_get_prefixlen(dst) != want)
+		if (nl_addr_get_prefixlen(dst) != m->want_plen)
 			return;
 		/* prefix comparison on the network address, not the raw row */
-		if (want >= 32) {
-			base = ntohl(m->dst->s_addr);
-		} else {
-			base = ntohl(m->dst->s_addr) & (want ? ~(0xffffffffu >> want) : 0xffffffffu);
-		}
-		got = ntohl(*(const uint32_t *)nl_addr_get_binary_addr(dst));
-		got &= want >= 32 ? 0xffffffffu : (want ? ~(0xffffffffu >> want) : 0xffffffffu);
+		base = ntohl(m->dst->s_addr) & hadc_ipv4_prefix_mask_host(m->want_plen);
+		got = ntohl(*(const uint32_t *)nl_addr_get_binary_addr(dst)) & hadc_ipv4_prefix_mask_host(m->want_plen);
 		if (got != base)
 			return;
 	}
@@ -648,7 +672,7 @@ static struct rtnl_route *find_prefix_route(struct nl_cache *cache, const struct
 	memset(&m, 0, sizeof(m));
 	m.dst = dst;
 	m.gw = gw;
-	m.want_plen = (int)plen;
+	m.want_plen = plen;
 	nl_cache_foreach(cache, host_route_match_cb, &m);
 	return m.found;
 }
@@ -675,7 +699,7 @@ size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
 
 			if (!a->address.s_addr || plen > 31)
 				continue;
-			mask = plen ? ~(0xffffffffu >> plen) : 0xffffffffu;
+			mask = hadc_ipv4_prefix_mask_host(plen);
 			base = ntohl(a->address.s_addr) & mask;
 			if (via->s_addr && (ntohl(via->s_addr) & mask) == base)
 				continue;
@@ -744,21 +768,26 @@ static void run_hook(char *const argv[], const hadc_desired_t *prev,
 	pid_t pid;
 	int status;
 
-	mask.s_addr = d->prefixlen <= 32 ? htonl(~(0xffffffffu >> d->prefixlen)) : 0;
-	snprintf(e_reason, sizeof(e_reason), "reason=%s", reason);
-	snprintf(e_if, sizeof(e_if), "interface=%s", d->interface);
-	snprintf(e_newip, sizeof(e_newip), "new_ip_address=%s",
-	    d->present ? inet_ntoa(d->address) : "");
-	snprintf(e_oldip, sizeof(e_oldip), "old_ip_address=%s",
-	    prev && prev->present ? inet_ntoa(prev->address) : "");
-	snprintf(e_mask, sizeof(e_mask), "new_mask=%s",
-	    d->present ? inet_ntoa(mask) : "");
-	snprintf(e_gw, sizeof(e_gw), "new_routers=%s",
-	    d->gateway.s_addr ? inet_ntoa(d->gateway) : "");
+	{
+		char abuf[INET_ADDRSTRLEN], obuf[INET_ADDRSTRLEN], mbuf[INET_ADDRSTRLEN], gbuf[INET_ADDRSTRLEN];
+		mask = hadc_ipv4_prefix_mask(d->prefixlen);
+		snprintf(e_reason, sizeof(e_reason), "reason=%s", reason);
+		snprintf(e_if, sizeof(e_if), "interface=%s", d->interface);
+		snprintf(e_newip, sizeof(e_newip), "new_ip_address=%s",
+		    d->present ? hadc_ipv4_format(d->address, abuf, sizeof(abuf)) : "");
+		snprintf(e_oldip, sizeof(e_oldip), "old_ip_address=%s",
+		    prev && prev->present ? hadc_ipv4_format(prev->address, obuf, sizeof(obuf)) : "");
+		snprintf(e_mask, sizeof(e_mask), "new_mask=%s",
+		    d->present ? hadc_ipv4_format(mask, mbuf, sizeof(mbuf)) : "");
+		snprintf(e_gw, sizeof(e_gw), "new_routers=%s",
+		    d->gateway.s_addr ? hadc_ipv4_format(d->gateway, gbuf, sizeof(gbuf)) : "");
+	}
 	pos = 0;
-	for (size_t i = 0; i < d->n_dns && pos < sizeof(e_dns) - 16; i++)
+	for (size_t i = 0; i < d->n_dns && pos < sizeof(e_dns) - 16; i++) {
+		char dbuf[INET_ADDRSTRLEN];
 		pos += snprintf(e_dns + pos, sizeof(e_dns) - pos, "%s%s", i ? " " : "",
-		    inet_ntoa(d->dns[i]));
+		    hadc_ipv4_format(d->dns[i], dbuf, sizeof(dbuf)));
+	}
 	snprintf(e_dns + pos, sizeof(e_dns) - pos, "%s", pos ? "" : "new_domain_name_servers=");
 
 	envp[n++] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -808,7 +837,7 @@ static int nl_addr_add(struct nl_sock *sk, int ifindex, const struct in_addr *ip
 	ifa->ifa_scope = RT_SCOPE_UNIVERSE;
 	ifa->ifa_index = (unsigned int)ifindex;
 	if (plen < 32) {
-		uint32_t mask = ~(0xffffffffu >> plen);
+		uint32_t mask = hadc_ipv4_prefix_mask_host(plen);
 		struct in_addr bc;
 		bc.s_addr = htonl((ntohl(ip->s_addr) & mask) | ~mask);
 		nla_put(m, IFA_BROADCAST, 4, &bc);
@@ -958,16 +987,18 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 	struct nl_cache *ncache = NULL;
 	struct rtnl_neigh *cur, *n;
 	struct nl_addr *dst;
+	char gwbuf[INET_ADDRSTRLEN];
 	int rc;
 
 	if (!g_sk)
 		return;
+	hadc_ipv4_format(*gw, gwbuf, sizeof(gwbuf));
 	dst = nl_addr_build(AF_INET, (void *)gw, 4);
 	if (!dst)
 		return;
-	if (rtnl_neigh_alloc_cache(g_sk, &ncache) < 0 || !ncache) {
+	if (hadc_nl_alloc_caches(g_sk, NULL, NULL, NULL, &ncache) < 0 || !ncache) {
 		hadc_warn("executor: neighbor cache dump failed (gateway %s cache not "
-		    "programmed, reason=%s)", inet_ntoa(*gw), reason);
+		    "programmed, reason=%s)", gwbuf, reason);
 		nl_addr_put(dst);
 		return;
 	}
@@ -977,9 +1008,9 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 		if (ll && nl_addr_get_len(ll) == HADC_MAC_LEN &&
 		    memcmp(nl_addr_get_binary_addr(ll), mac, HADC_MAC_LEN) == 0) {
 			hadc_dbg("executor: neighbor entry for %s already holds the cached "
-			    "lladdr", inet_ntoa(*gw));
+			    "lladdr", gwbuf);
 			rtnl_neigh_put(cur);
-			nl_cache_put(ncache);
+			nl_cache_drop(&ncache);
 			nl_addr_put(dst);
 			return;
 		}
@@ -987,39 +1018,39 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 	}
 	n = rtnl_neigh_alloc();
 	if (!n) {
-		nl_cache_put(ncache);
+		nl_cache_drop(&ncache);
 		nl_addr_put(dst);
 		return;
 	}
 	rtnl_neigh_set_family(n, AF_INET);
 	rtnl_neigh_set_ifindex(n, ifindex);
 	rtnl_neigh_set_state(n, NUD_PERMANENT);
-	{
-		struct nl_addr *ll = nl_addr_build(AF_UNSPEC, (void *)mac, HADC_MAC_LEN);
-		if (!ll || rtnl_neigh_set_dst(n, nl_addr_clone(dst)) < 0) {
-			if (ll)
-				nl_addr_put(ll);
-			hadc_warn("executor: building neighbor entry for %s failed (reason=%s)",
-			    inet_ntoa(*gw), reason);
-			rtnl_neigh_put(n);
-			nl_cache_put(ncache);
-			nl_addr_put(dst);
-			return;
+		{
+			struct nl_addr *ll = nl_addr_build(AF_UNSPEC, (void *)mac, HADC_MAC_LEN);
+			if (!ll || rtnl_neigh_set_dst(n, nl_addr_clone(dst)) < 0) {
+				if (ll)
+					nl_addr_put(ll);
+				hadc_warn("executor: building neighbor entry for %s failed (reason=%s)",
+				    gwbuf, reason);
+				rtnl_neigh_put(n);
+				nl_cache_drop(&ncache);
+				nl_addr_put(dst);
+				return;
+			}
+			rtnl_neigh_set_lladdr(n, ll); /* takes ownership */
 		}
-		rtnl_neigh_set_lladdr(n, ll); /* takes ownership */
-	}
 	rc = rtnl_neigh_add(g_sk, n, NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK);
 	if (rc < 0)
 		hadc_warn("executor: programming permanent neighbor %s -> "
-		    "%02x:%02x:%02x:%02x:%02x:%02x failed: %s", inet_ntoa(*gw), mac[0],
+		    "%02x:%02x:%02x:%02x:%02x:%02x failed: %s", gwbuf, mac[0],
 		    mac[1], mac[2], mac[3], mac[4], mac[5], nl_geterror(rc));
 	else
 		hadc_info("executor: programmed permanent neighbor %s -> "
 		    "%02x:%02x:%02x:%02x:%02x:%02x on ifindex %d (reason=%s)",
-		    inet_ntoa(*gw), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+		    gwbuf, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
 		    ifindex, reason);
 	rtnl_neigh_put(n);
-	nl_cache_put(ncache);
+	nl_cache_drop(&ncache);
 	nl_addr_put(dst);
 }
 
@@ -1040,8 +1071,7 @@ int hadc_executor_observe_gw_mac(hadc_ctx_t *ctx, uint8_t mac[HADC_MAC_LEN])
 	dst = nl_addr_build(AF_INET, (void *)&ctx->lease.gateway, 4);
 	if (!dst)
 		goto out;
-	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache ||
-	    rtnl_neigh_alloc_cache(g_sk, &ncache) < 0 || !ncache) {
+	if (hadc_nl_alloc_caches(g_sk, &lcache, NULL, NULL, &ncache) < 0 || !lcache || !ncache) {
 		hadc_dbg("executor: neighbor observation: netlink cache dump failed");
 		goto out;
 	}
@@ -1075,10 +1105,8 @@ out:
 		rtnl_neigh_put(n);
 	if (link)
 		rtnl_link_put(link);
-	if (lcache)
-		nl_cache_put(lcache);
-	if (ncache)
-		nl_cache_put(ncache);
+	nl_cache_drop(&lcache);
+	nl_cache_drop(&ncache);
 	nl_addr_put(dst);
 	hadc_maint_unlock();
 	return rc;
@@ -1111,8 +1139,7 @@ int hadc_executor_collect_vip_neighs(hadc_ctx_t *ctx, bool force_push)
         goto out_unlock;
     if (ctx->role != HADC_ROLE_MASTER && ctx->role != HADC_ROLE_PROMOTING)
         goto out_unlock;
-    if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache ||
-        rtnl_neigh_alloc_cache(g_sk, &ncache) < 0 || !ncache)
+    if (hadc_nl_alloc_caches(g_sk, &lcache, NULL, NULL, &ncache) < 0 || !lcache || !ncache)
         goto out_unlock;
 
     cap = ctx->conf.cluster.neighbor_sync_max;
@@ -1194,8 +1221,8 @@ int hadc_executor_collect_vip_neighs(hadc_ctx_t *ctx, bool force_push)
     }
 
 out_unlock:
-    if (lcache) nl_cache_put(lcache);
-    if (ncache) nl_cache_put(ncache);
+    nl_cache_drop(&lcache);
+    nl_cache_drop(&ncache);
     hadc_maint_unlock();
 
     if (collected && do_push)
@@ -1236,8 +1263,10 @@ static void hadc_executor_apply_vip_neighs(hadc_ctx_t *ctx, const hadc_desired_t
             rtnl_neigh_set_dst(n, dst); dst = NULL; /* takes ownership */
             rtnl_neigh_set_lladdr(n, ll); ll = NULL;
             int rc = rtnl_neigh_add(g_sk, n, NLM_F_CREATE | NLM_F_REPLACE);
-            if (rc < 0 && rc != -NLE_EXIST)
-                hadc_dbg("executor: vip neighbor %s dev %s add: %s", inet_ntoa(vn->ip), vn->ifname, nl_geterror(rc));
+            if (rc < 0 && rc != -NLE_EXIST) {
+                char vnbuf[INET_ADDRSTRLEN];
+                hadc_dbg("executor: vip neighbor %s dev %s add: %s", hadc_ipv4_format(vn->ip, vnbuf, sizeof(vnbuf)), vn->ifname, nl_geterror(rc));
+            }
         }
         if (dst) nl_addr_put(dst);
         if (ll) nl_addr_put(ll);
@@ -1281,13 +1310,9 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 
 	if (!g_sk)
 		return -1;
-	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 ||
-	    rtnl_addr_alloc_cache(g_sk, &acache) < 0 ||
-	    rtnl_route_alloc_cache(g_sk, AF_INET, 0, &rcache) < 0 ||
-	    rtnl_neigh_alloc_cache(g_sk, &ncache) < 0) {
+	if (hadc_nl_alloc_caches(g_sk, &lcache, &acache, &rcache, &ncache) < 0) {
 		hadc_dbg("executor: drift verify: netlink cache dump failed");
-		drift = -1;
-		goto out;
+		return -1;
 	}
 	link = rtnl_link_get_by_name(lcache, d->interface);
 	if (!link) {
@@ -1374,14 +1399,10 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 out:
 	if (link)
 		rtnl_link_put(link);
-	if (lcache)
-		nl_cache_put(lcache);
-	if (acache)
-		nl_cache_put(acache);
-	if (rcache)
-		nl_cache_put(rcache);
-	if (ncache)
-		nl_cache_put(ncache);
+	nl_cache_drop(&lcache);
+	nl_cache_drop(&acache);
+	nl_cache_drop(&rcache);
+	nl_cache_drop(&ncache);
 	(void)ctx;
 	return drift;
 }
@@ -1569,9 +1590,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 	    desired->config_hash[0], desired->config_hash[1], desired->config_hash[2],
 	    desired->config_hash[3]);
 
-	if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 ||
-	    rtnl_addr_alloc_cache(g_sk, &acache) < 0 ||
-	    rtnl_route_alloc_cache(g_sk, AF_INET, 0, &rcache) < 0) {
+	if (hadc_nl_alloc_caches(g_sk, &lcache, &acache, &rcache, NULL) < 0) {
 		hadc_warn("executor: netlink cache dump failed");
 		if (executor_action_is_fatal(-1, true))
 			fatal = -1;
@@ -1602,29 +1621,29 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 	    desired->prefixlen != prev->prefixlen)) {
 		stale = find_addr(acache, ifindex, &prev->address, prev->prefixlen);
 		if (stale) {
+			char abuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(prev->address, abuf, sizeof(abuf));
 			if ((ar = rtnl_addr_delete(g_sk, stale, 0)) < 0)
 				hadc_warn("executor: deleting address %s/%u failed: %s",
-				    inet_ntoa(prev->address), prev->prefixlen,
-				    nl_geterror(ar));
+				    abuf, prev->prefixlen, nl_geterror(ar));
 			else
 				hadc_info("executor: removed address %s/%u from %s (reason=%s)",
-				    inet_ntoa(prev->address), prev->prefixlen,
-				    desired->interface, reason);
+				    abuf, prev->prefixlen, desired->interface, reason);
 		}
 	}
 	if (desired->present) {
+		char abuf[INET_ADDRSTRLEN];
+		hadc_ipv4_format(desired->address, abuf, sizeof(abuf));
 		struct rtnl_addr *cur = find_addr(acache, ifindex, &desired->address, -1);
 		if (cur && (unsigned)rtnl_addr_get_prefixlen(cur) != desired->prefixlen) {
 			/* Same address, wrong prefix (e.g. left over by an older
 			   build): replace it, it is our lease address. */
 			if ((ar = rtnl_addr_delete(g_sk, cur, 0)) < 0)
 				hadc_warn("executor: replacing address %s/%u failed: %s",
-				    inet_ntoa(desired->address),
-				    (unsigned)rtnl_addr_get_prefixlen(cur), nl_geterror(ar));
+				    abuf, (unsigned)rtnl_addr_get_prefixlen(cur), nl_geterror(ar));
 			else
 				hadc_info("executor: replaced address %s/%u on %s (reason=%s)",
-				    inet_ntoa(desired->address),
-				    (unsigned)rtnl_addr_get_prefixlen(cur),
+				    abuf, (unsigned)rtnl_addr_get_prefixlen(cur),
 				    desired->interface, reason);
 			cur = NULL;
 		}
@@ -1632,16 +1651,13 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 			if ((ar = nl_addr_add(g_sk, ifindex, &desired->address,
 			    desired->prefixlen)) < 0)
 				hadc_warn("executor: adding address %s/%u failed: %s",
-				    inet_ntoa(desired->address), desired->prefixlen,
-				    nl_geterror(ar));
+				    abuf, desired->prefixlen, nl_geterror(ar));
 			else
 				hadc_info("executor: added address %s/%u on %s (reason=%s)",
-				    inet_ntoa(desired->address), desired->prefixlen,
-				    desired->interface, reason);
+				    abuf, desired->prefixlen, desired->interface, reason);
 		} else {
 			hadc_dbg("executor: address %s/%u already present on %s",
-			    inet_ntoa(desired->address), desired->prefixlen,
-			    desired->interface);
+			    abuf, desired->prefixlen, desired->interface);
 		}
 	}
 
@@ -1671,13 +1687,14 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 			    prev->gateway.s_addr != desired->gateway.s_addr)) {
 				sroute = find_host_route(rcache, &prev->server_id, &prev->gateway);
 				if (sroute) {
+					char pbuf[INET_ADDRSTRLEN];
+					hadc_ipv4_format(prev->server_id, pbuf, sizeof(pbuf));
 					if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 						hadc_warn("executor: deleting stale server pin to %s "
-						    "failed: %s", inet_ntoa(prev->server_id),
-						    nl_geterror(ar));
+						    "failed: %s", pbuf, nl_geterror(ar));
 					else
 						hadc_info("executor: removed stale server pin to %s "
-						    "(reason=%s)", inet_ntoa(prev->server_id), reason);
+						    "(reason=%s)", pbuf, reason);
 				}
 			}
 			if (!find_host_route(rcache, &desired->server_id, &desired->gateway)) {
@@ -1692,20 +1709,23 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 		} else if (prev && server_needs_pin(prev)) {
 			sroute = find_host_route(rcache, &prev->server_id, &prev->gateway);
 			if (sroute) {
+				char pbuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(prev->server_id, pbuf, sizeof(pbuf));
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting server pin /32 to %s failed: %s",
-					    inet_ntoa(prev->server_id), nl_geterror(ar));
+					    pbuf, nl_geterror(ar));
 				else
 					hadc_info("executor: removed server pin /32 to %s (reason=%s)",
-					    inet_ntoa(prev->server_id), reason);
+					    pbuf, reason);
 			}
 		}
 
 		if (via->s_addr) {
+			char viabuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(*via, viabuf, sizeof(viabuf));
 			sroute = find_default(rcache, via);
 			if (sroute) {
-				hadc_dbg("executor: default route via %s already present",
-				    inet_ntoa(*via));
+				hadc_dbg("executor: default route via %s already present", viabuf);
 			} else {
 				/* Remove every conflicting default-route entry
 				   (ours from before, netifd's, any type). */
@@ -1728,22 +1748,25 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 				int oif = desired->default_via.s_addr ? 0 : ifindex;
 				if ((ar = nl_route_add_default(g_sk, oif, via, 0)) < 0)
 					hadc_warn("executor: adding default route via %s failed: %s",
-					    inet_ntoa(*via), nl_geterror(ar));
+					    viabuf, nl_geterror(ar));
 				else
 					hadc_info("executor: added default route via %s on %s (reason=%s)",
-					    inet_ntoa(*via), desired->interface, reason);
+					    viabuf, desired->interface, reason);
 				wiped = true;
 			}
 		} else if (prev && default_nexthop(prev)->s_addr) {
 			/* the gateway went away: drop what we applied */
-			sroute = find_default(rcache, default_nexthop(prev));
+			const struct in_addr *pvia = default_nexthop(prev);
+			sroute = find_default(rcache, pvia);
 			if (sroute) {
+				char pvbuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(*pvia, pvbuf, sizeof(pvbuf));
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting default route via %s failed: %s",
-					    inet_ntoa(*default_nexthop(prev)), nl_geterror(ar));
+					    pvbuf, nl_geterror(ar));
 				else
 					hadc_info("executor: removed default route via %s (reason=%s)",
-					    inet_ntoa(*default_nexthop(prev)), reason);
+					    pvbuf, reason);
 			}
 		}
 
@@ -1768,32 +1791,31 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 		   primary wins whenever it exists and this takes over when it does
 		   not. It is dropped again on promotion. */
 		if (want_backup) {
+			char bbuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(desired->backup_gateway, bbuf, sizeof(bbuf));
 			if (wiped || !find_default(rcache, &desired->backup_gateway)) {
 				if ((ar = nl_route_add_default(g_sk, 0,
 				    &desired->backup_gateway, HADC_BACKUP_ROUTE_METRIC)) < 0)
 					hadc_warn("executor: adding backup default route via "
-					    "%s failed: %s", inet_ntoa(desired->backup_gateway),
-					    nl_geterror(ar));
+					    "%s failed: %s", bbuf, nl_geterror(ar));
 				else
 					hadc_info("executor: added backup default route via %s "
-					    "metric %d (reason=%s)",
-					    inet_ntoa(desired->backup_gateway),
-					    HADC_BACKUP_ROUTE_METRIC, reason);
+					    "metric %d (reason=%s)", bbuf, HADC_BACKUP_ROUTE_METRIC, reason);
 			} else {
-				hadc_dbg("executor: backup default route via %s already present",
-				    inet_ntoa(desired->backup_gateway));
+				hadc_dbg("executor: backup default route via %s already present", bbuf);
 			}
 		} else if (prev && prev->backup_route && prev->backup_gateway.s_addr &&
 		    prev->backup_gateway.s_addr != via->s_addr) {
 			sroute = find_default(rcache, &prev->backup_gateway);
 			if (sroute) {
+				char bbuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(prev->backup_gateway, bbuf, sizeof(bbuf));
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting backup default route via "
-					    "%s failed: %s", inet_ntoa(prev->backup_gateway),
-					    nl_geterror(ar));
+					    "%s failed: %s", bbuf, nl_geterror(ar));
 				else
 					hadc_info("executor: removed backup default route via %s "
-					    "(reason=%s)", inet_ntoa(prev->backup_gateway), reason);
+					    "(reason=%s)", bbuf, reason);
 			}
 		}
 		/* Optional: slave local-origin policy routing via master */
@@ -1803,12 +1825,17 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 			else
 				hadc_info("executor: ensured policy rule lookup table %d (reason=%s)", desired->slave_wan_local_table, reason);
 			if ((ar = nl_route_add_default_table(g_sk, 0, &desired->backup_gateway, 0, (uint32_t)desired->slave_wan_local_table)) < 0) {
+				char bbuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(desired->backup_gateway, bbuf, sizeof(bbuf));
 				if (ar == -NLE_EXIST)
-					hadc_dbg("executor: policy table %d default via %s already present", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway));
+					hadc_dbg("executor: policy table %d default via %s already present", desired->slave_wan_local_table, bbuf);
 				else
-					hadc_warn("executor: adding default in table %d via %s failed: %s", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway), nl_geterror(ar));
-			} else
-				hadc_info("executor: added default route in table %d via %s (reason=%s)", desired->slave_wan_local_table, inet_ntoa(desired->backup_gateway), reason);
+					hadc_warn("executor: adding default in table %d via %s failed: %s", desired->slave_wan_local_table, bbuf, nl_geterror(ar));
+			} else {
+				char bbuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(desired->backup_gateway, bbuf, sizeof(bbuf));
+				hadc_info("executor: added default route in table %d via %s (reason=%s)", desired->slave_wan_local_table, bbuf, reason);
+			}
 		} else if (prev && prev->slave_sync_wan && prev->slave_wan_local_via_master && prev->slave_wan_local_table > 0) {
 			bool need_cleanup = false;
 			if (!desired->slave_sync_wan || !desired->slave_wan_local_via_master || desired->slave_wan_local_table != prev->slave_wan_local_table)
@@ -1821,13 +1848,15 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 				else
 					hadc_info("executor: removed policy rule lookup table %d (reason=%s)", prev->slave_wan_local_table, reason);
 				if (prev->backup_gateway.s_addr != 0) {
+					char bbuf[INET_ADDRSTRLEN];
+					hadc_ipv4_format(prev->backup_gateway, bbuf, sizeof(bbuf));
 					if ((ar = nl_route_del_default_table(g_sk, (uint32_t)prev->slave_wan_local_table, &prev->backup_gateway)) < 0) {
 						if (ar == -NLE_OBJ_NOTFOUND || ar == -NLE_NOADDR)
-							hadc_dbg("executor: policy table %d default route via %s not present", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway));
+							hadc_dbg("executor: policy table %d default route via %s not present", prev->slave_wan_local_table, bbuf);
 						else
-							hadc_warn("executor: deleting policy table %d default route via %s failed: %s", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway), nl_geterror(ar));
+							hadc_warn("executor: deleting policy table %d default route via %s failed: %s", prev->slave_wan_local_table, bbuf, nl_geterror(ar));
 					} else
-						hadc_info("executor: removed policy table %d default route via %s (reason=%s)", prev->slave_wan_local_table, inet_ntoa(prev->backup_gateway), reason);
+						hadc_info("executor: removed policy table %d default route via %s (reason=%s)", prev->slave_wan_local_table, bbuf, reason);
 				}
 			}
 		}
@@ -1850,59 +1879,63 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 		split[0] = &split_low;
 		split[1] = &split_high;
 		if (desired->steer_via.s_addr) {
+			char viabuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(desired->steer_via, viabuf, sizeof(viabuf));
 			for (size_t i = 0; i < 2; i++) {
 				char dstbuf[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, split[i], dstbuf, sizeof(dstbuf));
+				hadc_ipv4_format(*split[i], dstbuf, sizeof(dstbuf));
 				if (find_prefix_route(rcache, split[i], 1, &desired->steer_via))
 					continue;
 				if ((ar = nl_route_add_prefix(g_sk, split[i], 1, &desired->steer_via)) < 0)
 					hadc_warn("executor: adding steering route %s/1 via %s failed: %s",
-					    dstbuf, inet_ntoa(desired->steer_via), nl_geterror(ar));
+					    dstbuf, viabuf, nl_geterror(ar));
 				else
 					hadc_info("executor: added steering route %s/1 via %s (reason=%s)",
-					    dstbuf, inet_ntoa(desired->steer_via), reason);
+					    dstbuf, viabuf, reason);
 			}
 			n_vips = vip_splits(desired, &desired->steer_via, vips, VIP_SPLIT_MAX);
 			for (size_t i = 0; i < n_vips; i++) {
 				char dstbuf[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, &vips[i].net, dstbuf, sizeof(dstbuf));
+				hadc_ipv4_format(vips[i].net, dstbuf, sizeof(dstbuf));
 				if (find_prefix_route(rcache, &vips[i].net, vips[i].plen, &desired->steer_via))
 					continue;
 				if ((ar = nl_route_add_prefix(g_sk, &vips[i].net, vips[i].plen,
 				        &desired->steer_via)) < 0)
 					hadc_warn("executor: adding steering route %s/%u via %s failed: %s",
-					    dstbuf, vips[i].plen, inet_ntoa(desired->steer_via), nl_geterror(ar));
+					    dstbuf, vips[i].plen, viabuf, nl_geterror(ar));
 				else
 					hadc_info("executor: added steering route %s/%u via %s (reason=%s)",
-					    dstbuf, vips[i].plen, inet_ntoa(desired->steer_via), reason);
+					    dstbuf, vips[i].plen, viabuf, reason);
 			}
 		} else if (prev && prev->steer_via.s_addr) {
+			char viabuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(prev->steer_via, viabuf, sizeof(viabuf));
 			for (size_t i = 0; i < 2; i++) {
 				char dstbuf[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, split[i], dstbuf, sizeof(dstbuf));
+				hadc_ipv4_format(*split[i], dstbuf, sizeof(dstbuf));
 				sroute = find_prefix_route(rcache, split[i], 1, &prev->steer_via);
 				if (!sroute)
 					continue;
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting steering route %s/1 via %s failed: %s",
-					    dstbuf, inet_ntoa(prev->steer_via), nl_geterror(ar));
+					    dstbuf, viabuf, nl_geterror(ar));
 				else
 					hadc_info("executor: removed steering route %s/1 via %s (reason=%s)",
-					    dstbuf, inet_ntoa(prev->steer_via), reason);
+					    dstbuf, viabuf, reason);
 			}
 			n_vips = vip_splits(prev, &prev->steer_via, vips, VIP_SPLIT_MAX);
 			for (size_t i = 0; i < n_vips; i++) {
 				char dstbuf[INET_ADDRSTRLEN];
-				inet_ntop(AF_INET, &vips[i].net, dstbuf, sizeof(dstbuf));
+				hadc_ipv4_format(vips[i].net, dstbuf, sizeof(dstbuf));
 				sroute = find_prefix_route(rcache, &vips[i].net, vips[i].plen, &prev->steer_via);
 				if (!sroute)
 					continue;
 				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
 					hadc_warn("executor: deleting steering route %s/%u via %s failed: %s",
-					    dstbuf, vips[i].plen, inet_ntoa(prev->steer_via), nl_geterror(ar));
+					    dstbuf, vips[i].plen, viabuf, nl_geterror(ar));
 				else
 					hadc_info("executor: removed steering route %s/%u via %s (reason=%s)",
-					    dstbuf, vips[i].plen, inet_ntoa(prev->steer_via), reason);
+					    dstbuf, vips[i].plen, viabuf, reason);
 			}
 		}
 	}
@@ -1943,12 +1976,9 @@ out:
 		g_applied = *desired;
 		g_applied_valid = true;
 	}
-	if (lcache)
-		nl_cache_put(lcache);
-	if (acache)
-		nl_cache_put(acache);
-	if (rcache)
-		nl_cache_put(rcache);
+	nl_cache_drop(&lcache);
+	nl_cache_drop(&acache);
+	nl_cache_drop(&rcache);
 	return fatal;
 }
 
@@ -2160,9 +2190,12 @@ static void demote_hold_signature(const hadc_desired_t *d, char *out, size_t out
 	    (unsigned)d->nat_bypass_mark, d->nat_bypass_notrack ? 1 : 0);
 	for (size_t i = 0; i < d->n_cluster_ifaces && n < outsz - 1; i++) {
 		const hadc_cluster_if_t *ci = &d->cluster_ifaces[i];
-		for (size_t j = 0; j < ci->n_addrs && n < outsz - 40; j++)
+		for (size_t j = 0; j < ci->n_addrs && n < outsz - 40; j++) {
+			char abuf[INET_ADDRSTRLEN];
+			hadc_ipv4_format(ci->addrs[j].address, abuf, sizeof(abuf));
 			n += (size_t)snprintf(out + n, outsz - n, "%s%s/%u", j ? " " : "a=",
-			    inet_ntoa(ci->addrs[j].address), ci->addrs[j].prefixlen);
+			    abuf, ci->addrs[j].prefixlen);
+		}
 		if (n < outsz - 1)
 			n += (size_t)snprintf(out + n, outsz - n, ";");
 	}
@@ -2237,9 +2270,11 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 			    chain, chain, ci->interface);
 			nft_run(cmd, reason, true);
 			for (size_t j = 0; j < ci->n_addrs; j++) {
+				char abuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(ci->addrs[j].address, abuf, sizeof(abuf));
 				snprintf(cmd, sizeof(cmd),
 				    "nft 'add rule netdev ha_dhcpc %s ether type arp arp operation reply arp saddr ip %s drop'",
-				    chain, inet_ntoa(ci->addrs[j].address));
+				    chain, abuf);
 				nft_run(cmd, reason, true);
 			}
 		}
@@ -2250,9 +2285,11 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 		for (size_t i = 0; i < desired->n_cluster_ifaces; i++) {
 			const hadc_cluster_if_t *ci = &desired->cluster_ifaces[i];
 			for (size_t j = 0; j < ci->n_addrs; j++) {
+				char abuf[INET_ADDRSTRLEN];
+				hadc_ipv4_format(ci->addrs[j].address, abuf, sizeof(abuf));
 				snprintf(cmd, sizeof(cmd),
 				    "nft 'add rule ip " HADC_TAKEOVER_NFT_TABLE " out ip saddr %s drop'",
-				    inet_ntoa(ci->addrs[j].address));
+				    abuf);
 				nft_run(cmd, reason, true);
 			}
 		}
@@ -2359,7 +2396,7 @@ int hadc_executor_link_up(const char *ifname)
         hadc_maint_unlock();
         return -1;
     }
-    if (rtnl_link_alloc_cache(g_sk, AF_UNSPEC, &lcache) < 0 || !lcache) {
+    if (hadc_nl_alloc_caches(g_sk, &lcache, NULL, NULL, NULL) < 0 || !lcache) {
         hadc_warn("executor: netlink cache dump failed");
         hadc_maint_unlock();
         return -1;
@@ -2367,7 +2404,7 @@ int hadc_executor_link_up(const char *ifname)
     link = rtnl_link_get_by_name(lcache, ifname);
     if (!link) {
         hadc_warn("executor: interface %s not found", ifname);
-        nl_cache_put(lcache);
+        nl_cache_drop(&lcache);
         hadc_maint_unlock();
         return -1;
     }
@@ -2377,7 +2414,7 @@ int hadc_executor_link_up(const char *ifname)
         else
             hadc_info("executor: link %s brought up", ifname);
     }
-    nl_cache_put(lcache);
+    nl_cache_drop(&lcache);
     hadc_maint_unlock();
     return rc;
 }

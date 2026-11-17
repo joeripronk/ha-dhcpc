@@ -5,7 +5,6 @@
  * epoll loop and pumps dispatch_step()/dhcp_core_run_timeouts() when they
  * fire. Reasons come back through dhcp_core_set_hooks and are mapped onto
  * the frozen daemon callbacks. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>

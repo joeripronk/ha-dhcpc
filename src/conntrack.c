@@ -36,9 +36,9 @@
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
-#include "ha-dhcpc/config.h"
 #include "ha-dhcpc/conntrack.h"
-#include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
+#include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "internal.h"
 
@@ -1543,7 +1543,10 @@ static int ensure_listen(struct hadc_conntrack *ct)
         return -1;
     }
     ct->listen_fd = fd;
-    hadc_info("conntrack: listening on %s:%u", inet_ntoa(ct->self_sync), (unsigned)ct->port);
+    {
+        char abuf[INET_ADDRSTRLEN];
+        hadc_info("conntrack: listening on %s:%u", hadc_ipv4_format(ct->self_sync, abuf, sizeof(abuf)), (unsigned)ct->port);
+    }
     return 0;
 }
 
@@ -1696,7 +1699,7 @@ static void send_hello(struct hadc_conntrack *ct, hadc_ct_peer_t *p)
         if (pr <= 0) { if (pr < 0) close_peer(p); return; }
     }
     json_t *o = json_pack("{s:s,s:s,s:i,s:b,s:b,s:i}", "node", ct->self,
-                          "role", ct->role == HADC_ROLE_MASTER ? "master" : "slave",
+                              "role", hadc_role_name(ct->role),
                           "gen", (int)ct->generation,
                           "snapshot", ct->snapshot_on_connect,
                           "ipv4_only", true,
@@ -1768,7 +1771,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             }
         }
         json_t *o = json_pack("{s:s,s:s,s:i,s:s}", "node", ct->self,
-                              "role", ct->role == HADC_ROLE_MASTER ? "master" : "slave",
+                          "role", hadc_role_name(ct->role),
                               "gen", (int)ct->generation, "ack", "ok");
         (void)send_json_msg(ct, p, HADC_CT_MSG_HELLO_ACK, 0, o);
         if (ct->role == HADC_ROLE_SLAVE && ct->snapshot_on_connect)
@@ -1976,7 +1979,10 @@ static void accept_peer(struct hadc_conntrack *ct)
         p->hello_sent = false;
         p->hello_ok = false;
         p->last_seen_ms = now_ms();
-        hadc_info("conntrack: accepted peer %s from %s", p->id, inet_ntoa(sa.sin_addr));
+        {
+            char abuf[INET_ADDRSTRLEN];
+            hadc_info("conntrack: accepted peer %s from %s", p->id, hadc_ipv4_format(sa.sin_addr, abuf, sizeof(abuf)));
+        }
     }
 }
 
@@ -2394,8 +2400,7 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
             ct->peers[i].snapshot_active = false;
     }
     pthread_mutex_unlock(&ct->lock);
-    hadc_info("conntrack: role %s -> %s", old_role == HADC_ROLE_MASTER ? "master" : "slave",
-              new_role == HADC_ROLE_MASTER ? "master" : "slave");
+    hadc_info("conntrack: role %s -> %s", hadc_role_name(old_role), hadc_role_name(new_role));
     ct_wake(ct);
 }
 

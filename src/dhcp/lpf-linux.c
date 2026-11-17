@@ -15,7 +15,6 @@
  * Copyright (c) 1995-1999 The Internet Software Consortium (BSD-3-Clause,
  * as the upstream files). Linux port: ha-dhcpc project.
  */
-#define _GNU_SOURCE
 
 #if !defined(__has_include) || __has_include(<sys/cdefs.h>)
 #include <sys/cdefs.h>

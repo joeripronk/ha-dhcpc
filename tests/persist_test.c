@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <jansson.h>
@@ -98,9 +97,9 @@ int main(void)
      * downtime/clock jumps of saved_at_utc); remaining is derived from now. */
     {
         static const struct { long long saved_delta; const char *what; } cases[] = {
-            { -300, "recalc within cap" },
+            { -300, "saved_at skew keeps stored anchors" },
             { 300, "clock jump keeps stored anchors" },
-            { -(long long)86401, "downtime beyond cap keeps stored anchors" },
+            { -(long long)86401, "downtime keeps stored anchors" },
         };
         for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
             json_error_t jerr;
@@ -117,44 +116,11 @@ int main(void)
             json_decref(root);
             hadc_persist_view_t v;
             if (hadc_persist_load(b, &v) != 0)
-                return fail("recalc load");
+                return fail("reload");
             if (v.lease.t1_at_utc != a->lease.t1_at_utc || v.lease.t2_at_utc != a->lease.t2_at_utc ||
                 v.lease.t3_at_utc != a->lease.t3_at_utc)
                 rc |= fail(cases[i].what);
         }
-    }
-
-    /* Backward compat: legacy remaining-second snapshot is converted. */
-    {
-        json_error_t jerr;
-        FILE *rf = fopen(path, "r");
-        json_t *root = json_loadf(rf, 0, &jerr);
-        if (rf) fclose(rf);
-        if (!root)
-            return fail("reopen legacy");
-        json_t *lj = json_object_get(root, "lease");
-        json_object_del(lj, "obtained_at_utc");
-        json_object_del(lj, "t1_at_utc");
-        json_object_del(lj, "t2_at_utc");
-        json_object_del(lj, "t3_at_utc");
-        long long base = (long long)time(NULL) - 10;
-        json_object_set_new(lj, "observed_at_utc", json_integer(base));
-        json_object_set_new(lj, "t1_remaining_s", json_integer(100));
-        json_object_set_new(lj, "t2_remaining_s", json_integer(200));
-        json_object_set_new(lj, "t3_remaining_s", json_integer(300));
-        FILE *f = fopen(path, "w");
-        json_dumpf(root, f, 0);
-        fclose(f);
-        json_decref(root);
-        hadc_persist_view_t v;
-        if (hadc_persist_load(b, &v) != 0)
-            return fail("legacy load");
-        if (v.lease.t1_at_utc != base + 100 || v.lease.t2_at_utc != base + 200 ||
-            v.lease.t3_at_utc != base + 300)
-            rc |= fail("legacy conversion");
-        /* remaining derived from anchors now, not snapshotted */
-        if (hadc_lease_remaining_one(v.lease.t3_at_utc, base + 50) != 250)
-            rc |= fail("legacy remaining derived");
     }
 
     unlink(path);

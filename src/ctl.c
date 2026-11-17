@@ -1,6 +1,5 @@
 /* Control interface: unix socket, plaintext commands, JSON replies (plan §3/§4).
  * Idempotent, logged, auditable. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -21,6 +20,7 @@
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/reload.h"
@@ -54,8 +54,8 @@ static json_t *status_object(hadc_ctx_t *ctx)
         return NULL;
     json_t *members = json_array();
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
-        char addr[64];
-        snprintf(addr, sizeof(addr), "%s", inet_ntoa(ctx->conf.members[i].sync_address));
+        char addr[INET_ADDRSTRLEN];
+        hadc_ipv4_format(ctx->conf.members[i].sync_address, addr, sizeof(addr));
         json_array_append_new(
             members,
             json_pack("{s:s, s:s, s:b, s:I, s:s, s:s, s:s}", "id", ctx->conf.members[i].id,
@@ -80,14 +80,14 @@ static json_t *status_object(hadc_ctx_t *ctx)
         uint32_t t1, t2, t3;
         hadc_lease_remaining(&rl, (long long)time(NULL), &t1, &t2, &t3);
         char la[64], ln[64], lg[64], ls[64];
-        snprintf(la, sizeof(la), "%s", inet_ntoa(rl.address));
-        snprintf(ln, sizeof(ln), "%s", inet_ntoa(rl.netmask));
-        snprintf(lg, sizeof(lg), "%s", inet_ntoa(rl.gateway));
-        snprintf(ls, sizeof(ls), "%s", inet_ntoa(rl.server_id));
+        hadc_ipv4_format(rl.address, la, sizeof(la));
+        hadc_ipv4_format(rl.netmask, ln, sizeof(ln));
+        hadc_ipv4_format(rl.gateway, lg, sizeof(lg));
+        hadc_ipv4_format(rl.server_id, ls, sizeof(ls));
         json_t *dns = json_array();
         for (size_t i = 0; i < rl.n_dns; i++) {
             char b[64];
-            snprintf(b, sizeof(b), "%s", inet_ntoa(rl.dns[i]));
+            hadc_ipv4_format(rl.dns[i], b, sizeof(b));
             json_array_append_new(dns, json_string(b));
         }
         json_object_set_new(o, "dhcp",
@@ -111,7 +111,7 @@ static json_t *status_object(hadc_ctx_t *ctx)
         json_t *addrs = json_array();
         for (size_t j = 0; j < ci->n_addrs; j++) {
             char buf[64];
-            snprintf(buf, sizeof(buf), "%s/%u", inet_ntoa(ci->addrs[j].address),
+            char ib[INET_ADDRSTRLEN]; hadc_ipv4_format(ci->addrs[j].address, ib, sizeof(ib)); snprintf(buf, sizeof(buf), "%s/%u", ib,
                      ci->addrs[j].prefixlen);
             json_array_append_new(addrs, json_string(buf));
         }
@@ -255,9 +255,13 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
         } else {
             ctx->newip_old_addr = ctx->lease.address;
             ctx->newip_pending = true;
-            hadc_info("ctl: newip forced a fresh DISCOVER (old=%s, abort_tcp=%s)",
-                      ctx->newip_old_addr.s_addr ? inet_ntoa(ctx->newip_old_addr) : "none",
-                      ctx->conf.apply.abort_tcp_on_newip ? "on" : "off");
+            {
+                char oldbuf[INET_ADDRSTRLEN] = "none";
+                if (ctx->newip_old_addr.s_addr)
+                    hadc_ipv4_format(ctx->newip_old_addr, oldbuf, sizeof(oldbuf));
+                hadc_info("ctl: newip forced a fresh DISCOVER (old=%s, abort_tcp=%s)",
+                          oldbuf, ctx->conf.apply.abort_tcp_on_newip ? "on" : "off");
+            }
         }
     } else if (!strcmp(cmd, "graceful-restart")) {
         if (ctx->role != HADC_ROLE_MASTER) {

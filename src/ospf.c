@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/ipv4.h"
 #include "internal.h"
 #include <jansson.h>
 #include "ospf.h"
@@ -401,9 +402,12 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
     for (size_t i = 0; i < g_ospf.n_ifaces; i++) {
         if (g_ospf.ifaces[i].ifindex)
             join_multicast(g_ospf.fd, g_ospf.ifaces[i].ifindex);
-        hadc_info("ospf: interface %s idx=%u addr=%s (router-id %s)",
-                  g_ospf.ifaces[i].name, g_ospf.ifaces[i].ifindex,
-                  inet_ntoa(g_ospf.ifaces[i].addr), ctx->conf.ospf.router_id);
+        {
+            char abuf[INET_ADDRSTRLEN];
+            hadc_info("ospf: interface %s idx=%u addr=%s (router-id %s)",
+                      g_ospf.ifaces[i].name, g_ospf.ifaces[i].ifindex,
+                      hadc_ipv4_format(g_ospf.ifaces[i].addr, abuf, sizeof(abuf)), ctx->conf.ospf.router_id);
+        }
     }
 
     if (pipe2(g_ospf.pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
@@ -540,8 +544,10 @@ static void send_to(struct in_addr dst, unsigned ifindex, const uint8_t *pkt, si
         }
     }
     ssize_t n = sendto(g_ospf.fd, pkt, len, 0, (struct sockaddr *)&da, sizeof(da));
-    if (n < 0)
-        hadc_dbg("ospf: send to %s failed: %s", inet_ntoa(dst), strerror(errno));
+    if (n < 0) {
+        char dbuf[INET_ADDRSTRLEN];
+        hadc_dbg("ospf: send to %s failed: %s", hadc_ipv4_format(dst, dbuf, sizeof(dbuf)), strerror(errno));
+    }
 }
 
 static void send_allspfrouters(const uint8_t *pkt, size_t len)
@@ -852,8 +858,11 @@ static void flood_lsas_to_neighbor(ospf_neighbor_t *n, bool self_only)
         off += llen;
     }
     send_to(n->ip, n->ifindex, pkt, len);
-    hadc_dbg("ospf: sent LS Update (%s, %u lsas) to %s", self_only ? "self" : "lsdb",
-             nlsas, inet_ntoa(n->ip));
+    {
+        char nbuf[INET_ADDRSTRLEN];
+        hadc_dbg("ospf: sent LS Update (%s, %u lsas) to %s", self_only ? "self" : "lsdb",
+                 nlsas, hadc_ipv4_format(n->ip, nbuf, sizeof(nbuf)));
+    }
 }
 
 static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
@@ -1038,7 +1047,10 @@ static void nbr_send_lsreq(ospf_neighbor_t *n)
     oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
     send_to(n->ip, n->ifindex, out, ooff);
     n->last_lsreq_sent = now;
-    hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, inet_ntoa(n->ip));
+    {
+        char nbuf[INET_ADDRSTRLEN];
+        hadc_dbg("ospf: sent LS Request (%zu) to %s", nreq, hadc_ipv4_format(n->ip, nbuf, sizeof(nbuf)));
+    }
 }
 
 
@@ -1153,8 +1165,11 @@ static void handle_hello(const uint8_t *pkt, size_t len, struct in_addr src, osp
                          n->state == NSTATE_EXSTART ? "ExStart" :
                          n->state == NSTATE_EXCHANGE ? "Exchange" :
                          n->state == NSTATE_LOADING ? "Loading" : "Full";
-        hadc_info("ospf: neighbor %s (%s) on %s -> %s", ridbuf, inet_ntoa(src),
-                  iface ? iface->name : "?", sn);
+        {
+            char sbuf[INET_ADDRSTRLEN];
+            hadc_info("ospf: neighbor %s (%s) on %s -> %s", ridbuf, hadc_ipv4_format(src, sbuf, sizeof(sbuf)),
+                      iface ? iface->name : "?", sn);
+        }
     }
     (void)two_way;
 }
@@ -1196,7 +1211,8 @@ static void handle_lsupdate(const uint8_t *pkt, size_t len, struct in_addr src, 
             if (nack < 32)
                 acks[nack++] = *lh;
         } else {
-            hadc_dbg("ospf: bad LSA checksum from %s (type %u adv %08x)", inet_ntoa(src), lh->type, ntohl(lh->adv_router));
+            char sbuf[INET_ADDRSTRLEN];
+            hadc_dbg("ospf: bad LSA checksum from %s (type %u adv %08x)", hadc_ipv4_format(src, sbuf, sizeof(sbuf)), lh->type, ntohl(lh->adv_router));
         }
         off += llen;
     }
@@ -1249,7 +1265,10 @@ static void handle_lsupdate(const uint8_t *pkt, size_t len, struct in_addr src, 
             }
             send_to(nb->ip, nb->ifindex, pkt, len);
         }
-        hadc_dbg("ospf: LSDB updated/flooded from %s (%u lsas)", inet_ntoa(src), nlsas);
+        {
+            char sbuf[INET_ADDRSTRLEN];
+            hadc_dbg("ospf: LSDB updated/flooded from %s (%u lsas)", hadc_ipv4_format(src, sbuf, sizeof(sbuf)), nlsas);
+        }
     }
 }
 
@@ -1320,7 +1339,10 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
         send_to(src, iface->ifindex, out, ooff);
     else
         send_to(src, 0, out, ooff);
-    hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s", nlsas, inet_ntoa(src));
+    {
+        char sbuf[INET_ADDRSTRLEN];
+        hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s", nlsas, hadc_ipv4_format(src, sbuf, sizeof(sbuf)));
+    }
 }
 
 
@@ -1482,7 +1504,8 @@ static void ospf_drain_rx_locked(void)
         if (ntohl(h->area_id) != OSPF_AREA_BACKBONE)
             continue;
         if (!verify_auth(h, g_ospf.ctx)) {
-            hadc_dbg("ospf: auth mismatch from %s, dropping", inet_ntoa(src.sin_addr));
+            char sbuf[INET_ADDRSTRLEN];
+            hadc_dbg("ospf: auth mismatch from %s, dropping", hadc_ipv4_format(src.sin_addr, sbuf, sizeof(sbuf)));
             continue;
         }
         ospf_if_t *iface = iface_for_src(src.sin_addr);
@@ -1501,8 +1524,11 @@ static void ospf_drain_rx_locked(void)
             break;
         case OSPF_DBDESC:
             handle_dbdesc(pkt, (size_t)plen, src.sin_addr, iface);
-            hadc_dbg("ospf: rx DBD from %s on %s (len %u)", inet_ntoa(src.sin_addr),
-                     iface ? iface->name : "?", plen);
+            {
+                char sbuf[INET_ADDRSTRLEN];
+                hadc_dbg("ospf: rx DBD from %s on %s (len %u)", hadc_ipv4_format(src.sin_addr, sbuf, sizeof(sbuf)),
+                         iface ? iface->name : "?", plen);
+            }
             break;
         default:
             break;
@@ -1518,8 +1544,9 @@ static void expire_neighbors(void)
         if (!n->in_use)
             continue;
         if (n->dead_at > 0 && now >= n->dead_at) {
-            char ridbuf[INET_ADDRSTRLEN]; u32_to_rid(n->router_id, ridbuf, sizeof(ridbuf));
-            hadc_info("ospf: neighbor %s (%s) dead -> Down", ridbuf, inet_ntoa(n->ip));
+            char ridbuf[INET_ADDRSTRLEN], nbuf[INET_ADDRSTRLEN];
+            u32_to_rid(n->router_id, ridbuf, sizeof(ridbuf));
+            hadc_info("ospf: neighbor %s (%s) dead -> Down", ridbuf, hadc_ipv4_format(n->ip, nbuf, sizeof(nbuf)));
             nbr_reset_exchange(n);
             n->in_use = false;
             n->state = NSTATE_DOWN;
@@ -1542,8 +1569,7 @@ static uint32_t orig_hash(bool want_pub, struct in_addr pub, bool want_def, hadc
             const hadc_cluster_if_t *ci = &c->conf.cluster.ifaces[i];
             for (size_t j = 0; j < ci->n_addrs; j++) {
                 unsigned pl = ci->addrs[j].prefixlen;
-                uint32_t mask = (pl == 0) ? 0 : htonl(0xffffffffu << (32 - (pl >= 32 ? 32 : pl)));
-                if (pl >= 32) mask = 0xffffffffu;
+                uint32_t mask = hadc_ipv4_prefix_mask(pl).s_addr;
                 FNV(ci->addrs[j].address.s_addr & mask);
                 FNV(mask);
             }
@@ -1635,8 +1661,7 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
             const hadc_cluster_if_t *ci = &c->conf.cluster.ifaces[i];
             for (size_t j = 0; j < ci->n_addrs && nlinks < 64; j++) {
                 unsigned pl = ci->addrs[j].prefixlen;
-                uint32_t mask = (pl == 0) ? 0 : htonl(0xffffffffu << (32 - (pl >= 32 ? 32 : pl)));
-                if (pl >= 32) mask = 0xffffffffu;
+                uint32_t mask = hadc_ipv4_prefix_mask(pl).s_addr;
                 links[nlinks].id = ci->addrs[j].address.s_addr & mask;
                 links[nlinks].data = mask;
                 links[nlinks].type = 3;

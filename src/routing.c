@@ -14,6 +14,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
@@ -169,21 +170,7 @@ static void update_local_candidate(hadc_ctx_t *ctx)
     g_rs.local_cand.valid = true;
 }
 
-static struct in_addr mask_addr(struct in_addr addr, unsigned prefixlen)
-{
-    struct in_addr out = {0};
-    if (prefixlen == 0) {
-        out.s_addr = 0;
-        return out;
-    }
-    if (prefixlen >= 32) {
-        out = addr;
-        return out;
-    }
-    uint32_t mask = htonl(0xffffffffu << (32 - prefixlen));
-    out.s_addr = addr.s_addr & mask;
-    return out;
-}
+
 
 static void add_want_prefix(struct in_addr prefix, unsigned prefixlen, const char *ifname)
 {
@@ -215,7 +202,7 @@ static void compute_want_prefixes(hadc_ctx_t *ctx, bool enabled, bool master_own
         for (size_t i = 0; i < ctx->conf.cluster.n_ifaces; i++) {
             const hadc_cluster_if_t *ci = &ctx->conf.cluster.ifaces[i];
             for (size_t j = 0; j < ci->n_addrs; j++) {
-                struct in_addr net = mask_addr(ci->addrs[j].address, ci->addrs[j].prefixlen);
+                struct in_addr net = hadc_ipv4_network(ci->addrs[j].address, ci->addrs[j].prefixlen);
                 add_want_prefix(net, ci->addrs[j].prefixlen, ci->interface);
             }
         }
@@ -680,9 +667,11 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     compute_want_prefixes(ctx, enabled, master_owner);
 
     if (want_pub != g_rs.advertised_public_ip32) {
+        char pubbuf[INET_ADDRSTRLEN] = "0.0.0.0";
+        if (ctx->lease.address.s_addr)
+            hadc_ipv4_format(ctx->lease.address, pubbuf, sizeof(pubbuf));
         hadc_info("routing: %s public /32 %s (router-id %s, %s)", want_pub ? "advertise" : "withdraw",
-                  ctx->lease.address.s_addr ? inet_ntoa(ctx->lease.address) : "0.0.0.0",
-                  g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
+                  pubbuf, g_rs.router_id[0] ? g_rs.router_id : "unset", g_rs.reason);
     }
     if (want_def != g_rs.advertised_default_route) {
         hadc_info("routing: %s default route 0.0.0.0/0 (router-id %s, %s)",

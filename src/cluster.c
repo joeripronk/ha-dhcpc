@@ -3,7 +3,6 @@
  * slaves pre-apply then ack, and role changes propagate. Failover is built in:
  * a dead master is replaced by the highest-priority live member once quorum is
  * satisfied, and every master owns the configured cluster addresses. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -11,21 +10,22 @@
 #include <jansson.h>
 #include <netinet/in.h>
 #include <poll.h>
-#include <pthread.h>
-#include <stdio.h>
-#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
+#include "ha-dhcpc/lease.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/reload.h"
+#include "ha-dhcpc/routing.h"
 #include "internal.h"
 
 /* Guards the fields the heartbeat thread reads (role, lease.version,
@@ -66,27 +66,6 @@ static uint64_t realtime_ms(void);
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
-
-static const char *role_name(hadc_role_t r)
-{
-    switch (r) {
-    case HADC_ROLE_MASTER:    return "master";
-    case HADC_ROLE_SLAVE:     return "slave";
-    case HADC_ROLE_PROMOTING: return "promoting";
-    case HADC_ROLE_DEMOTING:  return "demoting";
-    default:                  return "unknown";
-    }
-}
-
-static hadc_role_t role_from_name(const char *s)
-{
-    if (!s) return HADC_ROLE_UNKNOWN;
-    if (!strcmp(s, "master"))    return HADC_ROLE_MASTER;
-    if (!strcmp(s, "slave"))     return HADC_ROLE_SLAVE;
-    if (!strcmp(s, "promoting")) return HADC_ROLE_PROMOTING;
-    if (!strcmp(s, "demoting"))  return HADC_ROLE_DEMOTING;
-    return HADC_ROLE_UNKNOWN;
-}
 
 static uint8_t role_wire(hadc_role_t r)
 {
@@ -158,7 +137,7 @@ void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx)
             continue;
         json_object_set_new(msg, "conf_sha256", json_string(ctx->conf.sha256));
         json_object_set_new(msg, "ts_ms", json_integer((json_int_t)realtime_ms()));
-        json_object_set_new(msg, "role", json_string(role_name(ctx->role)));
+        json_object_set_new(msg, "role", json_string(hadc_role_name(ctx->role)));
         struct sockaddr_in to = { .sin_family = AF_INET,
                                   .sin_port = htons(ctx->conf.cluster.port),
                                   .sin_addr = m->sync_address };
@@ -530,66 +509,6 @@ static int send_to_member(hadc_ctx_t *ctx, const hadc_member_t *m, json_t *msg)
     return 0;
 }
 
-static void put_addr(json_t *obj, const char *key, struct in_addr a)
-{
-    char buf[64];
-    json_object_set_new(obj, key, json_string(inet_ntop(AF_INET, &a, buf, sizeof(buf))));
-}
-
-static void get_addr(json_t *obj, const char *key, struct in_addr *out)
-{
-    json_t *v = json_object_get(obj, key);
-    if (v && json_is_string(v))
-        inet_pton(AF_INET, json_string_value(v), out);
-}
-
-static json_t *lease_json(const hadc_lease_t *l)
-{
-    char hex[65];
-    json_t *dns = json_array();
-
-    for (size_t i = 0; i < 32; i++)
-        sprintf(hex + 2 * i, "%02x", l->config_hash[i]);
-    for (size_t i = 0; i < l->n_dns; i++) {
-        char buf[64];
-        json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
-    }
-    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
-                           "state", hadc_lease_state_name(l->state), "retention_active",
-                           (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
-                           "server_id", "", "dns", dns, "obtained_at_utc",
-                           (json_int_t)l->obtained_at_utc, "t1_at_utc",
-                           (json_int_t)l->t1_at_utc, "t2_at_utc",
-                           (json_int_t)l->t2_at_utc, "t3_at_utc",
-                           (json_int_t)l->t3_at_utc, "config_hash", hex);
-    if (!o) {
-        json_decref(dns);
-        return NULL;
-    }
-    put_addr(o, "address", l->address);
-    put_addr(o, "netmask", l->netmask);
-    put_addr(o, "gateway", l->gateway);
-    put_addr(o, "server_id", l->server_id);
-    if (l->gw_mac_valid) {
-        char mac[2 * HADC_MAC_LEN + 1];
-        for (size_t i = 0; i < HADC_MAC_LEN; i++)
-            sprintf(mac + 2 * i, "%02x", l->gw_mac[i]);
-        json_object_set_new(o, "gw_mac", json_string(mac));
-    }
-    return o;
-}
-
-static hadc_lease_state_t name_to_state(const char *n)
-{
-    if (!strcmp(n, "BOUND"))        return HADC_LEASE_BOUND;
-    if (!strcmp(n, "RENEW"))        return HADC_LEASE_RENEW;
-    if (!strcmp(n, "REBIND"))       return HADC_LEASE_REBIND;
-    if (!strcmp(n, "RETAINED"))     return HADC_LEASE_RETAINED;
-    if (!strcmp(n, "INIT-REBOOT"))  return HADC_LEASE_INIT_REBOOT;
-    if (!strcmp(n, "INIT-SELECT"))  return HADC_LEASE_INIT_SELECT;
-    return HADC_LEASE_NONE;
-}
-
 
 static json_t *vip_neighs_json(hadc_ctx_t *ctx)
 {
@@ -661,92 +580,15 @@ static void parse_vip_neighs(json_t *vn, hadc_ctx_t *ctx)
     }
 }
 
-static void parse_lease(json_t *lj, hadc_lease_t *out)
-{
-    json_t *v;
-
-    if (!lj || !json_is_object(lj))
-        return;
-    if ((v = json_object_get(lj, "state")) && json_is_string(v))
-        out->state = name_to_state(json_string_value(v));
-    if ((v = json_object_get(lj, "retention_active")) && json_is_boolean(v))
-        out->retention_active = json_is_true(v);
-    get_addr(lj, "address", &out->address);
-    get_addr(lj, "netmask", &out->netmask);
-    get_addr(lj, "gateway", &out->gateway);
-    get_addr(lj, "server_id", &out->server_id);
-    json_t *dns = json_object_get(lj, "dns");
-    if (dns && json_is_array(dns)) {
-        size_t idx;
-        json_t *e;
-        json_array_foreach(dns, idx, e) {
-            if (json_is_string(e) && out->n_dns < HADC_DNS_MAX &&
-                inet_pton(AF_INET, json_string_value(e), &out->dns[out->n_dns]) == 1)
-                out->n_dns++;
-        }
-    }
-    if ((v = json_object_get(lj, "obtained_at_utc")) && json_is_integer(v))
-        out->obtained_at_utc = (long long)json_integer_value(v);
-    if ((v = json_object_get(lj, "t1_at_utc")) && json_is_integer(v))
-        out->t1_at_utc = (long long)json_integer_value(v);
-    if ((v = json_object_get(lj, "t2_at_utc")) && json_is_integer(v))
-        out->t2_at_utc = (long long)json_integer_value(v);
-    if ((v = json_object_get(lj, "t3_at_utc")) && json_is_integer(v))
-        out->t3_at_utc = (long long)json_integer_value(v);
-    /* Backward compat: old remaining-second snapshots -> derive anchors now. */
-    {
-        json_t *oat = json_object_get(lj, "observed_at_utc");
-        json_t *r1 = json_object_get(lj, "t1_remaining_s");
-        if (out->t3_at_utc == 0 && oat && json_is_integer(oat) && r1 && json_is_integer(r1)) {
-            long long now = (long long)time(NULL);
-            long long base = json_integer_value(oat);
-            json_t *r2 = json_object_get(lj, "t2_remaining_s");
-            json_t *r3 = json_object_get(lj, "t3_remaining_s");
-            long long age = now - base;
-            if (age < 0) age = 0;
-            if (out->obtained_at_utc == 0)
-                out->obtained_at_utc = base;
-            out->t1_at_utc = base + json_integer_value(r1);
-            out->t2_at_utc = base + (r2 && json_is_integer(r2) ? json_integer_value(r2) : 0);
-            out->t3_at_utc = base + (r3 && json_is_integer(r3) ? json_integer_value(r3) : 0);
-            (void)age;
-        }
-    }
-    if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
-        strlen(json_string_value(v)) == 64) {
-        for (size_t i = 0; i < 32; i++) {
-            unsigned b;
-            if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
-                break;
-            out->config_hash[i] = (uint8_t)b;
-        }
-    }
-    if ((v = json_object_get(lj, "gw_mac")) && json_is_string(v) &&
-        strlen(json_string_value(v)) == 2 * HADC_MAC_LEN) {
-        uint8_t mac[HADC_MAC_LEN];
-        size_t i;
-        for (i = 0; i < HADC_MAC_LEN; i++) {
-            unsigned b;
-            if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
-                break;
-            mac[i] = (uint8_t)b;
-        }
-        if (i == HADC_MAC_LEN) {
-            memcpy(out->gw_mac, mac, sizeof(mac));
-            out->gw_mac_valid = true;
-        }
-    }
-}
-
 static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
 {
     json_t *m = json_pack("{s:s, s:s, s:s, s:I, s?:s}", "type", type, "origin", ctx->conf.self,
                            "master_id", ctx->conf.designated_master, "lease_version",
-                           (json_int_t)ctx->lease.version, "role", role_name(ctx->role));
+                           (json_int_t)ctx->lease.version, "role", hadc_role_name(ctx->role));
     if (!m)
         return NULL;
     if (with_lease) {
-        json_t *lj = lease_json(&ctx->lease);
+        json_t *lj = hadc_lease_to_json(&ctx->lease);
         if (lj)
             json_object_set_new(m, "lease", lj);
     }
@@ -790,7 +632,7 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
     v = json_object_get(m, "graceful_restart_until_ms");
     if (v && json_is_integer(v))
         out->graceful_restart_until_ms = (uint64_t)json_integer_value(v);
-    parse_lease(json_object_get(m, "lease"), &out->lease);
+    hadc_lease_from_json(json_object_get(m, "lease"), &out->lease);
 }
 
 static void peer_touch(hadc_ctx_t *ctx, const char *id)
@@ -940,7 +782,8 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(ctx->conf.cluster.port),
                                 .sin_addr = self->sync_address };
     if (bind(ctx->udp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        hadc_err("cluster: bind %s:%u: %s", inet_ntoa(addr.sin_addr),
+        char abuf[INET_ADDRSTRLEN];
+        hadc_err("cluster: bind %s:%u: %s", hadc_ipv4_format(addr.sin_addr, abuf, sizeof(abuf)),
                  (unsigned)ctx->conf.cluster.port, strerror(errno));
         close(ctx->udp_fd);
         ctx->udp_fd = -1;
@@ -949,8 +792,11 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
     fcntl(ctx->udp_fd, F_SETFL, O_NONBLOCK);
     hadc_loop_add(ctx, ctx->udp_fd, udp_ready, 0);
     g_bound = addr;
-    hadc_info("cluster: transport rebound to %s:%u for node %s", inet_ntoa(addr.sin_addr),
-              (unsigned)ctx->conf.cluster.port, ctx->conf.self);
+    {
+        char abuf[INET_ADDRSTRLEN];
+        hadc_info("cluster: transport rebound to %s:%u for node %s", hadc_ipv4_format(addr.sin_addr, abuf, sizeof(abuf)),
+                  (unsigned)ctx->conf.cluster.port, ctx->conf.self);
+    }
     return 1;
 }
 
@@ -1002,16 +848,18 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     json_t *m = NULL;
     if ((uint8_t)buf[0] == 0) { /* compact binary heartbeat (JSON starts with '{') */
         if (decode_bin_heartbeat(ctx, (const uint8_t *)buf, (size_t)n, &msg) != 0) {
+            char abuf[INET_ADDRSTRLEN];
             hadc_warn("sync: malformed binary heartbeat from %s:%d (%zd bytes, ignored)",
-                      inet_ntoa(from.sin_addr), ntohs(from.sin_port), n);
+                      hadc_ipv4_format(from.sin_addr, abuf, sizeof(abuf)), ntohs(from.sin_port), n);
             return;
         }
     } else {
         json_error_t jerr;
         m = json_loads(buf, 0, &jerr);
         if (!m) {
+            char abuf[INET_ADDRSTRLEN];
             hadc_warn("sync: malformed datagram from %s:%d (ignored): %s",
-                      inet_ntoa(from.sin_addr), ntohs(from.sin_port), jerr.text);
+                      hadc_ipv4_format(from.sin_addr, abuf, sizeof(abuf)), ntohs(from.sin_port), jerr.text);
             return;
         }
         load_msg_fields(ctx, m, &msg);
@@ -1052,7 +900,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
          * If we are a slave, follow the asserted master when our current one is
          * gone or has a lower priority. PROMOTING counts as asserting/active. */
         if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.master_id, msg.origin) &&
-            (role_claims_master(role_from_name(msg.role)))) {
+            (role_claims_master(hadc_role_from_name(msg.role)))) {
             const hadc_member_t *om = member_by_id(ctx, msg.origin);
             if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
                 bool peer_wins = om && (om->priority > ctx->conf.priority ||
@@ -1068,7 +916,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                               om ? om->priority : 0);
                     propagate_role(ctx);
                 }
-            } else if (strcmp(msg.master_id, ctx->conf.designated_master) && role_is_master_ready(role_from_name(msg.role))) {
+            } else if (strcmp(msg.master_id, ctx->conf.designated_master) && role_is_master_ready(hadc_role_from_name(msg.role))) {
                 const hadc_member_t *cur = member_by_id(ctx, ctx->conf.designated_master);
                 bool take = !master_is_alive(ctx, ctx->conf.designated_master) ||
                     (ctx->conf.cluster.preempt && om &&
@@ -1148,7 +996,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             hadc_info("cluster: ctl_promote from %s requests master %s", msg.origin, msg.new_master);
             hadc_cluster_promote(ctx, msg.new_master);
         } else {
-            hadc_dbg("cluster: ctl_promote from %s ignored (role=%s)", msg.origin, role_name(ctx->role));
+            hadc_dbg("cluster: ctl_promote from %s ignored (role=%s)", msg.origin, hadc_role_name(ctx->role));
         }
     } else if (!strcmp(msg.type, HADC_MSG_ROLE_CHANGE)) {
         hadc_info("sync: role_change from %s: master is now %s", msg.origin, msg.new_master);
@@ -1250,7 +1098,8 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(ctx->conf.cluster.port),
                                 .sin_addr = self->sync_address };
     if (bind(ctx->udp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        hadc_err("cluster: bind %s:%u: %s", inet_ntoa(addr.sin_addr),
+        char abuf[INET_ADDRSTRLEN];
+        hadc_err("cluster: bind %s:%u: %s", hadc_ipv4_format(addr.sin_addr, abuf, sizeof(abuf)),
                  (unsigned)ctx->conf.cluster.port, strerror(errno));
         close(ctx->udp_fd);
         ctx->udp_fd = -1;
@@ -1259,8 +1108,11 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
     fcntl(ctx->udp_fd, F_SETFL, O_NONBLOCK);
     hadc_loop_add(ctx, ctx->udp_fd, udp_ready, 0);
     g_bound = addr;
-    hadc_info("cluster: transport bound to %s:%u for node %s (v1 unauthenticated trusted LAN)",
-              inet_ntoa(self->sync_address), (unsigned)ctx->conf.cluster.port, ctx->conf.self);
+    {
+        char abuf[INET_ADDRSTRLEN];
+        hadc_info("cluster: transport bound to %s:%u for node %s (v1 unauthenticated trusted LAN)",
+                  hadc_ipv4_format(self->sync_address, abuf, sizeof(abuf)), (unsigned)ctx->conf.cluster.port, ctx->conf.self);
+    }
     return 0;
 }
 
@@ -1504,9 +1356,12 @@ void hadc_cluster_gateway_mac_refresh(hadc_ctx_t *ctx)
     memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
     ctx->lease.gw_mac_valid = true;
     bool standalone = (ctx->conf.n_members == 0);
-    hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached%s",
-              inet_ntoa(ctx->lease.gateway), mac[0], mac[1], mac[2], mac[3],
-              mac[4], mac[5], standalone ? "" : "; pushing state");
+    {
+        char gwbuf[INET_ADDRSTRLEN];
+        hadc_info("cluster: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached%s",
+                  hadc_ipv4_format(ctx->lease.gateway, gwbuf, sizeof(gwbuf)), mac[0], mac[1], mac[2], mac[3],
+                  mac[4], mac[5], standalone ? "" : "; pushing state");
+    }
     hadc_persist_save(ctx);
     if (!standalone)
         hadc_cluster_push_state(ctx, &ctx->lease);
@@ -1781,7 +1636,7 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         set_role(ctx, HADC_ROLE_PROMOTING);
     }
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->conf.designated_master,
-              role_name(ctx->role));
+              hadc_role_name(ctx->role));
     propagate_role(ctx);
     hadc_persist_save(ctx);
     return 0;

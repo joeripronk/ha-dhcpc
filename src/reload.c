@@ -9,7 +9,6 @@
  * socket, DHCP send knobs, members, priority, default_role and the election
  * timers all apply live; requested DHCP options and the hook script are read at
  * engine start, so a change to those alone takes effect on restart. */
-#define _GNU_SOURCE
 
 #include <errno.h>
 #include <stdio.h>

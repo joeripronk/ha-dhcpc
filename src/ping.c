@@ -17,6 +17,7 @@
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/routing.h"
@@ -168,13 +169,14 @@ static void send_probe(hadc_ctx_t *ctx, uint64_t now)
         icmp->checksum = htons(icmp_checksum(buf, sizeof(buf)));
     if (sendto(g_fd, buf, sizeof(buf), MSG_DONTWAIT,
                (struct sockaddr *)&to, sizeof(to)) < 0) {
-        hadc_warn("gwping: probe to %s failed: %s", inet_ntoa(to.sin_addr),
+        char gwbuf[INET_ADDRSTRLEN];
+        hadc_warn("gwping: probe to %s failed: %s", hadc_ipv4_format(to.sin_addr, gwbuf, sizeof(gwbuf)),
                   strerror(errno));
         return;
     }
     g_last_send_ms = now;
     g_awaiting = true;
-    hadc_dbg("gwping: echo sent to %s (seq %u)", inet_ntoa(to.sin_addr), seq);
+    { char gwbuf[INET_ADDRSTRLEN]; hadc_dbg("gwping: echo sent to %s (seq %u)", hadc_ipv4_format(to.sin_addr, gwbuf, sizeof(gwbuf)), seq); }
 }
 
 void hadc_gwping_start(hadc_ctx_t *ctx)
@@ -277,11 +279,12 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
         g_failures++;
         if (g_failures >= g_fail_threshold) {
             if (!g_unreachable_logged) {
+                char gwbuf[INET_ADDRSTRLEN];
                 g_unreachable = true;
                 g_unreachable_logged = true;
                 g_unreachable_since_ms = now;
                 hadc_warn("gwping: gateway %s unreachable (%u consecutive probes without reply, timeout %ums); forcing DHCP renew",
-                          inet_ntoa((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }),
+                          hadc_ipv4_format((struct in_addr){ .s_addr = ctx->lease.gateway.s_addr }, gwbuf, sizeof(gwbuf)),
                           g_failures, g_timeout_ms);
                 reroute(ctx, "GWPING-FAIL");
                 hadc_dhcpcore_force_renew(ctx);

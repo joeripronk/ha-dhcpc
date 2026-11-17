@@ -1,5 +1,4 @@
 /* Persistence: cluster view JSON, atomic rename + fsync (plan §3/§8). */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -15,67 +14,6 @@
 #include "internal.h"
 
 static char g_path[PATH_MAX];
-
-static hadc_lease_state_t name_to_state(const char *n)
-{
-    if (!strcmp(n, "NONE"))         return HADC_LEASE_NONE;
-    if (!strcmp(n, "INIT-SELECT"))  return HADC_LEASE_INIT_SELECT;
-    if (!strcmp(n, "INIT-REBOOT"))  return HADC_LEASE_INIT_REBOOT;
-    if (!strcmp(n, "BOUND"))        return HADC_LEASE_BOUND;
-    if (!strcmp(n, "RENEW"))        return HADC_LEASE_RENEW;
-    if (!strcmp(n, "REBIND"))       return HADC_LEASE_REBIND;
-    if (!strcmp(n, "RETAINED"))     return HADC_LEASE_RETAINED;
-    return HADC_LEASE_NONE;
-}
-
-static void put_addr(json_t *obj, const char *key, struct in_addr a)
-{
-    char buf[64];
-    json_object_set_new(obj, key, json_string(inet_ntop(AF_INET, &a, buf, sizeof(buf))));
-}
-
-static void get_addr(json_t *obj, const char *key, struct in_addr *out)
-{
-    json_t *v = json_object_get(obj, key);
-    if (v && json_is_string(v))
-        inet_pton(AF_INET, json_string_value(v), out);
-}
-
-static json_t *lease_json(const hadc_lease_t *l)
-{
-    char hex[65];
-    json_t *dns = json_array();
-
-    for (size_t i = 0; i < 32; i++)
-        sprintf(hex + 2 * i, "%02x", l->config_hash[i]);
-    for (size_t i = 0; i < l->n_dns; i++) {
-        char buf[64];
-        json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
-    }
-    json_t *o = json_pack("{s:s, s:b, s:s, s:s, s:s, s:s, s:o, s:I, s:I, s:I, s:I, s:s}",
-                           "state", hadc_lease_state_name(l->state), "retention_active",
-                           (int)l->retention_active, "address", "", "netmask", "", "gateway", "",
-                           "server_id", "", "dns", dns, "obtained_at_utc",
-                           (json_int_t)l->obtained_at_utc, "t1_at_utc",
-                           (json_int_t)l->t1_at_utc, "t2_at_utc",
-                           (json_int_t)l->t2_at_utc, "t3_at_utc",
-                           (json_int_t)l->t3_at_utc, "config_hash", hex);
-    if (!o) {
-        json_decref(dns);
-        return NULL;
-    }
-    put_addr(o, "address", l->address);
-    put_addr(o, "netmask", l->netmask);
-    put_addr(o, "gateway", l->gateway);
-    put_addr(o, "server_id", l->server_id);
-    if (l->gw_mac_valid) {
-        char mac[2 * HADC_MAC_LEN + 1];
-        for (size_t i = 0; i < HADC_MAC_LEN; i++)
-            sprintf(mac + 2 * i, "%02x", l->gw_mac[i]);
-        json_object_set_new(o, "gw_mac", json_string(mac));
-    }
-    return o;
-}
 
 int hadc_persist_init(hadc_ctx_t *ctx, const char *path)
 {
@@ -104,11 +42,9 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
     out->found = true;
     json_t *v;
     if ((v = json_object_get(root, "role")) && json_is_string(v))
-        if (!strcmp(json_string_value(v), "master")) out->role = HADC_ROLE_MASTER;
-        else if (!strcmp(json_string_value(v), "slave")) out->role = HADC_ROLE_SLAVE;
-        else if (!strcmp(json_string_value(v), "promoting")) out->role = HADC_ROLE_PROMOTING;
-        else if (!strcmp(json_string_value(v), "demoting")) out->role = HADC_ROLE_DEMOTING;
-        else out->role = HADC_ROLE_UNKNOWN;
+        out->role = hadc_role_from_name(json_string_value(v));
+    else
+        out->role = HADC_ROLE_UNKNOWN;
     if ((v = json_object_get(root, "master_id")) && json_is_string(v))
         snprintf(out->master_id, sizeof(out->master_id), "%s",
                  json_string_value(v));
@@ -126,77 +62,10 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
     }
 
     json_t *lj = json_object_get(root, "lease");
-    if (lj && json_is_object(lj)) {
-        hadc_lease_t *l = &out->lease;
-        if ((v = json_object_get(lj, "state")) && json_is_string(v))
-            l->state = name_to_state(json_string_value(v));
-        if ((v = json_object_get(lj, "retention_active")) && json_is_boolean(v))
-            l->retention_active = json_is_true(v);
-        get_addr(lj, "address", &l->address);
-        get_addr(lj, "netmask", &l->netmask);
-        get_addr(lj, "gateway", &l->gateway);
-        get_addr(lj, "server_id", &l->server_id);
-        json_t *dns = json_object_get(lj, "dns");
-        if (dns && json_is_array(dns)) {
-            size_t idx;
-            json_t *e;
-            json_array_foreach(dns, idx, e) {
-                if (json_is_string(e) && l->n_dns < HADC_DNS_MAX &&
-                    inet_pton(AF_INET, json_string_value(e), &l->dns[l->n_dns]) == 1)
-                    l->n_dns++;
-            }
-        }
-        if ((v = json_object_get(lj, "obtained_at_utc")) && json_is_integer(v))
-            l->obtained_at_utc = (long long)json_integer_value(v);
-        if ((v = json_object_get(lj, "t1_at_utc")) && json_is_integer(v))
-            l->t1_at_utc = (long long)json_integer_value(v);
-        if ((v = json_object_get(lj, "t2_at_utc")) && json_is_integer(v))
-            l->t2_at_utc = (long long)json_integer_value(v);
-        if ((v = json_object_get(lj, "t3_at_utc")) && json_is_integer(v))
-            l->t3_at_utc = (long long)json_integer_value(v);
-        /* Backward compat: old remaining-second snapshots. */
-        if (l->t3_at_utc == 0) {
-            json_t *oat = json_object_get(lj, "observed_at_utc");
-            json_t *r3 = json_object_get(lj, "t3_remaining_s");
-            if (oat && json_is_integer(oat) && r3 && json_is_integer(r3)) {
-                long long base = json_integer_value(oat);
-                json_t *r1 = json_object_get(lj, "t1_remaining_s");
-                json_t *r2 = json_object_get(lj, "t2_remaining_s");
-                if (l->obtained_at_utc == 0)
-                    l->obtained_at_utc = base;
-                l->t1_at_utc = base + (r1 && json_is_integer(r1) ? json_integer_value(r1) : 0);
-                l->t2_at_utc = base + (r2 && json_is_integer(r2) ? json_integer_value(r2) : 0);
-                l->t3_at_utc = base + json_integer_value(r3);
-            }
-        }
-        if ((v = json_object_get(lj, "config_hash")) && json_is_string(v) &&
-            strlen(json_string_value(v)) == 64) {
-            for (size_t i = 0; i < 32; i++) {
-                unsigned b;
-                if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
-                    break;
-                l->config_hash[i] = (uint8_t)b;
-            }
-        }
-        if ((v = json_object_get(lj, "gw_mac")) && json_is_string(v) &&
-            strlen(json_string_value(v)) == 2 * HADC_MAC_LEN) {
-            uint8_t mac[HADC_MAC_LEN];
-            size_t i;
-            for (i = 0; i < HADC_MAC_LEN; i++) {
-                unsigned b;
-                if (sscanf(json_string_value(v) + 2 * i, "%2x", &b) != 1)
-                    break;
-                mac[i] = (uint8_t)b;
-            }
-            if (i == HADC_MAC_LEN) {
-                memcpy(l->gw_mac, mac, sizeof(mac));
-                l->gw_mac_valid = true;
-            }
-        }
-    }
+    hadc_lease_from_json(lj, &out->lease);
 
     /* Absolute UTC anchors need no downtime recalculation; clocks are the
-     * source of truth on restart. Legacy snapshots are converted on parse. */
+     * source of truth on restart. */
 
     json_decref(root);
     return 0;
@@ -208,16 +77,11 @@ int hadc_persist_load(hadc_ctx_t *ctx, hadc_persist_view_t *out)
 static char *persist_build_json(hadc_ctx_t *ctx)
 {
     /* Timers are absolute UTC anchors; persist them as-is. */
-    json_t *lj = lease_json(&ctx->lease);
+    json_t *lj = hadc_lease_to_json(&ctx->lease);
     if (!lj)
         return NULL;
     json_t *o = json_pack("{s:s, s:s, s:I, s:I, s:s, s:s, s:I, s:I, s:o}", "role",
-                          ctx->role == HADC_ROLE_MASTER ? "master"
-                          : ctx->role == HADC_ROLE_SLAVE ? "slave"
-                          : ctx->role == HADC_ROLE_PROMOTING ? "promoting"
-                          : ctx->role == HADC_ROLE_DEMOTING ? "demoting"
-                                                         : "unknown",
-                          "master_id", ctx->conf.designated_master,
+                          hadc_role_name(ctx->role), "master_id", ctx->conf.designated_master,
                           "lease_version", (json_int_t)ctx->lease.version, "acked_version",
                           (json_int_t)ctx->acked_version, "interface", ctx->conf.interface,
                           "conf_sha256", ctx->conf.sha256, "saved_at_utc",

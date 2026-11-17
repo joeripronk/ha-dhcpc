@@ -5,7 +5,6 @@
  * that seam directly (simulating the thread's stall signal) and checks the
  * main-loop guard: demote only for a master in a real cluster, not for a slave
  * and not during a graceful restart. */
-#define _GNU_SOURCE
 
 #include <fcntl.h>
 #include <pthread.h>

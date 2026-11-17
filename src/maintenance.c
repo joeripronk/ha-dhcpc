@@ -12,7 +12,6 @@
  * persist state between this worker and the main loop; it is recursive so the
  * public executor/routing entry points can nest (routing_reconcile -> apply).
  */
-#define _GNU_SOURCE
 
 #include <errno.h>
 #include <pthread.h>

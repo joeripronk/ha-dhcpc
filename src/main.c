@@ -3,7 +3,6 @@
  * runs one epoll event loop (heartbeat timer + ctl socket + UDP transport).
  * DHCP engine, cluster decisions and netlink application are stubs wired
  * through the frozen M0 interfaces. */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -26,14 +25,15 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/config.h"
-#include "ha-dhcpc/conntrack.h"
 #include "ha-dhcpc/ctl.h"
 #include "ha-dhcpc/dhcpcore.h"
 #include "ha-dhcpc/executor.h"
-#include "ha-dhcpc/lease.h"
+#include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/routing.h"
+#include "ha-dhcpc/reload.h"
+#include "ha-dhcpc/conntrack.h"
 #include "internal.h"
 #include "ospf.h"
 
@@ -277,10 +277,13 @@ static int cache_gw_mac(hadc_ctx_t *ctx)
         return 0;
     memcpy(ctx->lease.gw_mac, mac, sizeof(mac));
     ctx->lease.gw_mac_valid = true;
-    hadc_info("lease: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached in "
-              "cluster state",
-              inet_ntoa(*(struct in_addr *)&ctx->lease.gateway), mac[0], mac[1],
-              mac[2], mac[3], mac[4], mac[5]);
+    {
+        char gwbuf[INET_ADDRSTRLEN];
+        hadc_info("lease: gateway %s lladdr %02x:%02x:%02x:%02x:%02x:%02x cached in "
+                  "cluster state",
+                  hadc_ipv4_format(ctx->lease.gateway, gwbuf, sizeof(gwbuf)), mac[0], mac[1],
+                  mac[2], mac[3], mac[4], mac[5]);
+    }
     return 1;
 }
 
@@ -361,8 +364,9 @@ static void abort_tcp_on_newip(hadc_ctx_t *ctx, const struct in_addr *old_addr)
 
 dump_done:
     if (nmatch == 0 && !truncated) {
+        char abuf[INET_ADDRSTRLEN];
         close(fd);
-        hadc_info("newip: no TCP sockets bound to %s", inet_ntoa(*old_addr));
+        hadc_info("newip: no TCP sockets bound to %s", hadc_ipv4_format(*old_addr, abuf, sizeof(abuf)));
         return;
     }
 
@@ -416,12 +420,15 @@ dump_done:
     }
 destroy_done:
     close(fd);
-    if (truncated)
-        hadc_warn("newip: too many TCP sockets bound to %s; aborted %d, failed %d, skipped %d",
-                  inet_ntoa(*old_addr), destroyed, failed, truncated);
-    else
-        hadc_info("newip: aborted TCP sockets bound to %s (destroyed=%d failed=%d)",
-                  inet_ntoa(*old_addr), destroyed, failed);
+    {
+        char abuf[INET_ADDRSTRLEN];
+        if (truncated)
+            hadc_warn("newip: too many TCP sockets bound to %s; aborted %d, failed %d, skipped %d",
+                      hadc_ipv4_format(*old_addr, abuf, sizeof(abuf)), destroyed, failed, truncated);
+        else
+            hadc_info("newip: aborted TCP sockets bound to %s (destroyed=%d failed=%d)",
+                      hadc_ipv4_format(*old_addr, abuf, sizeof(abuf)), destroyed, failed);
+    }
 }
 
 static void cb_lease_update(void *arg, const hadc_lease_t *lease)
@@ -440,11 +447,12 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         hadc_cluster_unlock();
         {
             uint32_t t1, t3;
+            char abuf[INET_ADDRSTRLEN];
             hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, NULL, &t3);
             hadc_info("lease update v%llu state=%s addr=%s t1=%us t3=%us",
                       (unsigned long long)ctx->lease.version,
                       hadc_lease_state_name(ctx->lease.state),
-                      inet_ntoa(*(struct in_addr *)&ctx->lease.address), t1, t3);
+                      hadc_ipv4_format(ctx->lease.address, abuf, sizeof(abuf)), t1, t3);
         }
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired,
@@ -456,9 +464,11 @@ static void cb_lease_update(void *arg, const hadc_lease_t *lease)
         if (pending) {
             if (old.s_addr != 0 && old.s_addr != ctx->lease.address.s_addr)
                 abort_tcp_on_newip(ctx, &old);
-            else if (old.s_addr != 0)
+            else if (old.s_addr != 0) {
+                char abuf[INET_ADDRSTRLEN];
                 hadc_info("newip: new lease kept address %s; no TCP abort needed",
-                          inet_ntoa(ctx->lease.address));
+                          hadc_ipv4_format(ctx->lease.address, abuf, sizeof(abuf)));
+            }
             ctx->newip_pending = false;
             ctx->newip_old_addr.s_addr = 0;
         }
@@ -1135,7 +1145,7 @@ int main(int argc, char **argv)
             hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
             hadc_info("persist: restored role=%s lease_version=%llu state=%s addr=%s "
                       "mask=%s gateway=%s dns=%zu t1=%us t2=%us t3=%us acked=%llu",
-                      ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
+                      hadc_role_name(ctx->role),
                       (unsigned long long)pv.lease_version, hadc_lease_state_name(ctx->lease.state),
                       a, nm, gw, ctx->lease.n_dns, t1, t2, t3,
                       (unsigned long long)ctx->acked_version);
@@ -1147,9 +1157,8 @@ int main(int argc, char **argv)
              ctx->conf.master_mac[1], ctx->conf.master_mac[2], ctx->conf.master_mac[3],
              ctx->conf.master_mac[4], ctx->conf.master_mac[5]);
     hadc_info("node %s priority=%d role=%s interface=%s (DHCP MAC %s; shared conf %s sha256=%s)",
-              ctx->conf.self, ctx->conf.priority,
-              ctx->role == HADC_ROLE_MASTER ? "MASTER" : "SLAVE", ctx->conf.interface, macstr,
-              ctx->conf.base_path, ctx->conf.sha256);
+              ctx->conf.self, ctx->conf.priority, hadc_role_name(ctx->role),
+              ctx->conf.interface, macstr, ctx->conf.base_path, ctx->conf.sha256);
 
 
     ctx->epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -1266,8 +1275,7 @@ int main(int argc, char **argv)
         uint32_t t1, t2, t3;
         hadc_lease_remaining(&ctx->lease, (long long)time(NULL), &t1, &t2, &t3);
         hadc_info("startup: role=%s lease state=%s renew_in=%us rebind_in=%us expire_in=%us",
-                  ctx->role == HADC_ROLE_MASTER ? "master" : "slave",
-                  hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
+                  hadc_role_name(ctx->role), hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
     }
     if (ctx->conf.n_members == 0)
         hadc_info("running standalone (no cluster members; heartbeat transport disabled, role master)");

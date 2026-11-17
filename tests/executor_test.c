@@ -1,7 +1,6 @@
 /* Executor state-commit tests: only fatal setup failures may stop executor
  * apply from recording the desired state as applied. Plus the drift self-heal
  * pre-init contract (no memo, no monitor, verification unknown). */
-#define _GNU_SOURCE
 
 #include <arpa/inet.h>
 #include <errno.h>
