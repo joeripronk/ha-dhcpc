@@ -281,8 +281,12 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             reply = "{\"ok\":false,\"error\":\"usage: conntrack resync\"}";
         }
     } else if (!strcmp(cmd, "shutdown") || !strcmp(cmd, "kill") || !strcmp(cmd, "quit") || !strcmp(cmd, "stop")) {
-        bool force = !strcmp(arg, "now") || !strcmp(arg, "force");
-        hadc_info("ctl: %s%s", cmd, force ? " now" : "");
+        bool force = !strcmp(cmd, "kill") || !strcmp(arg, "now") || !strcmp(arg, "force");
+        hadc_info("ctl: %s%s", cmd, (!strcmp(cmd, "kill") || force) && strcmp(cmd, "kill") ? " now" : (!strcmp(cmd, "kill") ? "" : ""));
+        if (!strcmp(cmd, "kill"))
+            hadc_info("ctl: kill");
+        else
+            hadc_info("ctl: %s%s", cmd, force ? " now" : "");
         if (ctx->conf.n_members == 0) {
             hadc_info("ctl shutdown: standalone shutdown, leaving service intact");
             ctx->shutting_down = true;
@@ -300,7 +304,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
             ctx->shutting_down = true;
             ctx->running = false;
         } else {
-            hadc_warn("ctl shutdown: no live peer available for handoff; shutdown cancelled (use 'shutdown now')");
+            hadc_warn("ctl shutdown: no live peer available for handoff; shutdown cancelled (use 'shutdown now' or 'kill')");
             reply = "{\"ok\":false,\"error\":\"no live peer for handoff\"}";
         }
     } else {

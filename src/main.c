@@ -634,7 +634,7 @@ static void usage(const char *argv0)
             "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
             "ctl cmds (unambiguous prefixes ok): status|s promote|p demote|d update|u "
-            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown|kill [now]\n",
+            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown [now]|kill\n",
             argv0, argv0, argv0, argv0);
 }
 
