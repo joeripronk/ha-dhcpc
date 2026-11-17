@@ -622,7 +622,7 @@ static void usage(const char *argv0)
             "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
             "ctl cmds (unambiguous prefixes ok): status|s promote|p demote|d update|u "
-            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync\n",
+            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown\n",
             argv0, argv0, argv0, argv0);
 }
 
@@ -944,7 +944,7 @@ static bool status_tok(const char *t, const char *full, const char *abbr)
 static const char *ctl_resolve(const char *tok, const char *cmd)
 {
     static const char *cmds[] = {"promote", "demote", "status", "update", "renew",
-                                 "newip", "graceful-restart", "conntrack"};
+                                 "newip", "graceful-restart", "conntrack", "shutdown"};
     static const char *gr_args[] = {"enable", "disable", "on", "off", "cancel"};
     static const char *ct_args[] = {"resync"};
     const char **set = cmds;

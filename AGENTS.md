@@ -15,8 +15,8 @@ Passwordless sudo is available on this machine. Use the provided deploy scripts 
 
 - Script: `./deploy-local.sh` (wrapper for `production/host-router/deploy-local.sh`).
 - Builds and runs tests, installs binary/config/unit only when changed, and restarts `ha-dhcpc.service`.
-- **Dry-run by default** (prints actions). Apply with:
-  - `./deploy-local.sh --apply`
+- Deploys by default. Preview with:
+  - `./deploy-local.sh --dry-run`
 - Re-execs with sudo as needed. After apply it checks status via `ha-dhcpc ctl status` and prints journal hints on failure.
 
 ### OpenWrt router cluster
@@ -29,7 +29,7 @@ Passwordless sudo is available on this machine. Use the provided deploy scripts 
 
 ## Guidelines
 
-- Prefer `make test` after code changes; for local deployment use `./deploy-local.sh --apply`; for OpenWrt routers use `./deploy-openwrt.sh` (dry-run first when unsure).
+- Prefer `make test` after code changes; for local deployment use `./deploy-local.sh` (`--dry-run` to preview); for OpenWrt routers use `./deploy-openwrt.sh` (`--dry-run` to preview).
 - Do not commit secrets or environment-specific credentials; configs in `production/` are deployment-specific.
 - Be cautious with cluster deploys: they affect live routers and failover behavior. Review status/output and avoid manual partial deploys when the script aborts for safety.
 

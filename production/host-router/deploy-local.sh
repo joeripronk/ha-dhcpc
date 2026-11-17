@@ -1,7 +1,8 @@
 #!/bin/sh
 # Deploy ha-dhcpc to this host (the router): native build + tests, install
 # binary, production config and systemd unit when they differ from what is
-# installed, then restart the service. Dry-run by default; run with --apply.
+# installed, then restart the service. Deploys by default; pass --dry-run to
+# preview actions without applying changes.
 #
 # Rollback: install the previous binary/config and restart, or
 # systemctl stop ha-dhcpc.service && systemctl start dhclient-internet
@@ -11,9 +12,9 @@ CONF_DIR=/etc/ha-dhcpc
 UNIT=ha-dhcpc.service
 SRC_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_DIR=$(cd "$SRC_DIR/../.." && pwd)
-APPLY=0
+APPLY=1
 
-[ "${1:-}" = "--apply" ] && APPLY=1
+[ "${1:-}" = "--dry-run" ] && APPLY=0
 
 run() {
 	if [ "$APPLY" = 1 ]; then sh -c "$1"; else echo "DRY-RUN: $1"; fi
@@ -84,5 +85,5 @@ if [ "$APPLY" = 1 ]; then
 		exit 1
 	fi
 else
-	echo "dry-run complete; rerun with --apply"
+	echo "dry-run complete; rerun without --dry-run"
 fi

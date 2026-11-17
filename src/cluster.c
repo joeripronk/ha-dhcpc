@@ -1835,14 +1835,18 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
      * restart or partition heal can resume. Returns 1 if a handoff was made. */
     if (hadc_cluster_graceful_active(ctx))
         return 0;
-    if (ctx->role != HADC_ROLE_MASTER)
+    if (ctx->role != HADC_ROLE_MASTER && ctx->role != HADC_ROLE_PROMOTING)
         return 0;
     age_peers(ctx);
     const hadc_member_t *best = best_alive(ctx, false);
     if (!best)
         return 0;
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
-    set_role(ctx, HADC_ROLE_SLAVE);
+    /* Controlled handoff: enter DEMOTING so the old master keeps forwarding for
+     * the hold window while the new master takes over. */
+    set_role(ctx, HADC_ROLE_DEMOTING);
+    g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
+    g_handoff_until_ms = g_no_elect_until_ms;
     hadc_info("cluster: handing the master role to %s before shutdown", best->id);
     propagate_role(ctx);
     hadc_persist_save(ctx);
