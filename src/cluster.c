@@ -1697,8 +1697,10 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
     if (!best)
         return 0;
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
-    /* Controlled handoff: enter DEMOTING so the old master keeps forwarding for
-     * the hold window while the new master takes over. */
+    /* Controlled handoff: enter DEMOTING so a caller that keeps running (e.g.
+     * a self-monitor demote) keeps forwarding for the hold window while the
+     * new master takes over; shutdown callers exit right after this returns,
+     * so for them only the role broadcast goes out. */
     set_role(ctx, HADC_ROLE_DEMOTING);
     g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
     g_handoff_until_ms = g_no_elect_until_ms;

@@ -249,13 +249,16 @@ static void signal_ready(hadc_ctx_t *ctx, int fd)
         ctx->running = false;
         return;
     }
+    const char *reason = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
+                             ? "no live peer available for handoff"
+                             : "not master, cannot hand off";
     if (force) {
-        hadc_warn("signal %u received; no live peer available for handoff, shutting down without handoff", si.ssi_signo);
+        hadc_warn("signal %u received; %s, shutting down without handoff", si.ssi_signo, reason);
         ctx->shutting_down = true;
         ctx->running = false;
         return;
     }
-    hadc_warn("signal %u received; no live peer available for handoff, shutdown cancelled", si.ssi_signo);
+    hadc_warn("signal %u received; %s, shutdown cancelled", si.ssi_signo, reason);
 }
 
 /* DHCP engine callbacks (dhcpcore adapter -> daemon). */

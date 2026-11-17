@@ -39,6 +39,8 @@ static inline unsigned hadc_ipv4_mask_to_prefix(struct in_addr mask, bool *ok)
     return contiguous ? (unsigned)__builtin_popcount(m) : 0;
 }
 
+/* Returns 0 for a non-contiguous mask (readers treat it as the default
+ * route); the old popcount behavior for such masks is gone. */
 static inline unsigned hadc_ipv4_netmask_prefix(struct in_addr mask)
 {
     bool ok = false;

@@ -23,7 +23,11 @@ typedef enum {
  * Timer anchors are absolute UTC seconds (time_t) when the lease was
  * obtained/refreshed: renew/rebind/expire deadlines are derived from them so
  * every node computes the same remaining time from its clock, and restarts do
- * not rely on snapshot aging. 0 means unknown/unset. */
+ * not rely on snapshot aging.  0 means unknown/unset.  Deadlines are therefore
+ * a direct function of the system clock.  The old relative fields
+ * (t1_remaining_s/observed_at_utc) are no longer parsed, so a lease written by
+ * a pre-anchor node parses with zero timers and forces a renew on adoption:
+ * upgrade a cluster in one pass, do not roll mixed versions. */
 typedef struct {
     uint64_t version;
     hadc_lease_state_t state;
