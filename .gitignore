@@ -6,3 +6,4 @@ build/
 /ha-dhcpc
 /vendor/
 /captures/
+/failover-captures/
