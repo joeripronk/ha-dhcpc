@@ -281,8 +281,46 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
                 reply = "{\"ok\":false,\"error\":\"conntrack resync unavailable\"}";
             else
                 reply = "{\"ok\":true}";
+        } else if (!strcmp(arg, "compare")) {
+            if (ctx->role != HADC_ROLE_SLAVE) {
+                reply = "{\"ok\":false,\"error\":\"conntrack compare requires slave role\"}";
+            } else if (hadc_conntrack_compare(ctx) != 0) {
+                reply = "{\"ok\":false,\"error\":\"conntrack compare unavailable\"}";
+            } else {
+                long long deadline = hadc_now_ms() + 10000;
+                while (hadc_now_ms() < deadline && !hadc_conntrack_compare_done(ctx)) {
+                    struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
+                    nanosleep(&ts, NULL);
+                }
+                char *cmp_txt = hadc_conntrack_compare_json(ctx);
+                json_t *cmp = NULL;
+                if (cmp_txt) {
+                    json_error_t jerr;
+                    cmp = json_loads(cmp_txt, 0, &jerr);
+                    free(cmp_txt);
+                }
+                if (!cmp)
+                    cmp = json_object();
+                bool done = hadc_conntrack_compare_done(ctx);
+                json_t *out = json_object();
+                json_object_set_new(out, "ok", json_boolean(done));
+                if (!done)
+                    json_object_set_new(out, "error", json_string("conntrack compare timed out"));
+                json_object_set_new(out, "compare", cmp);
+                char *txt = json_dumps(out, JSON_PRESERVE_ORDER | JSON_COMPACT);
+                json_decref(out);
+                if (txt) {
+                    char nl = '\n';
+                    (void)!write(reply_fd, txt, strlen(txt));
+                    (void)!write(reply_fd, &nl, 1);
+                    free(txt);
+                    reply = NULL;
+                } else {
+                    reply = "{\"ok\":false,\"error\":\"conntrack compare failed\"}";
+                }
+            }
         } else {
-            reply = "{\"ok\":false,\"error\":\"usage: conntrack resync\"}";
+            reply = "{\"ok\":false,\"error\":\"usage: conntrack resync|compare\"}";
         }
     } else if (!strcmp(cmd, "shutdown") || !strcmp(cmd, "kill") || !strcmp(cmd, "quit") || !strcmp(cmd, "stop")) {
         bool force = !strcmp(cmd, "kill") || !strcmp(arg, "now") || !strcmp(arg, "force");

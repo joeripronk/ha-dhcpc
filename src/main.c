@@ -647,7 +647,7 @@ static void usage(const char *argv0)
             "       %s status|s [cluster|c|ip|i|ospf|o [routes|r|neighbors|n]] [detailed|d]\n"
             "       %s -v|--version\n"
             "ctl cmds (unambiguous prefixes ok): status|s promote|p demote|d update|u "
-            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync shutdown [now]|kill\n",
+            "renew|r newip|n graceful-restart|g [enable|e disable|d] conntrack|c resync|compare shutdown [now]|kill\n",
             argv0, argv0, argv0, argv0);
 }
 
@@ -973,7 +973,7 @@ static const char *ctl_resolve(const char *tok, const char *cmd)
     static const char *cmds[] = {"promote", "demote", "status", "update", "renew",
                                  "newip", "graceful-restart", "conntrack", "shutdown", "kill"};
     static const char *gr_args[] = {"enable", "disable", "on", "off", "cancel"};
-    static const char *ct_args[] = {"resync"};
+    static const char *ct_args[] = {"resync", "compare"};
     static const char *sd_args[] = {"now", "force"};
     const char **set = cmds;
     size_t n = sizeof(cmds) / sizeof(cmds[0]);

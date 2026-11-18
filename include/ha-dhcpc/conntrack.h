@@ -46,6 +46,9 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
 void hadc_conntrack_notify_config(hadc_ctx_t *ctx);
 void hadc_conntrack_notify_vip(hadc_ctx_t *ctx);
 int hadc_conntrack_resync(hadc_ctx_t *ctx);
+int hadc_conntrack_compare(hadc_ctx_t *ctx);
+bool hadc_conntrack_compare_done(const hadc_ctx_t *ctx);
+char *hadc_conntrack_compare_json(const hadc_ctx_t *ctx);
 void hadc_conntrack_get_status(const hadc_ctx_t *ctx, hadc_ct_status_t *out);
 char *hadc_conntrack_status_json(const hadc_ctx_t *ctx);
 

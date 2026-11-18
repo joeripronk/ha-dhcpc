@@ -247,6 +247,23 @@ struct hadc_conntrack {
     uint64_t last_resync_ms;
     uint64_t last_timer_sync_ms;
     uint32_t generation;
+
+    /* last snapshot comparison vs authoritative master (slave-side) */
+    bool compare_requested;
+    bool compare_in_progress;
+    uint64_t compare_started_ms;
+    uint32_t compare_missing_on_slave;
+    uint32_t compare_extra_on_slave;
+    uint32_t compare_matched;
+    uint32_t compare_gen;
+    char compare_master[HADC_NODE_ID_MAX];
+    bool compare_has_result;
+    uint64_t compare_at_ms;
+    uint32_t compare_last_missing;
+    uint32_t compare_last_extra;
+    uint32_t compare_last_matched;
+    uint32_t compare_last_gen;
+    char compare_last_master[HADC_NODE_ID_MAX];
 };
 
 static uint64_t now_ms(void)
@@ -596,7 +613,7 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     ct->ctnl_dump_start_ms = now_ms();
     ct->dump_event_count = 0;
     ct->dump_event_overflow = false;
-    hadc_info("conntrack: ct dump requested seq=%u", ct->ctnl_dump_seq);
+    hadc_dbg("conntrack: ct dump requested seq=%u", ct->ctnl_dump_seq);
     /* best-effort: also request expectation dump on same socket/seq space logic
      * is complex to multiplex; expectations arrive as events and are treated as
      * incremental in v1. */
@@ -1208,7 +1225,7 @@ static void drain_ctnl(struct hadc_conntrack *ct){
         for(struct nlmsghdr *nh=(struct nlmsghdr*)buf; NLMSG_OK(nh,(unsigned)n); nh=NLMSG_NEXT(nh,n)){
             if(nh->nlmsg_type==NLMSG_DONE){
                 /* dump completed; if not aborted, allow snapshot_end to be sent after flush */
-                hadc_info("conntrack: ct dump done seq=%u pending=%d", nh->nlmsg_seq, (int)ct->ctnl_dump_pending);
+                hadc_dbg("conntrack: ct dump done seq=%u pending=%d", nh->nlmsg_seq, (int)ct->ctnl_dump_pending);
                 if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted)
                     ct->ctnl_dump_pending = false;
                 ct->ctnl_dump_aborted = false;
@@ -1794,6 +1811,21 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     if (h->type == HADC_CT_MSG_SNAPSHOT_BEGIN) {
         if (ct->role == HADC_ROLE_SLAVE) {
             ct->rx_snapshot_active = true;
+            ct->compare_in_progress = true;
+            ct->compare_started_ms = now_ms();
+            ct->compare_missing_on_slave = 0;
+            ct->compare_extra_on_slave = 0;
+            ct->compare_matched = 0;
+            ct->compare_gen = ct->generation;
+            snprintf(ct->compare_master, sizeof(ct->compare_master), "%s", p->id[0] ? p->id : "");
+            if (payload && len > 0) {
+                json_error_t jerr; json_t *jo = json_loadb((const char *)payload, len, 0, &jerr);
+                if (jo) {
+                    json_int_t g = json_integer_value(json_object_get(jo, "gen"));
+                    if (g > 0) ct->compare_gen = (uint32_t)g;
+                    json_decref(jo);
+                }
+            }
             for (size_t i = 0; i < ct->n_shadow; i++)
                 ct->shadow[i].seen_in_snapshot = false;
         }
@@ -1802,10 +1834,12 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     if (h->type == HADC_CT_MSG_SNAPSHOT_END) {
         if (ct->role == HADC_ROLE_SLAVE && ct->rx_snapshot_active) {
             bool recent_handoff = ct->slave_recent_master_handoff;
+            uint32_t extra = 0;
             for (size_t i = 0; i < ct->n_shadow; i++) {
                 hadc_ct_shadow_ent_t *s = &ct->shadow[i];
                 if (!s->valid || s->seen_in_snapshot)
                     continue;
+                extra++;
                 char desc[256];
                 ct_entry_log_tuple(desc, sizeof(desc), &s->e);
                 if (recent_handoff) {
@@ -1844,6 +1878,31 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                     }
                 }
             }
+            ct->compare_extra_on_slave = extra;
+            ct->compare_has_result = true;
+            ct->compare_at_ms = now_ms();
+            ct->compare_last_missing = ct->compare_missing_on_slave;
+            ct->compare_last_extra = ct->compare_extra_on_slave;
+            ct->compare_last_matched = ct->compare_matched;
+            ct->compare_last_gen = ct->compare_gen;
+            snprintf(ct->compare_last_master, sizeof(ct->compare_last_master), "%s", ct->compare_master);
+            if (ct->compare_requested || ct->compare_last_missing || ct->compare_last_extra) {
+                hadc_info("conntrack: compare vs master %s gen=%u: missing_on_slave=%u extra_on_slave=%u matched=%u",
+                          ct->compare_last_master[0] ? ct->compare_last_master : "?",
+                          (unsigned)ct->compare_last_gen,
+                          (unsigned)ct->compare_last_missing,
+                          (unsigned)ct->compare_last_extra,
+                          (unsigned)ct->compare_last_matched);
+            } else {
+                hadc_dbg("conntrack: compare vs master %s gen=%u: missing_on_slave=%u extra_on_slave=%u matched=%u",
+                         ct->compare_last_master[0] ? ct->compare_last_master : "?",
+                         (unsigned)ct->compare_last_gen,
+                         (unsigned)ct->compare_last_missing,
+                         (unsigned)ct->compare_last_extra,
+                         (unsigned)ct->compare_last_matched);
+            }
+            ct->compare_requested = false;
+            ct->compare_in_progress = false;
             ct->rx_snapshot_active = false;
             ct->slave_recent_master_handoff = false;
         }
@@ -1865,6 +1924,22 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             if (ok || del) {
                 char desc[256];
                 ct_entry_log_tuple(desc, sizeof(desc), e);
+                /* master-authoritative frames during a snapshot window arrive as
+                 * SNAPSHOT_ENTRY or as replayed UPSERT/DELETE (dump rows are
+                 * CT_NEW messages routed through the event buffer); count them all. */
+                bool in_snap = ct->rx_snapshot_active;
+                hadc_ct_shadow_ent_t *before = shadow_find(ct, e);
+                bool existed = before && before->valid;
+                if (in_snap) {
+                    if (del) {
+                        if (existed)
+                            ct->compare_matched++; /* agreed removal */
+                    } else if (existed) {
+                        ct->compare_matched++;
+                    } else {
+                        ct->compare_missing_on_slave++;
+                    }
+                }
                 hadc_dbg("conntrack: synced %s from %s: %s",
                          h->type == HADC_CT_MSG_SNAPSHOT_ENTRY ? "snapshot" : (del ? "delete" : "upsert"),
                          p->id, desc);
@@ -2056,7 +2131,7 @@ static void master_maybe_send_snapshot(struct hadc_conntrack *ct, hadc_ct_peer_t
     }
     p->snapshot_active = true;
     ct->st.resync_count++;
-    hadc_info("conntrack: snapshot begin -> %s gen=%u connect=%s",
+    hadc_dbg("conntrack: snapshot begin -> %s gen=%u connect=%s",
               p->id[0] ? p->id : "peer", ct->generation,
               (ct->snapshot_on_connect && p->tx_seq <= 1) ? "yes" : "no");
 }
@@ -2120,6 +2195,7 @@ static void *conntrack_thread_main(void *arg)
             ct->rx_snapshot_active = false;
             ct->slave_resync_requested = false;
             ct->slave_recent_master_handoff = false;
+            ct->compare_in_progress = false;
             for (size_t i = 0; i < ct->n_peers; i++) {
                 ct->peers[i].need_resync = false;
                 if (ct->peers[i].fd >= 0 || ct->peers[i].connected)
@@ -2199,7 +2275,7 @@ static void *conntrack_thread_main(void *arg)
                                        json_pack("{s:i}", "gen", (int)ct->generation));
                 if (rc > 0) {
                     p->snapshot_active = false;
-                    hadc_info("conntrack: snapshot end -> %s gen=%u", p->id[0] ? p->id : "peer", ct->generation);
+                    hadc_dbg("conntrack: snapshot end -> %s gen=%u", p->id[0] ? p->id : "peer", ct->generation);
                 } else if (rc < 0) {
                     close_peer(p);
                 } else {
@@ -2443,6 +2519,63 @@ int hadc_conntrack_resync(hadc_ctx_t *ctx)
     return 0;
 }
 
+int hadc_conntrack_compare(hadc_ctx_t *ctx)
+{
+    struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
+    if (!ct || !ct->enabled)
+        return -1;
+    pthread_mutex_lock(&ct->lock);
+    if (ct->role != HADC_ROLE_SLAVE) {
+        pthread_mutex_unlock(&ct->lock);
+        return -1;
+    }
+    ct->compare_requested = true;
+    ct->compare_has_result = false;
+    ct->compare_started_ms = now_ms();
+    ct->slave_resync_requested = true;
+    ct->st.resync_count++;
+    ct->last_resync_ms = now_ms();
+    pthread_mutex_unlock(&ct->lock);
+    ct_wake(ct);
+    return 0;
+}
+
+bool hadc_conntrack_compare_done(const hadc_ctx_t *ctx)
+{
+    struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
+    if (!ct)
+        return false;
+    pthread_mutex_lock((pthread_mutex_t *)&ct->lock);
+    bool done = ct->compare_has_result && !ct->compare_in_progress && !ct->compare_requested;
+    pthread_mutex_unlock((pthread_mutex_t *)&ct->lock);
+    return done;
+}
+
+char *hadc_conntrack_compare_json(const hadc_ctx_t *ctx)
+{
+    struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
+    if (!ct)
+        return NULL;
+    pthread_mutex_lock((pthread_mutex_t *)&ct->lock);
+    json_t *cmp = json_object();
+    json_object_set_new(cmp, "requested", json_boolean(ct->compare_requested));
+    json_object_set_new(cmp, "in_progress", json_boolean(ct->compare_in_progress));
+    json_object_set_new(cmp, "has_result", json_boolean(ct->compare_has_result));
+    if (ct->compare_has_result) {
+        json_object_set_new(cmp, "at_ms", json_integer((json_int_t)ct->compare_at_ms));
+        json_object_set_new(cmp, "master", json_string(ct->compare_last_master));
+        json_object_set_new(cmp, "gen", json_integer((json_int_t)ct->compare_last_gen));
+        json_object_set_new(cmp, "missing_on_slave", json_integer((json_int_t)ct->compare_last_missing));
+        json_object_set_new(cmp, "extra_on_slave", json_integer((json_int_t)ct->compare_last_extra));
+        json_object_set_new(cmp, "matched", json_integer((json_int_t)ct->compare_last_matched));
+        json_object_set_new(cmp, "equal", json_boolean(ct->compare_last_missing == 0 && ct->compare_last_extra == 0));
+    }
+    pthread_mutex_unlock((pthread_mutex_t *)&ct->lock);
+    char *txt = json_dumps(cmp, JSON_PRESERVE_ORDER | JSON_COMPACT);
+    json_decref(cmp);
+    return txt;
+}
+
 void hadc_conntrack_get_status(const hadc_ctx_t *ctx, hadc_ct_status_t *out)
 {
     struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
@@ -2463,6 +2596,7 @@ void hadc_conntrack_get_status(const hadc_ctx_t *ctx, hadc_ct_status_t *out)
 char *hadc_conntrack_status_json(const hadc_ctx_t *ctx)
 {
     hadc_ct_status_t st;
+    struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
     hadc_conntrack_get_status(ctx, &st);
     const char *sip = st.sip_helper == HADC_CT_HELPER_AVAILABLE ? "available"
                     : st.sip_helper == HADC_CT_HELPER_UNAVAILABLE ? "unavailable"
@@ -2477,6 +2611,24 @@ char *hadc_conntrack_status_json(const hadc_ctx_t *ctx)
         "resync_count", (json_int_t)st.resync_count, "queue_drops", (json_int_t)st.queue_drops,
         "shadow_entries", (int)st.shadow_entries,
         "sip_helper", sip, "sip_helper_reason", st.sip_helper_reason);
+    if (o && ct) {
+        pthread_mutex_lock((pthread_mutex_t *)&ct->lock);
+        json_t *cmp = json_object();
+        json_object_set_new(cmp, "requested", json_boolean(ct->compare_requested));
+        json_object_set_new(cmp, "in_progress", json_boolean(ct->compare_in_progress));
+        json_object_set_new(cmp, "has_result", json_boolean(ct->compare_has_result));
+        if (ct->compare_has_result) {
+            json_object_set_new(cmp, "at_ms", json_integer((json_int_t)ct->compare_at_ms));
+            json_object_set_new(cmp, "master", json_string(ct->compare_last_master));
+            json_object_set_new(cmp, "gen", json_integer((json_int_t)ct->compare_last_gen));
+            json_object_set_new(cmp, "missing_on_slave", json_integer((json_int_t)ct->compare_last_missing));
+            json_object_set_new(cmp, "extra_on_slave", json_integer((json_int_t)ct->compare_last_extra));
+            json_object_set_new(cmp, "matched", json_integer((json_int_t)ct->compare_last_matched));
+            json_object_set_new(cmp, "equal", json_boolean(ct->compare_last_missing == 0 && ct->compare_last_extra == 0));
+        }
+        pthread_mutex_unlock((pthread_mutex_t *)&ct->lock);
+        json_object_set_new(o, "compare", cmp);
+    }
     char *txt = json_dumps(o, JSON_PRESERVE_ORDER | JSON_COMPACT);
     json_decref(o);
     return txt;
