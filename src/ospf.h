@@ -17,6 +17,9 @@ void hadc_ospf_lock(void);   /* guards g_ospf incl. conf the thread reads */
 void hadc_ospf_unlock(void);
 void hadc_ospf_shutdown(hadc_ctx_t *ctx);
 void hadc_ospf_tick(hadc_ctx_t *ctx);
+/* Fast convergence: flush every LSA originated by rid_host (host order,
+ * router-id == member sync_address) with MaxAge; no-op when OSPF is off. */
+void hadc_ospf_flush_lsas_of_rid(uint32_t rid_host);
 /* Recompute self-originated LSAs from desired prefixes/default-route intent. */
 void hadc_ospf_originate(hadc_ctx_t *ctx,
                          const struct in_addr *public_ip32, bool want_pub,

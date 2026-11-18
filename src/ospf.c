@@ -246,7 +246,7 @@ static void u32_to_rid(uint32_t v, char *out, size_t outlen)
 static void ospf_drain_rx_locked(void);
 static void ospf_tick_locked(void);
 static void *ospf_thread_main(void *arg);
-static size_t flush_self_lsas_maxage(void);
+static size_t flush_lsas_maxage_adv(uint32_t adv_net);
 
 static void refresh_ifaces(hadc_ctx_t *ctx)
 {
@@ -446,7 +446,7 @@ void hadc_ospf_shutdown(hadc_ctx_t *ctx)
     int ad = ctx ? ctx->conf.ospf.announce_death : -1;
     bool announce = (ad == 1) || (ad < 0 && ctx && ctx->conf.n_members > 0);
     if (g_ospf.enabled && g_ospf.fd >= 0 && announce && !hadc_cluster_graceful_active(ctx)) {
-        size_t flushed = flush_self_lsas_maxage();
+        size_t flushed = flush_lsas_maxage_adv(htonl(g_ospf.router_id));
         if (flushed) {
             hadc_info("ospf: announcing death, flushed %zu self LSA(s) with MaxAge", flushed);
             /* let the flush leave the NIC before the socket closes */
@@ -889,16 +889,16 @@ static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
     flood_lsas_to_neighbor(n, true);
 }
 
-/* Flush every self-originated LSA with MaxAge (RFC 2328: a self-originated
- * LSA deleted from the LSDB is flushed at MaxAge) so peers age out our
- * prefixes now instead of waiting for our adjacencies to time out.
+/* Flush every LSA originated by adv_net (net order) with MaxAge (RFC 2328: a
+ * self-originated LSA deleted from the LSDB is flushed at MaxAge) so peers
+ * age it out now instead of waiting for the dead timer or MaxAge aging.
  * Caller must hold the OSPF lock or be the sole writer (thread joined). */
-static size_t flush_self_lsas_maxage(void)
+static size_t flush_lsas_maxage_adv(uint32_t adv_net)
 {
     size_t flushed = 0;
     for (size_t i = 0; i < g_ospf.n_lsas; i++) {
         ospf_lsa_t *e = &g_ospf.lsdb[i];
-        if (!e->valid || !e->self)
+        if (!e->valid || e->hdr.adv_router != adv_net)
             continue;
         size_t l = lsa_wire_len(e);
         if (l == 0 || l > OSPF_MTU)
@@ -936,6 +936,24 @@ static size_t flush_self_lsas_maxage(void)
         free(pkt);
     }
     return flushed;
+}
+
+/* Fast-convergence entry point (main-loop callers): flush every LSA originated
+ * by rid_host (host order) with MaxAge so the area reconverges without waiting
+ * out the OSPF dead timer. Driven by the cluster heartbeat's fast failure
+ * detector; router-id == member sync_address (the config fallback default). */
+void hadc_ospf_flush_lsas_of_rid(uint32_t rid_host)
+{
+    if (!g_ospf.enabled || rid_host == 0 || rid_host == g_ospf.router_id)
+        return;
+    OSPF_LOCK();
+    size_t flushed = flush_lsas_maxage_adv(htonl(rid_host));
+    if (flushed) {
+        char ridbuf[INET_ADDRSTRLEN];
+        u32_to_rid(rid_host, ridbuf, sizeof(ridbuf));
+        hadc_info("ospf: peer %s declared dead, flushed %zu LSA(s) with MaxAge", ridbuf, flushed);
+    }
+    OSPF_UNLOCK();
 }
 
 
@@ -1619,9 +1637,13 @@ static void expire_neighbors(void)
             char ridbuf[INET_ADDRSTRLEN], nbuf[INET_ADDRSTRLEN];
             u32_to_rid(n->router_id, ridbuf, sizeof(ridbuf));
             hadc_info("ospf: neighbor %s (%s) dead -> Down", ridbuf, hadc_ipv4_format(n->ip, nbuf, sizeof(nbuf)));
+            bool flush = n->state >= NSTATE_2WAY;
+            uint32_t adv = htonl(n->router_id);
             nbr_reset_exchange(n);
             n->in_use = false;
             n->state = NSTATE_DOWN;
+            if (flush) /* standard: flush a dead neighbor's LSAs (we were adjacent) */
+                flush_lsas_maxage_adv(adv);
         }
     }
 }

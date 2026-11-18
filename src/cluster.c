@@ -27,6 +27,7 @@
 #include "ha-dhcpc/reload.h"
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
+#include "ospf.h"
 
 /* Guards the fields the heartbeat thread reads (role, lease.version,
  * graceful_restart_until_ms, cadence/gap, the member table, conf.self/udp_fd,
@@ -1260,16 +1261,31 @@ static void age_peers(hadc_ctx_t *ctx)
 
     if (deadline == 0)
         deadline = 6000;
+    uint32_t flush_rids[HADC_MEMBERS_MAX];
+    size_t n_flush = 0;
     HB_LOCK(ctx); /* the hb thread snapshots peer liveness for the seen bitmap */
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         hadc_peer_t *p = &ctx->peers[i];
+        bool was_alive = p->alive;
         if (p->last_seen_ms == 0) {
             p->alive = false;
             continue;
         }
         p->alive = now - p->last_seen_ms <= deadline;
+        if (was_alive && !p->alive && ctx->conf.members[i].sync_address.s_addr)
+            flush_rids[n_flush++] = ntohl(ctx->conf.members[i].sync_address.s_addr);
     }
     HB_UNLOCK(ctx);
+    /* Fast OSPF convergence: the cluster heartbeat is our fast failure detector,
+     * so a peer we just declared dead has its LSAs flushed with MaxAge
+     * (router-id == member sync_address, the config fallback default) instead
+     * of waiting out the OSPF dead timer. Done after HB_UNLOCK: the OSPF thread
+     * takes the OSPF->HB order, so we must not take it HB->OSPF. Skipped during
+     * a graceful restart, where the LSDB must not move. */
+    if (n_flush && !hadc_cluster_graceful_active(ctx)) {
+        for (size_t i = 0; i < n_flush; i++)
+            hadc_ospf_flush_lsas_of_rid(flush_rids[i]);
+    }
 }
 
 static size_t alive_members(hadc_ctx_t *ctx)

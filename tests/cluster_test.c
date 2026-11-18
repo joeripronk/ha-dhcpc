@@ -6,6 +6,7 @@
  * main-loop guard: demote only for a master in a real cluster, not for a slave
  * and not during a graceful restart. */
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -17,6 +18,9 @@
 #include "ha-dhcpc/config.h"
 #include "ha-dhcpc/types.h"
 #include "internal.h"
+
+extern uint32_t stub_ospf_flush_last_rid;
+extern int stub_ospf_flush_count;
 
 static int hook_count;
 static hadc_role_t hook_old, hook_new;
@@ -125,6 +129,37 @@ int main(void)
         return fail("demoted during a graceful restart");
     if (ctx.role != HADC_ROLE_MASTER)
         return fail("master role changed during graceful restart");
+
+    /* Fast OSPF convergence: a peer that transitions alive->dead has its LSAs
+     * flushed with MaxAge (router-id == member sync_address) on the heartbeat
+     * cadence instead of waiting for the OSPF dead timer. */
+    hook_count = 0;
+    stub_ospf_flush_count = 0;
+    setup(&ctx);
+    ctx.role = HADC_ROLE_MASTER;
+    inet_pton(AF_INET, "10.10.0.2", &ctx.conf.members[1].sync_address);
+    ctx.peers[1].alive = true;
+    ctx.peers[1].last_seen_ms = now_ms() - 5000; /* past the 60ms deadline */
+    hadc_cluster_heartbeat(&ctx);
+    if (stub_ospf_flush_count != 1)
+        return fail("dead peer did not flush its LSAs");
+    if (stub_ospf_flush_last_rid != 0x0a0a0002u)
+        return fail("flush used the wrong router-id");
+    hadc_cluster_heartbeat(&ctx);
+    if (stub_ospf_flush_count != 1)
+        return fail("flush repeated for an already-dead peer");
+
+    /* During a graceful restart the LSDB must not move: no flush. */
+    stub_ospf_flush_count = 0;
+    setup(&ctx);
+    ctx.role = HADC_ROLE_MASTER;
+    inet_pton(AF_INET, "10.10.0.2", &ctx.conf.members[1].sync_address);
+    ctx.peers[1].alive = true;
+    ctx.peers[1].last_seen_ms = now_ms() - 5000;
+    ctx.graceful_restart_until_ms = realtime_ms() + 100000;
+    hadc_cluster_heartbeat(&ctx);
+    if (stub_ospf_flush_count != 0)
+        return fail("flush fired during graceful restart");
 
     printf("cluster_test: OK\n");
     return 0;

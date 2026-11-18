@@ -94,3 +94,13 @@ int hadc_persist_save(hadc_ctx_t *ctx)
 void hadc_maint_lock(void) {}
 void hadc_maint_unlock(void) {}
 bool hadc_maint_running(void) { return false; }
+
+/* Recording stub: cluster_test asserts on the dead-peer LSA flush hook. */
+uint32_t stub_ospf_flush_last_rid;
+int stub_ospf_flush_count;
+
+void hadc_ospf_flush_lsas_of_rid(uint32_t rid_host)
+{
+    stub_ospf_flush_last_rid = rid_host;
+    stub_ospf_flush_count++;
+}
