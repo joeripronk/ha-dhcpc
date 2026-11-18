@@ -5,14 +5,17 @@ set -euo pipefail
 # Two-node cluster on a dedicated non-VIP fabric; node1 is master (higher priority),
 # node2 slave. Demoting node1 must, during the handoff hold:
 #   - install additive split /1 steering routes via node2's fabric address,
-#     keeping the default route untouched (no lease here: no default at all),
+#     keeping the default route untouched (seeded lease default stays),
 #     plus per-VIP-subnet splits at prefixlen+1 covering the VIP subnet,
 #   - keep its VIP assigned through the hold (removed only at completion),
 #   - run scoped nft scoping: VIP ARP-reply suppression, VIP-source output drop,
 #     NAT-bypass mark chains (checked only when an nft CLI is available),
 # and after the hold: node2 promotes (owns the VIP), node1 is a clean slave
 # (no split routes, no VIP, no takeover chains). Also verifies the
-# apply.disable_rp_filter reconcile (default on).
+# apply.disable_rp_filter reconcile (default on) and the new-master takeover
+# sequence: both nodes start with a seeded lease (public IP + default route),
+# node2 prepares locally, signals node1 via takeover_prep, GARPs only after
+# node1 acks the installed steering routes (takeover_ack).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${BIN:-$ROOT_DIR/ha-dhcpc}"
@@ -29,6 +32,9 @@ DHCP_IF="${DHCP_IF:-dhcp0}"
 VIP_IF="${VIP_IF:-vip0}"
 VIP_CIDR="${VIP_CIDR:-192.168.101.1/24}"
 VIP_IP="${VIP_IP:-192.168.101.1}"
+LEASE_IP="${LEASE_IP:-172.31.7.100}"
+LEASE_MASK="${LEASE_MASK:-255.255.255.0}"
+LEASE_GW="${LEASE_GW:-172.31.7.1}"
 NAT_MARK="${NAT_MARK:-0x2e05}"
 NAT_MARK_DEC=11781
 WAIT_SEC="${WAIT_SEC:-45}"
@@ -163,6 +169,20 @@ start_node() {
     ip netns exec "$ns" sh -c "\"$BIN\" --conf '$dir/ha-dhcpc.conf' --local-conf '$dir/ha-dhcpc-local.conf' --persist '$dir/state.json' >> '$logf' 2>&1; echo \"[test] daemon exited rc=\$?\" >> '$logf'" &
     PIDS+=("$!")
 }
+
+# Seed a BOUND lease into each node's persist file so the new-master takeover
+# sequence can verify public IP + default route before announcing the VIP. The
+# role/master_id fields keep startup deterministic (node1 master, node2 slave).
+seed_lease() {
+    local dir="$1" role="$2" now t1 t2 t3 zeros
+    now="$(date -u +%s)"; t1=$((now + 3600)); t2=$((now + 3700)); t3=$((now + 3800))
+    zeros="$(printf '0%.0s' {1..64})"
+    cat >"$dir/state.json" <<EOF
+{"role":"$role","master_id":"node1","lease_version":1,"acked_version":1,"graceful_restart_until_ms":0,"lease":{"state":"BOUND","retention_active":false,"address":"$LEASE_IP","netmask":"$LEASE_MASK","gateway":"$LEASE_GW","server_id":"$LEASE_GW","dns":[],"obtained_at_utc":$now,"t1_at_utc":$t1,"t2_at_utc":$t2,"t3_at_utc":$t3,"config_hash":"$zeros"}}
+EOF
+}
+seed_lease "$STATE_BASE/$NS1" master
+seed_lease "$STATE_BASE/$NS2" slave
 
 log "start ha-dhcpc instances"
 start_node "$NS1" "$STATE_BASE/$NS1" "$STATE_BASE/node1.log"
@@ -330,6 +350,18 @@ if [[ -n "$ok_node2" && -n "$ok_node1" ]]; then
             fail "takeover ip-family table lingered on node1" ||
             pass "takeover ip-family scoping cleaned up on node1"
     fi
+    # New-master takeover sequence: node2 verified its public IP + default route,
+    # signaled node1 (takeover_prep), and GARPed only after node1 acked the
+    # installed steering routes (takeover_ack).
+    grep -q "signaled node1 to steer via the /+1 routes" "$STATE_BASE/node2.log" &&
+        pass "node2 prepared locally and signaled node1 before GARPing" ||
+        fail "node2 never signaled node1 before announcing ownership"
+    grep -q "takeover_prep from node2" "$STATE_BASE/node1.log" &&
+        pass "node1 received the takeover signal from node2 and acked it" ||
+        fail "node1 never received takeover_prep from node2"
+    grep -q "takeover_ack from node1" "$STATE_BASE/node2.log" &&
+        pass "node2 GARPed only after node1 acked the steering routes" ||
+        fail "node2 did not wait for node1's steering ack"
 fi
 
 log "result: $PASS passed, $FAIL failed, $SKIP skipped"

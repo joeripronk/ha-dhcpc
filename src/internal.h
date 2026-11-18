@@ -58,8 +58,8 @@ struct hadc_ctx {
     char handoff_target[HADC_NODE_ID_MAX];
 
     /* Demote return-traffic steering over fabric to the new master (opt-in).
-     * Requires slave_sync_wan and OSPF on a non-VIP interface; invalid configs
-     * disable the behavior and are reported with an error. */
+     * Requires OSPF on a non-VIP interface; invalid configs disable the
+     * behavior and are reported with an error. */
     bool demote_route_via_new_master_active;
     bool demote_route_via_new_master_invalid;
     char demote_route_via_new_master_reason[128];
@@ -67,6 +67,17 @@ struct hadc_ctx {
      * dataplane+VIP announce is done (and optionally after start delay). */
     bool promotion_pending;
     uint64_t gwping_start_after_ms;
+
+    /* Seamless takeover handshake (SEAMLESS_TAKEOVER.md, new-master side): the
+     * live peer that handed master over to us (set on an accepted role_change
+     * promotion from a node asserting master). When set, promotion prepares
+     * locally (public IP/routing verified, VIPs assigned without GARP), sends
+     * takeover_prep, and defers GARP + ready until that node acks the installed
+     * /+1 steering routes or promotion_finalize_at_ms expires (then GARP
+     * anyway). steering_routes_ready is the demoting-side ack basis. */
+    char takeover_from[HADC_NODE_ID_MAX];
+    uint64_t promotion_finalize_at_ms;
+    bool steering_routes_ready;
 
     /* Heartbeat thread: the send cadence runs here so it is never blocked by
      * main-loop work (executor/OSPF/persist); the self-monitor watchdog measures
@@ -105,6 +116,11 @@ typedef struct {
 
 size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
     vip_split_t out[], size_t max);
+
+/* Complete a deferred promotion (main.c): GARP burst, DHCP core start, ready
+ * announce (role flip), gateway probe, conntrack ownership + persist. Called
+ * from the takeover_ack handler and the finalize deadline. */
+void hadc_promotion_finalize_complete(hadc_ctx_t *ctx, const char *reason);
 
 /* gateway-reachability probe (ping.c): master pings the lease gateway every
  * second after a promote and fails over after 3 consecutive misses; start sends

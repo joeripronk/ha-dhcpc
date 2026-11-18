@@ -632,6 +632,9 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
     v = json_object_get(m, "graceful_restart_until_ms");
     if (v && json_is_integer(v))
         out->graceful_restart_until_ms = (uint64_t)json_integer_value(v);
+    v = json_object_get(m, "steered");
+    if (v && json_is_boolean(v))
+        out->steered = json_is_true(v);
     hadc_lease_from_json(json_object_get(m, "lease"), &out->lease);
 }
 
@@ -923,6 +926,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                      (!cur || beats(om, cur->id, cur->priority)));
                 if (om && take) {
                     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", om->id);
+                    ctx->takeover_from[0] = '\0';
                     set_role(ctx, HADC_ROLE_SLAVE);
                     hadc_info("cluster: following master %s (was %s)", om->id,
                               cur ? cur->id : "(none)");
@@ -1034,6 +1038,15 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                 snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
                 if (handoff)
                     g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000;
+                /* Seamless takeover: when we are being promoted by another live
+                 * peer (the node that just handed master over to us), record it
+                 * as the handshake peer: promotion prepares locally, signals it
+                 * via takeover_prep, and defers GARP + ready until it acks the
+                 * installed /+1 steering routes (or the budget expires). A
+                 * self-originated election has no handshake peer and keeps the
+                 * immediate-GARP behavior. */
+                snprintf(ctx->takeover_from, sizeof(ctx->takeover_from), "%s",
+                         (ours && strcmp(msg.origin, ctx->conf.self)) ? msg.origin : "");
                 /* Adopt self-mastery via the full promotion flow so dataplane and
                  * the DHCP engine are started; never jump straight to MASTER.
                  * When yielding mastership, enter DEMOTING so VIPs drop immediately
@@ -1044,6 +1057,36 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                                          : HADC_ROLE_SLAVE);
                 hadc_persist_save(ctx);
             }
+        }
+    } else if (!strcmp(msg.type, HADC_MSG_TAKEOVER_PREP)) {
+        /* The node we handed off to has prepared locally (public IP/routing
+         * verified, VIPs assigned without GARP) and asks us to steer via the
+         * /+1 routes. The routes are installed on this node's demote-hold
+         * apply; ack with what we can actually deliver (SEAMLESS_TAKEOVER.md). */
+        if (strcmp(msg.origin, ctx->conf.self) && ctx->role == HADC_ROLE_DEMOTING &&
+            ctx->handoff_forward_hold && ctx->handoff_target[0] &&
+            !strcmp(msg.origin, ctx->handoff_target)) {
+            bool steered = ctx->demote_route_via_new_master_active && ctx->steering_routes_ready;
+            json_t *ack = build_msg(ctx, HADC_MSG_TAKEOVER_ACK, 0);
+            if (ack) {
+                json_object_set_new(ack, "steered", json_boolean(steered));
+                send_to_member(ctx, member_by_id(ctx, msg.origin), ack);
+            }
+            hadc_info("seamless: takeover_prep from %s (the node we handed off to); acked steered=%s",
+                      msg.origin, steered ? "yes" : "no");
+        } else {
+            hadc_dbg("cluster: takeover_prep from %s ignored (we are not holding for it)",
+                     msg.origin);
+        }
+    } else if (!strcmp(msg.type, HADC_MSG_TAKEOVER_ACK)) {
+        if (ctx->role == HADC_ROLE_PROMOTING && ctx->takeover_from[0] &&
+            !strcmp(msg.origin, ctx->takeover_from)) {
+            hadc_info("seamless: takeover_ack from %s (steered=%s); completing promotion",
+                      msg.origin, msg.steered ? "yes" : "no");
+            hadc_promotion_finalize_complete(ctx,
+                msg.steered ? "takeover-ack" : "takeover-ack-unsteered");
+        } else {
+            hadc_dbg("cluster: takeover_ack from %s ignored (not awaiting it)", msg.origin);
         }
     } else if (!strcmp(msg.type, HADC_MSG_CONF_SYNC)) {
         if (strcmp(msg.origin, ctx->conf.self) && !strcmp(msg.origin, ctx->conf.designated_master))
@@ -1708,6 +1751,26 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
     propagate_role(ctx);
     hadc_persist_save(ctx);
     return 1;
+}
+
+int hadc_cluster_send_takeover_prep(hadc_ctx_t *ctx)
+{
+    if (!ctx->takeover_from[0] || !strcmp(ctx->takeover_from, ctx->conf.self))
+        return -1;
+    const hadc_member_t *m = member_by_id(ctx, ctx->takeover_from);
+    if (!m)
+        return -1;
+    hadc_peer_t *p = peer_entry(ctx, m->id);
+    if (!p || !p->alive)
+        return -1;
+    json_t *msg = build_msg(ctx, HADC_MSG_TAKEOVER_PREP, 0);
+    if (!msg)
+        return -1;
+    if (send_to_member(ctx, m, msg) != 0) {
+        hadc_warn("seamless: cannot send takeover_prep to %s", m->id);
+        return -1;
+    }
+    return 0;
 }
 
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)

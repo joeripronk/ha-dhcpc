@@ -41,6 +41,11 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     return 0;
 }
 
+void hadc_promotion_finalize_complete(hadc_ctx_t *ctx, const char *reason)
+{
+    (void)ctx; (void)reason;
+}
+
 int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
     (void)ctx; (void)lease;

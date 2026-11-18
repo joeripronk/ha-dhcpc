@@ -294,8 +294,6 @@ static struct in_addr demote_route_nexthop(hadc_ctx_t *ctx)
         return none;
     if (!(ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold))
         return none;
-    if (!ctx->conf.apply.slave_sync_wan)
-        return none;
     const char *target = ctx->handoff_target[0] ? ctx->handoff_target : ctx->conf.designated_master;
     if (!target || !*target)
         return none;
@@ -2417,4 +2415,43 @@ int hadc_executor_link_up(const char *ifname)
     nl_cache_drop(&lcache);
     hadc_maint_unlock();
     return rc;
+}
+
+struct default_route_scan {
+	bool any;
+};
+
+static void default_route_scan_cb(struct nl_object *obj, void *p)
+{
+	struct default_route_scan *m = p;
+	struct rtnl_route *r = (struct rtnl_route *)obj;
+	struct nl_addr *dst = rtnl_route_get_dst(r);
+
+	if (m->any)
+		return;
+	if (rtnl_route_get_type(r) != RTN_UNICAST)
+		return;
+	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4 ||
+	    nl_addr_get_prefixlen(dst) != 0)
+		return;
+	if (rtnl_route_get_nnexthops(r) == 0)
+		return;
+	m->any = true;
+}
+
+bool hadc_executor_default_route_present(hadc_ctx_t *ctx)
+{
+	struct nl_cache *rcache = NULL;
+	struct default_route_scan m = { .any = false };
+
+	hadc_maint_lock();
+	if (!g_sk || hadc_nl_alloc_caches(g_sk, NULL, NULL, &rcache, NULL) < 0 || !rcache) {
+		hadc_maint_unlock();
+		return false;
+	}
+	nl_cache_foreach(rcache, default_route_scan_cb, &m);
+	nl_cache_drop(&rcache);
+	hadc_maint_unlock();
+	(void)ctx;
+	return m.any;
 }

@@ -5,7 +5,7 @@
 Make master demotion/handoff as seamless as possible by keeping the demoting node forwarding traffic to the newly promoted master over a separate cluster/OSPF fabric, instead of blackholing or hairpinning flows during the ownership transition.
 
 Target behavior (when explicitly enabled and prerequisites are met):
-- **VIP ownership moves immediately** (new master adds VIPs and GARPs), but the **old master keeps the VIP addresses assigned during the hold** and simply stops answering/originating for them: **no ARP replies and no locally-originated traffic from VIP sources**. The VIP addresses are removed only **after the migration completes** (hold ends → SLAVE). As long as the demoting node neither replies to ARP nor sends traffic from the VIPs, temporarily holding both copies is safe enough, and it prevents the demoting master from dropping traffic it can still forward to the new master.
+- **The new master prepares before it announces ownership**: it sets up its local environment (public IP + routing, VIPs assigned **without GARP**, confirmed active), signals the old master to start steering traffic to it via the /+1 split routes, and only **GARPs the VIPs after the old master confirms the routes are installed** (see "Takeover sequence"). The **old master keeps the VIP addresses assigned during the hold** and simply stops answering/originating for them: **no ARP replies and no locally-originated traffic from VIP sources**. The VIP addresses are removed only **after the migration completes** (hold ends → SLAVE). As long as the demoting node neither replies to ARP nor sends traffic from the VIPs, temporarily holding both copies is safe enough, and it prevents the demoting master from dropping traffic it can still forward to the new master.
 - **Return/inbound traffic that still arrives at the old master is forwarded to the new master** over the non-VIP fabric during a controlled hold window.
 - **Outbound/forwarded traffic from the old master is steered to the new master** without relying on the old upstream/default path.
 - **NAT/masquerading ownership moves to the new master**; the demoting master forwards packets without creating/rewriting NAT state.
@@ -19,7 +19,6 @@ This is an opt-in, best-effort forwarding bridge during handoff — not a guaran
   additive split /1 routes (see "Outbound" below; this replaced the earlier `default_via`
   override) while keeping the public WAN IP/default route and — with steering active — the VIP
   addresses installed (VIPs are removed only after the hold completes). Validation at startup/reload requires:
-  - `apply.slave_sync_wan: true`
   - at least one `ospf.interfaces` entry
   - every `ospf.interfaces` entry must **not** be an interface that carries `cluster.addresses` (VIPs)
 - Invalid configuration: behavior disabled, runtime state marked invalid, and an error logged (`demote_route_via_new_master(...): invalid configuration: ...; behaviour disabled`).
@@ -31,6 +30,39 @@ This is an opt-in, best-effort forwarding bridge during handoff — not a guaran
 2. **L3 forwarding enabled** on the demoting node for the relevant families/paths; firewall must permit forwarding between WAN/VIP-facing ingress and the fabric toward the new master during the hold.
 3. **Conntrack/state replication** (`conntrack_sync`) healthy enough for the new master to continue existing flows where applicable; helper/expectation coverage and replication lag are limiting factors.
 4. **Timely promotion** of the new master (VIP add + GARP + route/neighbor readiness) within/around `apply.handoff_hold_ms` (default 5000 ms).
+
+## Takeover sequence (new master side)
+
+For seamless takeover to work correctly, the new master must be fully prepared and confirmed
+before it announces VIP ownership; otherwise it GARPs (and starts claiming) the VIP while the
+old master's steering routes are not yet in place, and stray traffic during that window is
+blackholed. Required order:
+
+1. **Prepare locally** on the takeover node: apply the public IP + routing (from the synced
+   lease), assign the VIP addresses **without GARP**, and confirm everything is active.
+   **Always verify the public IP and routing — above all a working default route — are up and
+   correct before announcing the VIPs** (GARP): announcing ownership without a correct default
+   route risks disconnects, because return traffic and NAT would follow a wrong or missing
+   route the moment clients start sending us their flows.
+2. **Signal the old master** (the node in the demoting hold) to start sending its traffic to
+   this node, i.e. install the /+1 split steering routes (VIP-subnet splits and the /1
+   defaults) pointing at the takeover node's fabric address.
+3. **Wait for the old master to signal back** that its steering routes are installed.
+4. **GARP the VIPs** — only now announce ownership (GARP burst, then role/readiness), so
+   clients, the old master's steering, and NAT/conntrack ownership converge on the new master
+   only after the forwarding bridge is up.
+
+Implemented (new-master side): promotion prepares locally (public IP + routing from
+the synced lease, VIPs assigned without GARP, verified active — a working default
+route must be present before any announce), then signals the old master via the
+cluster protocol (`takeover_prep`). The old master, holding for this node with its
+/+1 steering routes installed, answers `takeover_ack` (steered=false when it cannot
+steer); only then the new master GARPs the VIPs and announces ready (which unblocks
+the old master's egress block as before). The ack wait is bounded by
+`handoff_hold_ms` (min 1000 ms); on timeout — or when the old master cannot steer,
+is not a live peer (dead-master failover), or there is no cluster transport
+(single-node) — promotion falls back to the original behavior and GARPs
+immediately.
 
 ## Routing strategies
 
@@ -88,6 +120,12 @@ Why:
 - Conntrack sync typically replicates original/reply tuples; rewriting on a node that is giving up ownership risks inconsistent translations, missed reverse matches, and leaks after handoff.
 
 Recommended policy during demoting hold:
+- Conntrack must stay **enabled on the new master's sync/traffic interface**: steered traffic
+  arrives there and NAT runs there; a NOTRACK on the new master's fabric ingress would mean no
+  conntrack state and no masquerade for steered flows. The daemon's own takeover NOTRACK is
+  already scoped correctly — it is active only on the demoting node while steering. Guardrail:
+  do not deploy the platform-firewall raw NOTRACK drop-in (SEAMLESS_FIREWALL_HOWTO.md) on all
+  nodes; keep the new master's fabric ingress tracked.
 - Bypass/skip masquerade/SNAT/DNAT rules on the demoting master for flows being forwarded to the new master over fabric (scoped by interface/mark/state/routing decision as appropriate).
 - Ensure forwarding path is allowed; let new master apply its normal NAT once traffic arrives there.
 - After hold, demoting node becomes slave per normal isolation (`slave_isolation`, nft egress, etc.) and must not perform master NAT.
@@ -148,9 +186,10 @@ Notes:
 
 ## Implementation notes
 
-- Opt-in and validated at startup/reload: `apply.slave_sync_wan: true`, at least one non-VIP `ospf.interfaces` entry (fabric must not carry VIPs); invalid config disables the behavior and reports it in status/logs.
+- Opt-in and validated at startup/reload: at least one non-VIP `ospf.interfaces` entry (fabric must not carry VIPs); invalid config disables the behavior and reports it in status/logs.
 - `apply.disable_rp_filter` (default on) reconciles rp_filter on managed/all/default interfaces.
 - Steering uses additive split /1 routes via the new master's fabric nexthop during the demoting hold (the lease default route stays in place); per-VIP-subnet splits are installed where applicable.
 - VIP addresses remain assigned through the hold; ARP replies for VIPs are suppressed and locally-originated VIP-source traffic is dropped (scoped nftables), then VIPs are removed at hold completion. nft rules are reconciled on state transitions.
 - NAT/conntrack bypass: `apply.demote_nat_bypass_mark` (default 0) marks steered traffic (prerouting/postrouting, raw priority); `apply.demote_notrack` (default on) NOTRACKs steered traffic at prerouting so conntrack/NAT do not run on the demoting node. Zone-based forward policies may need cooperation (see `SEAMLESS_FIREWALL_HOWTO.md`).
+- Takeover handshake (implemented): the new master verifies its local environment (public IP + default route + VIPs, no GARP), sends `takeover_prep`; the old master (in hold, steering installed) acks via `takeover_ack`; the new master GARPs only after the ack, the ack budget (`handoff_hold_ms`, min 1000 ms), or a non-steering ack. No handshake peer (dead-master failover, single-node) keeps the original immediate-GARP behavior.
 - Tests: unit coverage for steering/suppression/mark and config parsing; netns integration `tests/seamless-takeover-netns.sh` (root; nft checks when available). Load and WAN-ingress-under-load cases remain manual.

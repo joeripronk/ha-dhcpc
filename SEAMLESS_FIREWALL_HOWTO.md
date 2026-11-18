@@ -74,8 +74,11 @@ suffices.
   instead `return` on the mark before its NAT hooks (prerouting DNAT and
   postrouting SNAT/masquerade) and accept marked packets in forward.
 - NOTRACK means the demoting node has no conntrack state for steered flows;
-  the new master applies all NAT once traffic arrives there. Conntrack sync
-  health (helpers/expectations, replication lag) still limits how many existing
+  the new master applies all NAT once traffic arrives there. This drop-in is
+  therefore for the **demoting node only**: the new master must keep conntrack
+  enabled on its fabric/sync ingress (no NOTRACK there), or it never creates
+  state for steered flows and masquerade breaks. Conntrack sync health
+  (helpers/expectations, replication lag) still limits how many existing
   flows survive the handoff.
 - Verified end-to-end by `tests/seamless-takeover-netns.sh` (netns, root;
   checks split /1s, VIP hold, ARP suppression, output drop, the prerouting

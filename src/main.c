@@ -86,10 +86,7 @@ void hadc_validate_demote_route_config(hadc_ctx_t *ctx, const char *why)
         return;
     }
 
-    if (!ctx->conf.apply.slave_sync_wan) {
-        snprintf(reason, sizeof(reason), "requires apply.slave_sync_wan=true");
-        ok = false;
-    } else if (ctx->conf.ospf.n_interfaces == 0) {
+    if (ctx->conf.ospf.n_interfaces == 0) {
         snprintf(reason, sizeof(reason), "requires at least one ospf.interfaces entry on a non-VIP interface");
         ok = false;
     } else {
@@ -116,7 +113,7 @@ void hadc_validate_demote_route_config(hadc_ctx_t *ctx, const char *why)
         if (was_invalid)
             hadc_info("demote_route_via_new_master(%s): configuration now valid; behaviour enabled", why ? why : "config");
         else
-            hadc_info("demote_route_via_new_master(%s): enabled (slave_sync_wan and non-VIP OSPF fabric verified)", why ? why : "config");
+            hadc_info("demote_route_via_new_master(%s): enabled (non-VIP OSPF fabric verified)", why ? why : "config");
     }
 }
 
@@ -179,14 +176,19 @@ static void periodic_ready(hadc_ctx_t *ctx, int fd)
 {
     uint64_t exp;
     (void)!read(fd, &exp, sizeof(exp));
+    uint64_t now = (uint64_t)hadc_now_ms();
     if (ctx->handoff_forward_hold) {
-        uint64_t now = (uint64_t)hadc_now_ms();
         /* Keep default route and public IP for the full handoff hold (VIPs drop at
          * demotion, or stay assigned-with-ARP-suppressed through the hold when
          * seamless-takeover steering is active); only complete after the hold expires. */
         if (now >= ctx->handoff_hold_until_ms)
             handoff_hold_complete(ctx, "handoff-hold-timeout");
     }
+    /* Deferred promotion (takeover handshake): the ack wait expired, so announce
+     * ownership anyway (fallback to the pre-handshake behavior). */
+    if (ctx->role == HADC_ROLE_PROMOTING && ctx->promotion_finalize_at_ms &&
+        now >= ctx->promotion_finalize_at_ms)
+        hadc_promotion_finalize_complete(ctx, "takeover-ack-timeout");
     /* Offload audit/gwping/routing maintenance to the serialized worker so the
      * main loop stays responsive to heartbeats. */
     hadc_maint_post_tick(ctx);
@@ -199,6 +201,7 @@ static void handoff_hold_complete(hadc_ctx_t *ctx, const char *reason)
     ctx->handoff_forward_hold = false;
     ctx->handoff_target[0] = '\0';
     ctx->handoff_hold_until_ms = 0;
+    ctx->steering_routes_ready = false;
     /* transition DEMOTING -> SLAVE and apply full slave isolation (egress block) */
     if (ctx->role == HADC_ROLE_DEMOTING) {
         hadc_role_t old = ctx->role;
@@ -539,6 +542,53 @@ static void cb_carrier_return(void *arg)
 /* Role transitions (ctl/cluster-driven, plan §4): the engine runs only on the
  * master; a promoted node resumes renew-only on the synced lease and claims the
  * cluster addresses. */
+/* Complete the promotion announce: GARP burst, DHCP core start, ready (role
+ * flip), then gateway probe. */
+static void promotion_finalize(hadc_ctx_t *ctx, const char *reason)
+{
+    if (ctx->role != HADC_ROLE_PROMOTING)
+        return;
+    ctx->takeover_from[0] = '\0';
+    hadc_executor_announce_cluster(ctx); /* configurable burst; switches L2 to us */
+    hadc_dhcpcore_start(ctx);
+    /* announce ready: heartbeats now report master */
+    hadc_cluster_lock();
+    if (ctx->role == HADC_ROLE_PROMOTING)
+        ctx->role = HADC_ROLE_MASTER;
+    ctx->promotion_pending = false;
+    hadc_cluster_unlock();
+    hadc_info("promotion: setup complete, announced master (reason=%s)", reason);
+    /* delay gwping to avoid probe traffic/mac flips during handoff */
+    if (ctx->conf.apply.gateway_probe && ctx->conf.apply.gateway_probe_start_delay_ms > 0) {
+        ctx->gwping_start_after_ms = (uint64_t)hadc_now_ms() + ctx->conf.apply.gateway_probe_start_delay_ms;
+        hadc_info("gwping: start delayed %ums after promote", ctx->conf.apply.gateway_probe_start_delay_ms);
+    } else {
+        ctx->gwping_start_after_ms = 0;
+        hadc_gwping_start(ctx);
+    }
+}
+
+/* Complete a deferred promotion (called from the takeover_ack handler and the
+ * finalize deadline): the announce plus conntrack ownership, ack and persist.
+ * The deferred cb_role_change tail already ran a notify with the intermediate
+ * PROMOTING role (slave-side semantics during the handshake window); this
+ * re-notifies the real SLAVE->MASTER transition so ownership + shadow apply
+ * follow the announce. */
+void hadc_promotion_finalize_complete(hadc_ctx_t *ctx, const char *reason)
+{
+    if (ctx->role != HADC_ROLE_PROMOTING)
+        return;
+    ctx->promotion_finalize_at_ms = 0;
+    ctx->takeover_from[0] = '\0';
+    promotion_finalize(ctx, reason);
+    /* conntrack ownership follows the announce: the SLAVE->MASTER transition
+     * applies the shadow state replicated from the old master (seamless
+     * takeover depends on this being the conntrack/NAT state owner). */
+    hadc_conntrack_notify_role(ctx, HADC_ROLE_SLAVE, ctx->role);
+    ctx->acked_version = ctx->lease.version;
+    hadc_persist_save(ctx);
+}
+
 static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role)
 {
     hadc_ctx_t *ctx = arg;
@@ -557,30 +607,37 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                       hadc_lease_state_name(ctx->lease.state), t1, t2, t3);
         }
         /* Promote dataplane but do NOT announce role=master yet: apply lease/public
-         * address and routes, then VIPs, then GARP burst; only after that mark ready. */
+         * address and routes, then VIPs; only then GARP burst + ready. When a
+         * takeover handshake peer exists (the live node that handed master over to
+         * us), verify the local environment first (public IP + routing up — no
+         * announce without a working default route), signal it to steer via the
+         * /+1 routes, and defer the GARP/ready until it acks or the budget
+         * expires (SEAMLESS_TAKEOVER.md takeover sequence). */
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         desired.cluster_addrs_present = false;
         hadc_executor_apply(ctx, &desired, "PROMOTE");
         hadc_routing_reconcile(ctx, "promote");
         desired.cluster_addrs_present = true;
         hadc_executor_apply(ctx, &desired, "PROMOTE-VIPS");
-        hadc_executor_announce_cluster(ctx); /* configurable burst; switches L2 to us */
-        hadc_dhcpcore_start(ctx);
-        /* announce ready: heartbeats now report master */
-        hadc_cluster_lock();
-        if (ctx->role == HADC_ROLE_PROMOTING)
-            ctx->role = HADC_ROLE_MASTER;
-        ctx->promotion_pending = false;
-        hadc_cluster_unlock();
-        hadc_info("promotion: setup complete, announced master");
-        /* delay gwping to avoid probe traffic/mac flips during handoff */
-        if (ctx->conf.apply.gateway_probe && ctx->conf.apply.gateway_probe_start_delay_ms > 0) {
-            ctx->gwping_start_after_ms = (uint64_t)hadc_now_ms() + ctx->conf.apply.gateway_probe_start_delay_ms;
-            hadc_info("gwping: start delayed %ums after promote", ctx->conf.apply.gateway_probe_start_delay_ms);
-        } else {
-            ctx->gwping_start_after_ms = 0;
-            hadc_gwping_start(ctx);
+        bool deferred = false;
+        if (ctx->takeover_from[0]) {
+            bool verified = ctx->lease.address.s_addr != 0 &&
+                ctx->lease.state != HADC_LEASE_NONE &&
+                hadc_executor_default_route_present(ctx);
+            if (!verified) {
+                hadc_warn("promotion: public ip/default route not verified before announcing VIPs; announcing without handshake");
+            } else if (hadc_cluster_send_takeover_prep(ctx) == 0) {
+                uint32_t wait_ms = ctx->conf.apply.handoff_hold_ms ? ctx->conf.apply.handoff_hold_ms : 5000;
+                if (wait_ms < 1000)
+                    wait_ms = 1000;
+                ctx->promotion_finalize_at_ms = (uint64_t)hadc_now_ms() + wait_ms;
+                deferred = true;
+                hadc_info("promotion: local env ready (public ip+routing verified, VIPs assigned, no GARP yet); signaled %s to steer via the /+1 routes; awaiting ack (budget %ums)",
+                          ctx->takeover_from, wait_ms);
+            }
         }
+        if (!deferred)
+            promotion_finalize(ctx, "PROMOTE");
     } else if (new_role == HADC_ROLE_DEMOTING) {
         /* Controlled handoff: keep public IP/default route and forward traffic
          * (clients may still send to our MAC); defer nft egress block until the new
@@ -614,9 +671,14 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
         desired.backup_route = false;
         hadc_executor_apply(ctx, &desired, "DEMOTE-VIPS-HOLD");
         hadc_routing_reconcile(ctx, "demote-hold");
+        /* Takeover handshake ack basis: steering routes are installed by the
+         * apply above when steering is active; a live takeover_prep from the
+         * handoff target is acked only then. */
+        ctx->steering_routes_ready = (desired.steer_via.s_addr != 0);
     } else {
         /* SLAVE or other: ensure not holding */
         ctx->handoff_forward_hold = false;
+        ctx->steering_routes_ready = false;
         if (old_role == HADC_ROLE_MASTER || old_role == HADC_ROLE_PROMOTING) {
             hadc_gwping_stop(ctx);
             hadc_dhcpcore_stop(ctx);

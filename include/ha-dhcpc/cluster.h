@@ -25,6 +25,8 @@
 #define HADC_MSG_CONF_SYNC          "conf_sync"          /* master -> member: shared document (plan §6) */
 #define HADC_MSG_CONF_REQ           "conf_req"           /* member -> master: our shared digest differs */
 #define HADC_MSG_CONF_ACK           "conf_ack"           /* member -> master: document written + applied */
+#define HADC_MSG_TAKEOVER_PREP      "takeover_prep"      /* new master -> old master (in hold): local env prepared (no GARP yet); steer via the /+1 routes and ack */
+#define HADC_MSG_TAKEOVER_ACK       "takeover_ack"       /* old master (in hold) -> new master: steering routes installed (steered=false when this node cannot steer); unblocks the new master's GARP + ready announce */
 
 /* Wire role codes for the compact binary heartbeat (the only binary message
  * type; its first byte is 0, so JSON datagrams — which always start with '{'
@@ -58,6 +60,7 @@ typedef struct {
     uint64_t ts_ms;                      /* sender's CLOCK_REALTIME ms at send time */
     char role[16];                       /* sender's own role: master|slave|unknown */
     uint64_t graceful_restart_until_ms;  /* global no-master-switch deadline (realtime ms) */
+    bool steered;                        /* takeover_ack only: the acking node has its steering routes installed */
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -139,8 +142,14 @@ void hadc_cluster_unlock(void);
 
 /* Graceful handoff for shutdown: hands the master role to the best live peer
  * when one exists and returns 1; returns 0 (and leaves service intact) when
- * there is no live peer, so a lone/partitioned master does not withdraw. */
+ * there is no live peer, so a lone/partitioned node does not withdraw. */
 int hadc_cluster_handoff(hadc_ctx_t *ctx);
+
+/* Seamless takeover handshake (new-master side): signal the old master recorded
+ * in takeover_from that our local environment is prepared (public IP/routing
+ * verified, VIPs assigned without GARP) and ask it to steer via the /+1 routes
+ * and ack. 0 = prep sent; -1 = no handshake peer (finalize immediately). */
+int hadc_cluster_send_takeover_prep(hadc_ctx_t *ctx);
 
 /* Master pushes lease state to slaves on change; slaves apply then ack. */
 int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease);

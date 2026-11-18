@@ -111,6 +111,11 @@ int hadc_executor_link_up(const char *ifname);
 /* Remove any nft egress block installed for slave isolation on ifname. */
 void hadc_executor_clear_slave_isolation(const char *ifname);
 
+/* True when an IPv4 default route (unicast, any table, with a nexthop) exists
+ * in live kernel state. Promotion verification: the new master must have its
+ * public IP + routing up before announcing VIP ownership (GARP). */
+bool hadc_executor_default_route_present(hadc_ctx_t *ctx);
+
 /* Send gratuitous ARP for every configured cluster IPv4 address (called on
  * promotion when apply.announce_gratuitous is true). IPv4 only for now. */
 int hadc_executor_announce_cluster(hadc_ctx_t *ctx);
