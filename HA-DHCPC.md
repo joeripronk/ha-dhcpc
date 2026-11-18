@@ -317,8 +317,9 @@ default_role: slave            # master = bootstrap election when no master is k
                                  # unanswered or there is no lease IP yet, and hands
                                  # back when the gateway answers again.
      dns_hook: /usr/lib/ha-dhcpc/hooks/resolvconf   # optional
-     ddclient: /usr/bin/ddclient   # optional; run as a one-shot (ddclient -daemon=0
-                                   # -syslog) when the applied address changes, on the
+     ddclient: /usr/local/bin/ddclient-run   # optional; run as a one-shot (symlink to
+                                   # ddclient whose name does not end in 'd', no daemon= in its
+                                   # config) when the applied address changes, on the
                                    # master only (the node that owns the public IP)
      suppress_member_dad: true  # compatibility no-op (only the master owns the VIP)
      arp_responder: true        # compatibility no-op (the kernel answers on the owner)

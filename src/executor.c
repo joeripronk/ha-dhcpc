@@ -1959,11 +1959,16 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 	/* ddclient: one-shot DDNS update, master-only (the node that owns the public
 	 * IP), only when the applied address changed. ddclient dedups against its own
 	 * cache, so a reboot that lands on the same IP is a no-op; a node that comes
-	 * up with a different IP updates. */
+	 * up with a different IP updates. ddclient daemonizes by default when its
+	 * invocation name ends in 'd' (which "ddclient" does) and its CLI cannot
+	 * disable daemon mode (daemon=0 is clamped to a 60s minimum), so point
+	 * apply.ddclient at a name not ending in 'd' (e.g. a ddclient-run symlink)
+	 * and pass its config file explicitly; then a plain run updates once (its
+	 * cache dedups a no-change run) and exits. */
 	if (!fatal && (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && ctx->conf.apply.ddclient[0] && desired->present &&
 	    (!prev || !prev->present || prev->address.s_addr != desired->address.s_addr)) {
-		char *argv[4] = { ctx->conf.apply.ddclient, (char *)"-daemon=0", (char *)"-syslog",
-			NULL };
+		char *argv[5] = { ctx->conf.apply.ddclient, (char *)"--file", (char *)"/etc/ddclient.conf",
+			(char *)"-syslog", NULL };
 		run_hook(argv, prev, desired, reason);
 	}
 
