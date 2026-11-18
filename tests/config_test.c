@@ -762,6 +762,54 @@ int main(void)
             ok("identity check passes for this host's own entry");
     }
 
+    /* ospf.announce_death: default auto (on in a cluster, off standalone);
+     * explicit true/false override; auto restores the default */
+    {
+        char abuf[1024];
+        snprintf(abuf, sizeof(abuf), "%sospf:\n  announce_death: true\n", BASE_NOMAC);
+        write_file(base, abuf);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("ospf.announce_death true load");
+        else if (conf.ospf.announce_death != 1)
+            fail("ospf.announce_death true parsed wrong");
+        else
+            ok("ospf.announce_death true parsed");
+
+        snprintf(abuf, sizeof(abuf), "%sospf:\n  announce_death: false\n", BASE_NOMAC);
+        write_file(base, abuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("ospf.announce_death false load");
+        else if (conf.ospf.announce_death != 0)
+            fail("ospf.announce_death false parsed wrong");
+        else
+            ok("ospf.announce_death false parsed");
+
+        write_file(base, BASE_NOMAC);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("ospf.announce_death default load");
+        else if (conf.ospf.announce_death != -1)
+            fail("ospf.announce_death should default to auto");
+        else
+            ok("ospf.announce_death defaults to auto");
+
+        snprintf(abuf, sizeof(abuf), "%sospf:\n  announce_death: auto\n", BASE_NOMAC);
+        write_file(base, abuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0)
+            fail("ospf.announce_death auto load");
+        else if (conf.ospf.announce_death != -1)
+            fail("ospf.announce_death auto parsed wrong");
+        else
+            ok("ospf.announce_death auto parsed");
+
+        snprintf(abuf, sizeof(abuf), "%sospf:\n  announce_death: sometimes\n", BASE_NOMAC);
+        write_file(base, abuf);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+            fail("ospf.announce_death garbage should be refused");
+        else
+            ok("ospf.announce_death garbage refused");
+    }
+
     unlink(base);
     unlink(local);
     rmdir(dir);

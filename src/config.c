@@ -863,6 +863,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->ospf.auth.type = 0;
     out->ospf.auth.key[0] = '\0';
     out->ospf.auth.key_id = 0;
+    out->ospf.announce_death = -1;
 
     /* conntrack sync (IPv4-only v1, off by default). */
     out->conntrack_sync.enabled = false;
@@ -1037,6 +1038,17 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     out->ospf.auth.key_id = (int)json_integer_value(kid);
                 if (out->ospf.auth.type != 0 && out->ospf.auth.key[0] == '\0') {
                     snprintf(err, errlen, "config: ospf.auth.key required for %s", t);
+                    goto derr;
+                }
+            }
+            json_t *ad = json_object_get(o, "announce_death");
+            if (ad && !json_is_null(ad)) {
+                if (json_is_boolean(ad))
+                    out->ospf.announce_death = json_is_true(ad) ? 1 : 0;
+                else if (json_is_string(ad) && !strcmp(json_string_value(ad), "auto"))
+                    out->ospf.announce_death = -1;
+                else {
+                    snprintf(err, errlen, "config: ospf.announce_death must be true, false or auto");
                     goto derr;
                 }
             }

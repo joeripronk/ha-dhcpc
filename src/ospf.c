@@ -246,6 +246,7 @@ static void u32_to_rid(uint32_t v, char *out, size_t outlen)
 static void ospf_drain_rx_locked(void);
 static void ospf_tick_locked(void);
 static void *ospf_thread_main(void *arg);
+static size_t flush_self_lsas_maxage(void);
 
 static void refresh_ifaces(hadc_ctx_t *ctx)
 {
@@ -425,7 +426,6 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
 
 void hadc_ospf_shutdown(hadc_ctx_t *ctx)
 {
-    (void)ctx;
     /* Stop the OSPF thread (set stop, wake its poll, join) before freeing state.
      * The mutex is left intact so a later init/spawn cycle stays valid. */
     if (g_ospf.thread_started) {
@@ -438,7 +438,21 @@ void hadc_ospf_shutdown(hadc_ctx_t *ctx)
         pthread_join(g_ospf.thread, NULL);
         g_ospf.thread_started = false;
     }
-    /* Thread joined: sole writer, no lock needed. */
+    /* Thread joined: sole writer, no lock needed. Announce our death to the
+     * area by flushing self LSAs with MaxAge so peers reconverge now instead
+     * of waiting out the dead interval (ospf.announce_death: auto = on in a
+     * cluster, off standalone). Skipped during graceful restart, where the
+     * LSDB must not move (the restart re-adopts it exactly). */
+    int ad = ctx ? ctx->conf.ospf.announce_death : -1;
+    bool announce = (ad == 1) || (ad < 0 && ctx && ctx->conf.n_members > 0);
+    if (g_ospf.enabled && g_ospf.fd >= 0 && announce && !hadc_cluster_graceful_active(ctx)) {
+        size_t flushed = flush_self_lsas_maxage();
+        if (flushed) {
+            hadc_info("ospf: announcing death, flushed %zu self LSA(s) with MaxAge", flushed);
+            /* let the flush leave the NIC before the socket closes */
+            usleep(1000000);
+        }
+    }
     if (g_ospf.fd >= 0) {
         close(g_ospf.fd);
         g_ospf.fd = -1;
@@ -873,6 +887,55 @@ static void flood_lsas_to_neighbor(ospf_neighbor_t *n, bool self_only)
 static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
 {
     flood_lsas_to_neighbor(n, true);
+}
+
+/* Flush every self-originated LSA with MaxAge (RFC 2328: a self-originated
+ * LSA deleted from the LSDB is flushed at MaxAge) so peers age out our
+ * prefixes now instead of waiting for our adjacencies to time out.
+ * Caller must hold the OSPF lock or be the sole writer (thread joined). */
+static size_t flush_self_lsas_maxage(void)
+{
+    size_t flushed = 0;
+    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[i];
+        if (!e->valid || !e->self)
+            continue;
+        size_t l = lsa_wire_len(e);
+        if (l == 0 || l > OSPF_MTU)
+            continue;
+        size_t plen = sizeof(ospf_hdr_t) + 4 + l;
+        uint8_t *pkt = calloc(1, plen);
+        if (!pkt)
+            continue;
+        ospf_hdr_t *oh = (ospf_hdr_t *)pkt;
+        oh->version = OSPF_VERSION;
+        oh->type = OSPF_LSUPDATE;
+        oh->router_id = htonl(g_ospf.router_id);
+        oh->area_id = htonl(OSPF_AREA_BACKBONE);
+        uint32_t nl = htonl(1);
+        memcpy(pkt + sizeof(ospf_hdr_t), &nl, 4);
+        uint8_t *lp = pkt + sizeof(ospf_hdr_t) + 4;
+        memcpy(lp, &e->hdr, sizeof(e->hdr));
+        if (e->body_len && e->body)
+            memcpy(lp + sizeof(e->hdr), e->body, e->body_len);
+        ((ospf_lsa_hdr_t *)lp)->age = htons(OSPF_LSA_MAXAGE); /* seq: last instance */
+        lsa_checksum(lp, l);
+        oh->length = htons((uint16_t)plen);
+        apply_auth(oh, g_ospf.ctx, pkt, plen);
+        oh->checksum = 0;
+        oh->checksum = ip_checksum(pkt, plen);
+        size_t sent = 0;
+        for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
+            if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY) {
+                send_to(g_ospf.nbrs[k].ip, g_ospf.nbrs[k].ifindex, pkt, plen);
+                sent++;
+            }
+        }
+        if (sent)
+            flushed++;
+        free(pkt);
+    }
+    return flushed;
 }
 
 

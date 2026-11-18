@@ -149,6 +149,9 @@ typedef struct {
         char router_id[INET_ADDRSTRLEN]; /* 0/empty = self cluster/sync address */
         int grace_period_s; /* hold self LSAs (no rebuild/flush) this long after
                              * startup; 0 = today's behavior */
+        int announce_death; /* flush self LSAs with MaxAge on shutdown so peers
+                             * reconverge at once: -1 auto (on in a cluster, off
+                             * standalone), 0 off, 1 on */
         struct {
             int type; /* 0 none, 1 plaintext, 2 md5 */
             char key[128];
