@@ -251,12 +251,16 @@ json_t *hadc_config_merge_json(json_t *base, json_t *overlay)
 
 int hadc_config_digest_json(const json_t *doc, char out[HADC_CONF_SHA_HEX])
 {
-    char *txt = json_dumps(doc ? doc : json_null(), JSON_PRESERVE_ORDER | JSON_COMPACT);
-    if (!txt)
+    json_t *fallback = doc ? NULL : json_null();
+    char *txt = json_dumps(doc ? doc : fallback, JSON_PRESERVE_ORDER | JSON_COMPACT);
+    if (!txt) {
+        json_decref(fallback);
         return -1;
+    }
     uint8_t digest[32];
     hadc_sha256(txt, strlen(txt), digest);
     free(txt);
+    json_decref(fallback);
     for (int i = 0; i < 32; i++)
         sprintf(out + 2 * i, "%02x", digest[i]);
     out[64] = '\0';
@@ -540,10 +544,22 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
 
     json_t *c = json_object_get(root, "cluster");
     if (get_int(c ? c : root, "port", &v, 4227, false, "cluster")) goto derr;
+    if (v < 1 || v > 65535) {
+        snprintf(err, errlen, "config: cluster.port out of range 1..65535");
+        goto derr;
+    }
     out->cluster.port = (uint16_t)v;
     if (get_int(c ? c : root, "heartbeat_ms", &v, 2000, false, "cluster")) goto derr;
+    if (v < 0 || v > 4294967295LL) {
+        snprintf(err, errlen, "config: cluster.heartbeat_ms out of range 0..4294967295");
+        goto derr;
+    }
     out->cluster.heartbeat_ms = (uint32_t)v;
     if (get_int(c ? c : root, "election_deadline_ms", &v, 6000, false, "cluster")) goto derr;
+    if (v < 0 || v > 4294967295LL) {
+        snprintf(err, errlen, "config: cluster.election_deadline_ms out of range 0..4294967295");
+        goto derr;
+    }
     out->cluster.election_deadline_ms = (uint32_t)v;
     if (get_int(c ? c : root, "self_demote_gap_ms", &v, 0, false, "cluster")) goto derr;
     if (v < 0 || v > 60000) {
@@ -568,6 +584,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         goto derr;
     }
     if (get_int(c ? c : root, "cluster_timeout_ms", &v, 0, false, "cluster")) goto derr;
+    if (v < 0 || v > 4294967295LL) {
+        snprintf(err, errlen, "config: cluster.cluster_timeout_ms out of range 0..4294967295");
+        goto derr;
+    }
     out->cluster.cluster_timeout_ms = (uint32_t)v;
     if (get_bool(c ? c : root, "preempt", &out->cluster.preempt, true)) goto derr;
     if (get_bool(c ? c : root, "neighbor_sync", &out->cluster.neighbor_sync, true)) goto derr;
@@ -695,6 +715,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
         goto derr;
     }
     if (get_int(d ? d : root, "retention_max_duration_s", &v, 0, false, "dhcp")) goto derr;
+    if (v < 0) {
+        snprintf(err, errlen, "config: dhcp.retention_max_duration_s must not be negative");
+        goto derr;
+    }
     out->dhcp.retention_max_duration_s = (uint64_t)v;
     json_t *rr = d ? json_object_get(d, "rediscover_in_retention") : NULL;
     out->dhcp.rediscover_in_retention = rr && json_is_boolean(rr) ? json_is_true(rr) : true;

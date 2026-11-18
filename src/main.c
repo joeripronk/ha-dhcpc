@@ -1355,6 +1355,7 @@ int main(int argc, char **argv)
             free(status);
         }
         hadc_persist_save(ctx);
+        hadc_maint_stop(); /* drain the queued persist before exiting */
         return 0;
     }
 

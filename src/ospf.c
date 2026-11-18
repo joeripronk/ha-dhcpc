@@ -191,7 +191,13 @@ static uint16_t ip_checksum(const void *data, size_t len)
     return (uint16_t)(~sum);
 }
 
-/* Fletcher checksum for OSPF LSAs (RFC 2328, excluding age field). */
+/* Fletcher checksum for OSPF LSAs (RFC 2328, excluding age field). Sums run
+ * over the whole LSA with the checksum field (offsets 16-17 in this
+ * implementation's header layout) zeroed; the closed form solves the Fletcher
+ * identity for a field at that position:
+ *   b1 = ((len-17)*c0 - c1) mod 255, b2 = (c1 - (len-16)*c0) mod 255.
+ * Changing this formula changes the on-wire checksum bytes: upgrade all
+ * cluster nodes together or they will reject each other's LSAs. */
 static uint16_t lsa_checksum(uint8_t *lsa, size_t len)
 {
     if (len < 18)
@@ -203,16 +209,12 @@ static uint16_t lsa_checksum(uint8_t *lsa, size_t len)
         c0 = (c0 + lsa[i]) % 255;
         c1 = (c1 + c0) % 255;
     }
-    int x = (int)((len - 16 - 1) % 255);
-    int y = (int)((c0 * (len - 16)) % 255);
-    int ck0 = (int)c0 - (int)c1 + (int)(len - 16) - y;
-    ck0 %= 255;
-    if (ck0 < 0) ck0 += 255;
-    int ck1 = (int)c1 - ck0 - x;
-    ck1 %= 255;
-    if (ck1 < 0) ck1 += 255;
-    lsa[16] = (uint8_t)ck0;
-    lsa[17] = (uint8_t)ck1;
+    uint32_t p16 = (uint32_t)(((uint64_t)(len - 16) * c0) % 255);
+    uint32_t p17 = (uint32_t)(((uint64_t)(len - 17) * c0) % 255);
+    uint32_t b1 = (p17 + 255 - c1) % 255;
+    uint32_t b2 = (c1 + 255 - p16) % 255;
+    lsa[16] = (uint8_t)b1;
+    lsa[17] = (uint8_t)b2;
     return (uint16_t)((lsa[16] << 8) | lsa[17]);
 }
 
@@ -675,7 +677,13 @@ static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
     size_t body_len = len - sizeof(*h);
     old->hdr = *h;
     old->body = body_len ? malloc(body_len) : NULL;
-    if (body_len && old->body)
+    if (body_len && !old->body) {
+        for (size_t i = 0; i < g_ospf.n_lsas; i++)
+            if (&g_ospf.lsdb[i] == old) { remove_lsa_at(i); break; }
+        hadc_warn("ospf: out of memory installing LSA, ignoring");
+        return false;
+    }
+    if (body_len)
         memcpy(old->body, lsapkt + sizeof(*h), body_len);
     old->body_len = body_len;
     old->originated = time(NULL);
@@ -1789,15 +1797,20 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
                 memcpy(b + 4, links, nlinks * sizeof(rlink_t));
             lsa_checksum(buf, total);
             lh->checksum = (uint16_t)((buf[16] << 8) | buf[17]);
-            ospf_lsa_t *e = &g_ospf.lsdb[g_ospf.n_lsas++];
-            memset(e, 0, sizeof(*e));
-            e->hdr = *lh;
-            e->body = malloc(body_len);
-            if (e->body) memcpy(e->body, b, body_len);
-            e->body_len = body_len;
-            e->originated = time(NULL);
-            e->self = true;
-            e->valid = true;
+            uint8_t *copy = malloc(body_len);
+            if (!copy) {
+                hadc_warn("ospf: out of memory originating router LSA");
+            } else {
+                ospf_lsa_t *e = &g_ospf.lsdb[g_ospf.n_lsas++];
+                memset(e, 0, sizeof(*e));
+                e->hdr = *lh;
+                e->body = copy;
+                memcpy(e->body, b, body_len);
+                e->body_len = body_len;
+                e->originated = time(NULL);
+                e->self = true;
+                e->valid = true;
+            }
         }
         free(buf);
     }
@@ -1825,15 +1838,20 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
             /* forwarding address 0.0.0.0, tag 0 */
             lsa_checksum(buf, total);
             lh->checksum = (uint16_t)((buf[16] << 8) | buf[17]);
-            ospf_lsa_t *e = &g_ospf.lsdb[g_ospf.n_lsas++];
-            memset(e, 0, sizeof(*e));
-            e->hdr = *lh;
-            e->body = malloc(body_len);
-            if (e->body) memcpy(e->body, b, body_len);
-            e->body_len = body_len;
-            e->originated = time(NULL);
-            e->self = true;
-            e->valid = true;
+            uint8_t *copy = malloc(body_len);
+            if (!copy) {
+                hadc_warn("ospf: out of memory originating external LSA");
+            } else {
+                ospf_lsa_t *e = &g_ospf.lsdb[g_ospf.n_lsas++];
+                memset(e, 0, sizeof(*e));
+                e->hdr = *lh;
+                e->body = copy;
+                memcpy(e->body, b, body_len);
+                e->body_len = body_len;
+                e->originated = time(NULL);
+                e->self = true;
+                e->valid = true;
+            }
         }
         free(buf);
     }

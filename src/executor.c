@@ -780,13 +780,12 @@ static void run_hook(char *const argv[], const hadc_desired_t *prev,
 		snprintf(e_gw, sizeof(e_gw), "new_routers=%s",
 		    d->gateway.s_addr ? hadc_ipv4_format(d->gateway, gbuf, sizeof(gbuf)) : "");
 	}
-	pos = 0;
-	for (size_t i = 0; i < d->n_dns && pos < sizeof(e_dns) - 16; i++) {
+	pos = (size_t)snprintf(e_dns, sizeof(e_dns), "new_domain_name_servers=");
+	for (size_t i = 0; i < d->n_dns && pos < sizeof(e_dns) - 64; i++) {
 		char dbuf[INET_ADDRSTRLEN];
-		pos += snprintf(e_dns + pos, sizeof(e_dns) - pos, "%s%s", i ? " " : "",
+		pos += (size_t)snprintf(e_dns + pos, sizeof(e_dns) - pos, "%s%s", i ? " " : "",
 		    hadc_ipv4_format(d->dns[i], dbuf, sizeof(dbuf)));
 	}
-	snprintf(e_dns + pos, sizeof(e_dns) - pos, "%s", pos ? "" : "new_domain_name_servers=");
 
 	envp[n++] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 	envp[n++] = e_reason;
@@ -1025,9 +1024,12 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 	rtnl_neigh_set_state(n, NUD_PERMANENT);
 		{
 			struct nl_addr *ll = nl_addr_build(AF_UNSPEC, (void *)mac, HADC_MAC_LEN);
-			if (!ll || rtnl_neigh_set_dst(n, nl_addr_clone(dst)) < 0) {
+			struct nl_addr *dstc = nl_addr_clone(dst);
+			if (!ll || !dstc || rtnl_neigh_set_dst(n, dstc) < 0) {
 				if (ll)
 					nl_addr_put(ll);
+				if (dstc)
+					nl_addr_put(dstc);
 				hadc_warn("executor: building neighbor entry for %s failed (reason=%s)",
 				    gwbuf, reason);
 				rtnl_neigh_put(n);
@@ -1035,7 +1037,9 @@ static void apply_gw_neigh(int ifindex, const struct in_addr *gw,
 				nl_addr_put(dst);
 				return;
 			}
-			rtnl_neigh_set_lladdr(n, ll); /* takes ownership */
+			nl_addr_put(dstc); /* set_dst took its own reference */
+			rtnl_neigh_set_lladdr(n, ll);
+			nl_addr_put(ll); /* set_lladdr took its own reference */
 		}
 	rc = rtnl_neigh_add(g_sk, n, NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK);
 	if (rc < 0)
@@ -1258,8 +1262,8 @@ static void hadc_executor_apply_vip_neighs(hadc_ctx_t *ctx, const hadc_desired_t
             rtnl_neigh_set_family(n, AF_INET);
             rtnl_neigh_set_ifindex(n, ifindex);
             rtnl_neigh_set_state(n, NUD_REACHABLE);
-            rtnl_neigh_set_dst(n, dst); dst = NULL; /* takes ownership */
-            rtnl_neigh_set_lladdr(n, ll); ll = NULL;
+            rtnl_neigh_set_dst(n, dst);
+            rtnl_neigh_set_lladdr(n, ll);
             int rc = rtnl_neigh_add(g_sk, n, NLM_F_CREATE | NLM_F_REPLACE);
             if (rc < 0 && rc != -NLE_EXIST) {
                 char vnbuf[INET_ADDRSTRLEN];
@@ -1573,7 +1577,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
     const char *reason, bool from_drift)
 {
 	struct nl_cache *lcache = NULL, *acache = NULL, *rcache = NULL;
-	struct rtnl_link *link;
+	struct rtnl_link *link = NULL;
 	struct rtnl_addr *stale;
 	struct rtnl_route *sroute;
 	const hadc_desired_t *prev = g_applied_valid ? &g_applied : NULL;
@@ -1979,6 +1983,7 @@ out:
 		g_applied = *desired;
 		g_applied_valid = true;
 	}
+	rtnl_link_put(link); /* get_by_name returned a new reference */
 	nl_cache_drop(&lcache);
 	nl_cache_drop(&acache);
 	nl_cache_drop(&rcache);
@@ -2417,6 +2422,7 @@ int hadc_executor_link_up(const char *ifname)
         else
             hadc_info("executor: link %s brought up", ifname);
     }
+    rtnl_link_put(link); /* get_by_name returned a new reference */
     nl_cache_drop(&lcache);
     hadc_maint_unlock();
     return rc;
