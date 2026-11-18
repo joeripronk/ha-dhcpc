@@ -2166,7 +2166,8 @@ static void apply_slave_nft_block(const char *ifname, bool block, const char *re
 }
 
 /* Seamless takeover, demoting-hold scoping (plan SEAMLESS_TAKEOVER.md):
- *  - netdev egress chain per VIP interface dropping ARP replies whose sender IP
+ *  - netdev egress chain per VIP interface in our own takeover table
+ *    (netdev ha_dhcpc_tk), dropping ARP replies whose sender IP
  *    is a VIP (the demoting node keeps VIPs assigned during the hold but must
  *    not claim them; the new master's GARPs are requests and pass untouched);
  *  - ip-family output chain dropping locally-originated traffic sourced from a
@@ -2238,15 +2239,16 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 	if (!was_active && !is_active)
 		return;
 
-	/* Tear down the previous scoping first (only our own chains; the netdev
-	 * table is shared with the slave egress block lifecycle). */
+	/* Tear down the previous scoping first (only our own chains; the takeover
+	 * tables are ours alone — the netdev slave-egress table ha_dhcpc has its
+	 * own lifecycle and must not share one with the ar_* chains). */
 	if (was_active) {
 		if (prev->vip_hold_suppress) {
 			for (size_t i = 0; i < prev->n_cluster_ifaces; i++) {
 				if (!prev->cluster_ifaces[i].n_addrs)
 					continue;
 				nft_chain_name(prev->cluster_ifaces[i].interface, san, sizeof(san));
-				snprintf(cmd, sizeof(cmd), "nft 'delete chain netdev ha_dhcpc ar_%s' 2>/dev/null", san);
+				snprintf(cmd, sizeof(cmd), "nft 'delete chain netdev " HADC_TAKEOVER_NFT_TABLE " ar_%s' 2>/dev/null", san);
 				nft_run(cmd, reason, false);
 			}
 			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " out' 2>/dev/null", reason, false);
@@ -2255,8 +2257,11 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " pre' 2>/dev/null", reason, false);
 			nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " post' 2>/dev/null", reason, false);
 		}
-		if (!is_active)
+		if (!is_active) {
+			if (prev->vip_hold_suppress)
+				nft_run("nft 'delete table netdev " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null", reason, false);
 			nft_run("nft 'delete table ip " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null", reason, false);
+		}
 	}
 
 	if (!is_active) {
@@ -2272,16 +2277,16 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 			nft_chain_name(ci->interface, san, sizeof(san));
 			snprintf(chain, sizeof(chain), "ar_%s", san);
 			snprintf(cmd, sizeof(cmd),
-			    "nft 'add table netdev ha_dhcpc' 2>/dev/null; "
-			    "nft 'delete chain netdev ha_dhcpc %s' 2>/dev/null; "
-			    "nft 'add chain netdev ha_dhcpc %s { type filter hook egress device \"%s\" priority 0; policy accept; }'",
+			    "nft 'add table netdev " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null; "
+			    "nft 'delete chain netdev " HADC_TAKEOVER_NFT_TABLE " %s' 2>/dev/null; "
+			    "nft 'add chain netdev " HADC_TAKEOVER_NFT_TABLE " %s { type filter hook egress device \"%s\" priority 0; policy accept; }'",
 			    chain, chain, ci->interface);
 			nft_run(cmd, reason, true);
 			for (size_t j = 0; j < ci->n_addrs; j++) {
 				char abuf[INET_ADDRSTRLEN];
 				hadc_ipv4_format(ci->addrs[j].address, abuf, sizeof(abuf));
 				snprintf(cmd, sizeof(cmd),
-				    "nft 'add rule netdev ha_dhcpc %s ether type arp arp operation reply arp saddr ip %s drop'",
+				    "nft 'add rule netdev " HADC_TAKEOVER_NFT_TABLE " %s ether type arp arp operation reply arp saddr ip %s drop'",
 				    chain, abuf);
 				nft_run(cmd, reason, true);
 			}

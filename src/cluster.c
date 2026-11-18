@@ -1898,8 +1898,12 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
     HB_UNLOCK(ctx);
     /* Controlled handoff: enter DEMOTING so a caller that keeps running (e.g.
      * a self-monitor demote) keeps forwarding for the hold window while the
-     * new master takes over; shutdown callers exit right after this returns,
-     * so for them only the role broadcast goes out. */
+     * new master takes over.  Shutdown callers exit right after this returns:
+     * the demoting apply (steering routes, VIP hold + ARP-reply suppression,
+     * NOTRACK) then survives as kernel state for the takeover window — exit
+     * cleanup must not touch it (clear_slave_isolation owns only netdev
+     * ha_dhcpc, not the takeover tables), and the new master falls back to
+     * timeout-GARP since no ack can come from a departed old master. */
     set_role(ctx, HADC_ROLE_DEMOTING);
     g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000; /* preempt/election only; failover stays live */
     hadc_info("cluster: handing the master role to %s before shutdown", best->id);

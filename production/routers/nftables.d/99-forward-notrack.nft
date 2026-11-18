@@ -1,0 +1,39 @@
+define target_ifs = { "br-lan.5", "br-lan.3","br-lan.8","br-lan.9", "br-lan.10" }
+
+chain raw_forward_notrack {
+    type filter hook forward priority raw; policy accept;
+
+    iifname $target_ifs oifname $target_ifs notrack
+    # do not track outgoing traffic over the sync/ospf interface
+    oifname "br-lan.11" notrack
+}
+chain raw_prerouting_local {
+    type filter hook prerouting priority raw; policy accept;
+
+    # Internet-egress tracker, counter-only, first: counts every packet the FIB
+    # lookup would send out the internet interface, including those the notrack
+    # rules below untrack; compare with the tracker at the end: equal =
+    # guard redundant, differing delta = what the notrack rules intercept.
+    fib daddr . iif oifname "br-lan.300" counter continue
+
+    # Disable conntrack for incoming traffic on target interfaces addressed to the router itself
+    iifname $target_ifs fib daddr type local notrack;
+    ip saddr 192.168.12.0/24 counter notrack;
+    ip daddr 192.168.12.0/24 counter notrack;
+    ip saddr 192.168.11.0/24 counter notrack;
+    ip daddr 192.168.11.0/24 counter notrack;
+    ip daddr 172.16.11.0/24 counter notrack;
+
+    # Internet-egress tracker, counter-only, last: internet-egress packets that
+    # survived every notrack rule (tracked anyway).  If this equals the first
+    # tracker, the always-track guard is redundant; the difference is what the
+    # notrack rules intercept.
+    fib daddr . iif oifname "br-lan.300" counter continue
+}
+
+chain raw_output_local {
+    type filter hook output priority raw; policy accept;
+
+    # Disable conntrack for locally generated traffic leaving via target interfaces
+    oifname $target_ifs notrack
+}

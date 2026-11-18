@@ -287,7 +287,7 @@ if [[ $hold_seen == 1 ]]; then
         fail "node1 dropped the VIP during the hold (must persist until completion)"
     fi
     if [[ -n "$NFT" ]]; then
-        netdev_rules="$(ip netns exec "$NS1" "$NFT" list table netdev ha_dhcpc 2>/dev/null || true)"
+        netdev_rules="$(ip netns exec "$NS1" "$NFT" list table netdev ha_dhcpc_tk 2>/dev/null || true)"
         ip_rules="$(ip netns exec "$NS1" "$NFT" list table ip ha_dhcpc_tk 2>/dev/null || true)"
         printf '%s' "$netdev_rules" | grep -q "arp operation reply arp saddr ip $VIP_IP drop" &&
             pass "ARP-reply suppression rule for the VIP active on node1" ||
@@ -341,7 +341,7 @@ if [[ -n "$ok_node2" && -n "$ok_node1" ]]; then
         fail "node2 did not take over the VIP"
     fi
     if [[ -n "$NFT" ]]; then
-        netdev_chains="$(ip netns exec "$NS1" "$NFT" -n list table netdev ha_dhcpc 2>/dev/null || true)"
+        netdev_chains="$(ip netns exec "$NS1" "$NFT" -n list table netdev ha_dhcpc_tk 2>/dev/null || true)"
         ip_chains="$(ip netns exec "$NS1" "$NFT" -n list table ip ha_dhcpc_tk 2>/dev/null || true)"
         printf '%s' "$netdev_chains" | grep -q "ar_${VIP_IF}" &&
             fail "ARP-suppression chain lingered on node1" ||
