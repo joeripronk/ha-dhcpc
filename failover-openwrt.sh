@@ -3,11 +3,14 @@
 # that established TCP connections on a given port keep working (conntrack
 # flows remain present across the promotion).
 #
-# Usage: ./failover-openwrt.sh <port> [--from <host>] [--to <host>] [--timeout N]
+# Usage: ./failover-openwrt.sh <port> [--from <host>] [--to <host>] [--timeout N] [--recheck N]
 #   port      TCP port number to monitor/validate (e.g. 3724)
 #   --from    require this node to be master before failover (optional)
 #   --to      target node to promote (defaults to preferred slave)
 #   --timeout seconds to wait for role convergence and validation (default 30)
+#   --recheck seconds to keep re-checking every baseline tuple once per second
+#             after the post-failover snapshot; a tuple that drops out of
+#             ESTABLISHED during the window fails the run (default 10)
 #
 # Uses ssh root@<host> and `ha-dhcpc ctl promote/status` (no daemon restarts).
 # Matches conntrack flows by original or reply sport/dport (NAT-aware).
@@ -26,9 +29,10 @@ PORT=""
 FROM=""
 TO=""
 TIMEOUT=30
+RECHECK=${RECHECK:-10}
 
 usage() {
-	echo "usage: $0 <port> [--from <host>] [--to <host>] [--timeout N]" >&2
+	echo "usage: $0 <port> [--from <host>] [--to <host>] [--timeout N] [--recheck N]" >&2
 	exit 2
 }
 
@@ -37,6 +41,7 @@ while [ $# -gt 0 ]; do
 	--from) [ $# -ge 2 ] || usage; FROM=$2; shift 2 ;;
 	--to) [ $# -ge 2 ] || usage; TO=$2; shift 2 ;;
 	--timeout) [ $# -ge 2 ] || usage; TIMEOUT=$2; shift 2 ;;
+	--recheck) [ $# -ge 2 ] || usage; RECHECK=$2; shift 2 ;;
 	--help|-h) usage ;;
 	-*) echo "unknown option: $1" >&2; usage ;;
 	*)
@@ -102,7 +107,7 @@ fi
 [ "$TARGET" != "$CURRENT_MASTER" ] || { echo "error: target equals current master ($TARGET)" >&2; exit 1; }
 host_in_list "$TARGET" || { echo "error: target $TARGET not in cluster hosts ($ALL_HOSTS)" >&2; exit 1; }
 
-echo "cluster: current master=$CURRENT_MASTER target=$TARGET port=$PORT timeout=${TIMEOUT}s"
+echo "cluster: current master=$CURRENT_MASTER target=$TARGET port=$PORT timeout=${TIMEOUT}s recheck=${RECHECK}s"
 for h in $ALL_HOSTS; do
 	echo "  $h: role=$(role_of "$h" 2>/dev/null || echo '?') master=$(master_of_view "$h" 2>/dev/null || echo '?')"
 done
@@ -135,14 +140,16 @@ trap cleanup EXIT INT TERM
 FETCH_OK=1
 
 fetch_remote_file() {
-	_rh=$1 _rf=$2 _lf=$3 _label=$4
+	_rh=$1 _rf=$2 _lf=$3 _label=$4 _optional=${5:-0}
 	_err="$tmpdir/scp.err.$$"
 	if scp -o BatchMode=yes -o ConnectTimeout=5 "root@${_rh}:${_rf}" "$_lf" </dev/null >"$_err" 2>&1; then
 		echo "  saved: $_lf"
 		return 0
 	fi
 	echo "  warning: could not fetch ${_label}: $(tr '\n' ' ' <"$_err" 2>/dev/null)" >&2
-	FETCH_OK=0
+	if [ "$_optional" -ne 1 ]; then
+		FETCH_OK=0
+	fi
 	return 1
 }
 
@@ -168,7 +175,6 @@ capture_start() {
 	sleep 1
 }
 capture_stop() {
-	[ -f "$tmpdir/captures.list" ] || true
 	echo "== stopping tcpdump captures (and killing any remaining tcpdump/conntrack on capture hosts) =="
 	if [ -f "$tmpdir/captures.list" ]; then
 		while IFS=' ' read -r h iface rfile pfile logfile; do
@@ -218,7 +224,9 @@ analysis_start() {
 	for h in $ALL_HOSTS; do
 		ct_dump_remote "$h" pre
 	done
-	for h in $CURRENT_MASTER $TARGET; do
+	# events+samples run on every node: a disconnect on any node counts, and
+	# the recheck window needs the monitors alive until analysis_stop_fetch.
+	for h in $ALL_HOSTS; do
 		emon="/tmp/ha-failover-${ts}-${PORT}-${h}-events.log"
 		epid="/tmp/ha-failover-${ts}-${PORT}-${h}-events.pid"
 		smon="/tmp/ha-failover-${ts}-${PORT}-${h}-samples.log"
@@ -228,7 +236,7 @@ analysis_start() {
 		if ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "
 			rm -f '$emon' '$epid' '$smon' '$spid'
 			(conntrack -E -o extended -p tcp 2>/dev/null | grep --line-buffered -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' >'$emon') & echo \$! >'$epid'
-			(i=0; while [ \$i -lt 30 ]; do echo \"--- sample \$i \$(date +%s 2>/dev/null || echo now) ---\"; conntrack -L -p tcp -o save 2>/dev/null | grep -E '(^|[[:space:]])(sport[[:space:]]+${PORT}|dport[[:space:]]+${PORT})([[:space:]]|$)' || conntrack -L -p tcp -o extended 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' || true; i=\$((i+1)); sleep 1; done >'$smon') & echo \$! >'$spid'
+			(i=0; while [ \$i -lt 120 ]; do echo \"--- sample \$i \$(date +%s 2>/dev/null || echo now) ---\"; conntrack -L -p tcp -o save 2>/dev/null | grep -E '(^|[[:space:]])(sport[[:space:]]+${PORT}|dport[[:space:]]+${PORT})([[:space:]]|$)' || conntrack -L -p tcp -o extended 2>/dev/null | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' || true; i=\$((i+1)); sleep 1; done >'$smon') & echo \$! >'$spid'
 		" >"$tmpdir/amon.err" 2>&1; then
 			echo "  started: $h conntrack events+samples"
 		else
@@ -249,7 +257,7 @@ analysis_stop_fetch() {
 		printf '%s\n' "$h log /tmp/ha-failover-${ts}-${PORT}-${h}-logread.log" >>"$tmpdir/analysis.files"
 		printf '%s\n' "$h log /tmp/ha-failover-${ts}-${PORT}-${h}-dmesg-tail.log" >>"$tmpdir/analysis.files"
 	done
-	for h in $CURRENT_MASTER $TARGET; do
+	for h in $ALL_HOSTS; do
 		for kind in events samples; do
 			pfile="/tmp/ha-failover-${ts}-${PORT}-${h}-${kind}.pid"
 			ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" \
@@ -263,7 +271,9 @@ analysis_stop_fetch() {
 			case "$kind" in
 			pre|post)
 				for ext in extended save plain nf_conntrack ip_default ip_r4 status.json status.err; do
-					fetch_remote_file "$h" "${a}.${ext}" "$CAP_DIR/analysis/${h}-${kind}.${ext}" "$h:${a}.${ext}" || true
+					opt=0
+					[ "$ext" = status.err ] && opt=1
+					fetch_remote_file "$h" "${a}.${ext}" "$CAP_DIR/analysis/${h}-${kind}.${ext}" "$h:${a}.${ext}" "$opt" || true
 				done
 				;;
 			bg)
@@ -309,11 +319,18 @@ for h in $ALL_HOSTS; do
 	echo "  $h: established=$est total_tcp_port=$all"
 done
 
-BASELINE_TUPLES="$tmpdir/pre.$CURRENT_MASTER.tuples"
+BASELINE_TUPLES="$tmpdir/baseline.tuples"
+: >"$BASELINE_TUPLES"
+for h in $ALL_HOSTS; do
+	if [ -s "$tmpdir/pre.$h.tuples" ]; then
+		cat "$tmpdir/pre.$h.tuples" >>"$BASELINE_TUPLES"
+	fi
+done
+sort -u -o "$BASELINE_TUPLES" "$BASELINE_TUPLES"
 BASELINE_COUNT=$(wc -l <"$BASELINE_TUPLES" | tr -d ' ')
-echo "baseline: $BASELINE_COUNT established conntrack tuple(s) for port $PORT on current master $CURRENT_MASTER"
+echo "baseline: $BASELINE_COUNT established conntrack tuple(s) for port $PORT across the cluster"
 if [ "$BASELINE_COUNT" -eq 0 ]; then
-	echo "note: no established port-$PORT conntrack flows found on master; validating role convergence only"
+	echo "note: no established port-$PORT conntrack flows found; validating role convergence only"
 fi
 
 echo "== failover =="
@@ -363,8 +380,60 @@ for h in $ALL_HOSTS; do
 	echo "  $h: established=$est total_tcp_port=$all"
 done
 
+# Recheck window: a single snapshot cannot tell a migrated-and-alive connection
+# from one that disconnects moments later (or a same-tuple reconnect).  Re-poll
+# every baseline tuple once per second; it must stay ESTABLISHED on some host in
+# every check.  Runs before analysis_stop_fetch so the event/sample monitors
+# stay alive through the window.
+RECHECK_DROPS="$tmpdir/recheck.dropped"
+: >"$RECHECK_DROPS"
+if [ "$BASELINE_COUNT" -gt 0 ] && [ "$RECHECK" -gt 0 ]; then
+	echo "== recheck window (${RECHECK} checks, ~1/s; every baseline tuple must stay established in every check) =="
+	i=0
+	while [ "$i" -lt "$RECHECK" ]; do
+		i=$((i+1))
+		wnow=$(date '+%H:%M:%S' 2>/dev/null || echo now)
+		all_tuples="$tmpdir/recheck.$i.tuples"
+		: >"$all_tuples"
+		for h in $ALL_HOSTS; do
+			ct_established "$h" | sed '/^$/d' | ct_tuples >>"$all_tuples"
+		done
+		sort -u -o "$all_tuples" "$all_tuples"
+		while IFS= read -r t; do
+			[ -n "$t" ] || continue
+			if ! grep -Fqx "$t" "$all_tuples"; then
+				printf '%s\tcheck=%s at=%s\n' "$t" "$i" "$wnow" >>"$RECHECK_DROPS"
+			fi
+		done <"$BASELINE_TUPLES"
+		if [ "$i" -lt "$RECHECK" ]; then
+			sleep 1
+		fi
+	done
+fi
+
 capture_stop
 analysis_stop_fetch
+
+# Scan the captured conntrack event logs for close/delete transitions of
+# baseline tuples: those are disconnects even when samples still show the
+# tuple (same-tuple reconnects look "present" in a state snapshot).
+EVENT_HITS="$tmpdir/event.disconnects"
+: >"$EVENT_HITS"
+if [ "$BASELINE_COUNT" -gt 0 ]; then
+	while IFS=' ' read -r _tag1 opair _tag2 rpair; do
+		[ -n "$opair" ] || continue
+		o_sp=${opair#*:}; o_sp=${o_sp%%->*}; o_dp=${opair#*->}; o_dp=${o_dp#*:}
+		r_sp=${rpair#*:}; r_sp=${r_sp%%->*}; r_dp=${rpair#*->}; r_dp=${r_dp#*:}
+		pat="sport=${o_sp}[[:space:]]+dport=${o_dp}|sport=${r_sp}[[:space:]]+dport=${r_dp}"
+		for ef in "$CAP_DIR"/analysis/*-events.log; do
+			[ -f "$ef" ] || continue
+			line=$(grep -E "$pat" "$ef" 2>/dev/null | grep -E 'CLOSE_WAIT|LAST_ACK|TIME_WAIT|CLOSE|FIN_WAIT|DELETE|DESTROY|REPLACED' | head -n 1 || true)
+			[ -n "$line" ] || continue
+			printf '%s\t%s\t%s\n' "$opair $rpair" "$(basename "$ef")" "$line" >>"$EVENT_HITS"
+		done
+	done <"$BASELINE_TUPLES"
+fi
+
 echo "captures: $CAP_DIR"
 if [ "$FETCH_OK" -ne 1 ]; then
 	echo "warning: some captures/analysis artifacts could not be fetched; see warnings above and preserved remote files" >&2
@@ -408,6 +477,18 @@ fi
 
 NEW_MASTER_TUPLES=$(wc -l <"$tmpdir/post.$TARGET.tuples" | tr -d ' ')
 echo "new master $TARGET has $NEW_MASTER_TUPLES established port-$PORT tuple(s)"
+
+if [ -s "$RECHECK_DROPS" ]; then
+	echo "validation: FAIL - baseline tuple(s) left established state during the ${RECHECK}s recheck window (migrated but disconnected):" >&2
+	sed 's/^/  dropped: /' "$RECHECK_DROPS" >&2
+	ok=0
+fi
+if [ -s "$EVENT_HITS" ]; then
+	echo "validation: FAIL - close/delete conntrack event(s) seen for baseline tuple(s) during the monitoring window:" >&2
+	sed 's/^/  event: /' "$EVENT_HITS" >&2
+	echo "  (presence in the final snapshot is not survival: a same-tuple reconnect looks identical)" >&2
+	ok=0
+fi
 
 if [ "$ok" -eq 1 ]; then
 	echo "RESULT: PASS (failover $CURRENT_MASTER -> $TARGET, port $PORT)"
