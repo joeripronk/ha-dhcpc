@@ -59,6 +59,7 @@ typedef struct {
 
 static fd_entry_t g_fds[MAX_FDS];
 static size_t g_nfds;
+static pthread_mutex_t g_fds_lock = PTHREAD_MUTEX_INITIALIZER; /* guards g_fds/g_nfds: the maintenance worker adds/drops fds (gwping) */
 static hadc_ctx_t g_ctx;
 
 
@@ -119,12 +120,16 @@ void hadc_validate_demote_route_config(hadc_ctx_t *ctx, const char *why)
 
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
 {
-    if (g_nfds >= MAX_FDS || fd < 0)
+    pthread_mutex_lock(&g_fds_lock);
+    if (g_nfds >= MAX_FDS || fd < 0) {
+        pthread_mutex_unlock(&g_fds_lock);
         return -1;
+    }
     g_fds[g_nfds].fd = fd;
     g_fds[g_nfds].cb = cb;
     g_fds[g_nfds].flags = events;
     g_nfds++;
+    pthread_mutex_unlock(&g_fds_lock);
     struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
     if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
         hadc_err("loop: epoll add fd %d: %s", fd, strerror(errno));
@@ -135,12 +140,16 @@ int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
 
 int hadc_loop_del(hadc_ctx_t *ctx, int fd)
 {
+    pthread_mutex_lock(&g_fds_lock);
     size_t j = 0;
     while (j < g_nfds && g_fds[j].fd != fd)
         j++;
-    if (j == g_nfds)
+    if (j == g_nfds) {
+        pthread_mutex_unlock(&g_fds_lock);
         return -1;
+    }
     g_fds[j] = g_fds[--g_nfds];
+    pthread_mutex_unlock(&g_fds_lock);
     if (epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, fd, NULL) != 0) {
         /* The owner may already have closed the fd (Linux drops it from the
          * epoll set automatically), so ENOENT/EBADF is not an error. */
@@ -1187,6 +1196,18 @@ int main(int argc, char **argv)
                          : (!strcmp(ctx->conf.designated_master, ctx->conf.self)
                                 ? HADC_ROLE_MASTER
                                 : HADC_ROLE_SLAVE);
+    /* Transient roles never survive a restart: PROMOTING/DEMOTING are steps of
+     * the promote/handoff flow that a crash cut short. Restore them to their
+     * stable equivalents so the node rejoins normally (the startup apply,
+     * announce and gwping below run for MASTER; every promotion path requires
+     * SLAVE, so a node that crashed mid-promotion/handoff must not resume in a
+     * transient role or it is locked out of promotion forever). */
+    if (pv.found && (ctx->role == HADC_ROLE_PROMOTING || ctx->role == HADC_ROLE_DEMOTING)) {
+        hadc_role_t pre_role = ctx->role;
+        ctx->role = pre_role == HADC_ROLE_PROMOTING ? HADC_ROLE_MASTER : HADC_ROLE_SLAVE;
+        hadc_info("persist: restored transient role %s normalized to %s at startup",
+                  hadc_role_name(pre_role), hadc_role_name(ctx->role));
+    }
 
     if (pv.found) {
         /* Runtime role changes are persisted; the shared config's
@@ -1363,12 +1384,17 @@ int main(int argc, char **argv)
         int n = epoll_wait(ctx->epfd, evs, MAX_FDS, 1000);
         for (int i = 0; i < n; i++) {
             int fd = evs[i].data.fd;
-            fd_entry_t *e = NULL;
+            fd_entry_t ent;
+            bool found = false;
+            pthread_mutex_lock(&g_fds_lock);
             for (size_t j = 0; j < g_nfds; j++)
                 if (g_fds[j].fd == fd) {
-                    e = &g_fds[j];
+                    ent = g_fds[j];
+                    found = true;
                     break;
                 }
+            pthread_mutex_unlock(&g_fds_lock);
+            fd_entry_t *e = found ? &ent : NULL;
             if (evs[i].events & (EPOLLERR | EPOLLHUP)) {
                 hadc_warn("loop: fd %d reports %s%s", fd,
                           (evs[i].events & EPOLLERR) ? "EPOLLERR" : "",

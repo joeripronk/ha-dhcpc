@@ -29,9 +29,10 @@
 #include "internal.h"
 
 /* Guards the fields the heartbeat thread reads (role, lease.version,
- * graceful_restart_until_ms, cadence/gap and the member table). Keep critical
- * sections tight: lock only the field write/read, never across a call that
- * itself locks. */
+ * graceful_restart_until_ms, cadence/gap, the member table, conf.self/udp_fd,
+ * conf.designated_master and the peer liveness it snapshots for the seen-nodes
+ * bitmap). Keep critical sections tight: lock only the field write/read, never
+ * across a call that itself locks. */
 #define HB_LOCK(ctx)   pthread_mutex_lock(&(ctx)->hb_lock)
 #define HB_UNLOCK(ctx) pthread_mutex_unlock(&(ctx)->hb_lock)
 
@@ -64,6 +65,8 @@ static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
 static void age_peers(hadc_ctx_t *ctx);
 static uint64_t realtime_ms(void);
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg);
+static void log_refusal_once(hadc_log_level_t level, const char *msg);
+static bool quorum_closure_ok(hadc_ctx_t *ctx);
 
 static void udp_ready(hadc_ctx_t *ctx, int fd);
 
@@ -81,11 +84,12 @@ static uint8_t role_wire(hadc_role_t r)
 static bool role_is_master_ready(hadc_role_t r) { return r == HADC_ROLE_MASTER; }
 static bool role_claims_master(hadc_role_t r) { return r == HADC_ROLE_MASTER || r == HADC_ROLE_PROMOTING; }
 
-/* Compact binary heartbeat (minimum-frame sized): 16-byte payload, 64-byte
- * Ethernet frame. Members are referenced by index into the shared config, so
- * index identity assumes the same shared document cluster-wide; a sender whose
- * index is unknown here is skipped by the assertion paths, which are driven by
- * role_change propagation and the conf-sync push instead.
+/* Compact binary heartbeat (minimum-frame sized): 16-byte base + seen-nodes
+ * bitmap, 64-byte Ethernet frame (the full field set stays within the 32-byte
+ * minimum-frame payload). Members are referenced by index into the shared
+ * config, so index identity assumes the same shared document cluster-wide; a
+ * sender whose index is unknown here is skipped by the assertion paths, which
+ * are driven by role_change propagation and the conf-sync push instead.
  *
  *   0  type: 0 = heartbeat (JSON datagrams start with '{', so 0 is the
  *      discriminator for the whole wire)
@@ -95,6 +99,15 @@ static bool role_claims_master(hadc_role_t r) { return r == HADC_ROLE_MASTER || 
  *   4  lease_version, big-endian u64
  *   12 ts_ms, big-endian u32 low bits of CLOCK_REALTIME ms (decoded to the
  *      nearest full ms to our clock, so the ~49-day wrap is harmless)
+ *   16 seen-nodes bitmap, ceil(n_members/8) bytes (1 byte covers members
+ *      0..7, a second byte extends the view to members 8..15): bit i set = the
+ *      sender heard member i (including itself) within its own deadline. This
+ *      is what makes shared-witness partitions visible: a direct-view majority
+ *      whose heard peers report seeing nodes outside the view cannot prove it
+ *      is the only majority, so promotion must not fire there. Receivers accept
+ *      bitmap-less 16-byte frames from mixed-version senders during an upgrade
+ *      (bitmap unknown); senders always send the full field set, so upgrade
+ *      deploys run inside the graceful-restart window.
  */
 #define HADC_WIRE_HB_LEN       16
 #define HADC_WIRE_IDX_UNKNOWN  255
@@ -232,20 +245,45 @@ static const char *member_id_by_index(const hadc_ctx_t *ctx, int idx)
     return ctx->conf.members[idx].id;
 }
 
-static void build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
+static size_t hb_bitmap_len(const hadc_ctx_t *ctx)
 {
-    memset(out, 0, HADC_WIRE_HB_LEN);
+    size_t blen = (ctx->conf.n_members + 7) / 8; /* 1 byte covers 8 members, a second extends to 16 */
+    return blen ? blen : 1;
+}
+
+/* Our own seen-nodes view: self plus every peer heard within the deadline. */
+static uint64_t hb_seen_bits(const hadc_ctx_t *ctx)
+{
+    int self_idx = member_index(ctx, ctx->conf.self);
+    uint64_t bits = self_idx >= 0 ? (1ULL << (uint64_t)self_idx) : 0;
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (ctx->peers[i].alive)
+            bits |= 1ULL << (uint64_t)i;
+    return bits;
+}
+
+/* Main-loop only (peers[] is main-loop state; the hb thread builds its frame
+ * from its snapshot). Returns the full frame length (base + bitmap). */
+static size_t build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
+{
+    size_t blen = hb_bitmap_len(ctx);
+    memset(out, 0, HADC_WIRE_HB_LEN + blen);
     out[1] = (uint8_t)member_index(ctx, ctx->conf.self);
     out[2] = (uint8_t)member_index(ctx, ctx->conf.designated_master);
     out[3] = role_wire(ctx->role);
     put_be(out + 4, ctx->lease.version, 8);
     put_be(out + 12, realtime_ms() & 0xffffffffu, 4);
+    uint64_t bits = hb_seen_bits(ctx);
+    for (size_t j = 0; j < blen; j++)
+        out[HADC_WIRE_HB_LEN + j] = (uint8_t)(bits >> (8 * j));
+    return HADC_WIRE_HB_LEN + blen;
 }
 
 static int decode_bin_heartbeat(const hadc_ctx_t *ctx, const uint8_t *p, size_t len,
                                 hadc_msg_t *out)
 {
-    if (len != HADC_WIRE_HB_LEN || p[0] != 0)
+    size_t blen = hb_bitmap_len(ctx);
+    if (p[0] != 0 || (len != HADC_WIRE_HB_LEN && len != HADC_WIRE_HB_LEN + blen))
         return -1;
     const char *id;
     memset(out, 0, sizeof(*out));
@@ -269,6 +307,12 @@ static int decode_bin_heartbeat(const hadc_ctx_t *ctx, const uint8_t *p, size_t 
         snprintf(out->role, sizeof(out->role), "unknown");
     out->lease_version = get_be(p + 4, 8);
     out->ts_ms = unwrap_ms((uint32_t)get_be(p + 12, 4));
+    if (len > HADC_WIRE_HB_LEN) {
+        out->seen_bits_known = true;
+        for (size_t i = 0; i < blen * 8; i++)
+            if ((p[HADC_WIRE_HB_LEN + i / 8] >> (i % 8)) & 1)
+                out->seen_bits |= 1ULL << i;
+    }
     return 0;
 }
 
@@ -336,20 +380,33 @@ static int send_bytes(hadc_ctx_t *ctx, const struct sockaddr_in *to, const uint8
     return r < 0 ? -1 : 0;
 }
 
+/* Swap the transport fd under hb_lock (the hb thread snapshots it); returns
+ * the old fd so callers can deregister/close it outside the lock. */
+static int udp_fd_swap(hadc_ctx_t *ctx, int new_fd)
+{
+    int old;
+
+    HB_LOCK(ctx);
+    old = ctx->udp_fd;
+    ctx->udp_fd = new_fd;
+    HB_UNLOCK(ctx);
+    return old;
+}
+
 static void send_heartbeats_now(hadc_ctx_t *ctx)
 {
     if (ctx->udp_fd < 0)
         return;
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
-        uint8_t hb[HADC_WIRE_HB_LEN];
+        uint8_t hb[32];
         if (!strcmp(m->id, ctx->conf.self))
             continue;
-        build_bin_heartbeat(ctx, hb);
+        size_t hlen = build_bin_heartbeat(ctx, hb);
         struct sockaddr_in to = { .sin_family = AF_INET,
                                    .sin_port = htons(ctx->conf.cluster.port),
                                    .sin_addr = m->sync_address };
-        if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
+        if (send_bytes(ctx, &to, hb, hlen) != 0)
             hadc_warn("cluster: send heartbeat to %s failed", m->id);
     }
 }
@@ -377,6 +434,9 @@ static void *hb_thread_main(void *arg)
             uint64_t lease_version;
             bool graceful;
             hadc_member_t members[HADC_MEMBERS_MAX];
+            char self_id[HADC_NODE_ID_MAX];
+            uint8_t peer_alive[HADC_MEMBERS_MAX]; /* feeds the seen-nodes bitmap */
+            int udp_fd;
         } snap;
 
         /* sleep first, on the current cadence (re-read every tick) */
@@ -398,27 +458,42 @@ static void *hb_thread_main(void *arg)
         snap.port = ctx->conf.cluster.port;
         snap.n_members = (uint8_t)ctx->conf.n_members;
         memcpy(snap.members, ctx->conf.members, sizeof(snap.members));
+        snprintf(snap.self_id, sizeof(snap.self_id), "%s", ctx->conf.self);
+        for (size_t i = 0; i < HADC_MEMBERS_MAX; i++)
+            snap.peer_alive[i] = ctx->peers[i].alive ? 1 : 0;
+        snap.udp_fd = ctx->udp_fd;
         pthread_mutex_unlock(&ctx->hb_lock);
         if (snap.cadence_ms == 0) /* hot-reload can zero the cadence: idle ticks */
             continue;
 
-        uint8_t hb[HADC_WIRE_HB_LEN];
+        uint8_t hb[32];
         memset(hb, 0, sizeof(hb));
         hb[1] = snap.self_idx;
         hb[2] = snap.master_idx;
         hb[3] = snap.role;
         put_be(hb + 4, snap.lease_version, 8);
         put_be(hb + 12, (uint64_t)realtime_ms() & 0xffffffffu, 4);
+        uint64_t bits = snap.self_idx < HADC_MEMBERS_MAX ? (1ULL << snap.self_idx) : 0;
+        for (uint8_t i = 0; i < snap.n_members; i++)
+            if (snap.peer_alive[i])
+                bits |= 1ULL << i;
+        size_t blen = (snap.n_members + 7) / 8;
+        if (!blen)
+            blen = 1;
+        for (size_t j = 0; j < blen; j++)
+            hb[HADC_WIRE_HB_LEN + j] = (uint8_t)(bits >> (8 * j));
+        size_t hlen = HADC_WIRE_HB_LEN + blen;
 
         uint64_t now_ms = (uint64_t)realtime_ms();
         for (uint8_t i = 0; i < snap.n_members; i++) {
             const hadc_member_t *m = &snap.members[i];
-            if (!strcmp(m->id, ctx->conf.self))
+            if (!strcmp(m->id, snap.self_id))
                 continue;
             struct sockaddr_in to = { .sin_family = AF_INET,
                                       .sin_port = htons(snap.port),
                                       .sin_addr = m->sync_address };
-            if (send_bytes(ctx, &to, hb, sizeof(hb)) != 0)
+            if (snap.udp_fd >= 0 &&
+                sendto(snap.udp_fd, hb, hlen, 0, (const struct sockaddr *)&to, sizeof(to)) < 0)
                 hadc_warn("cluster: send heartbeat to %s failed", m->id);
         }
 
@@ -640,6 +715,7 @@ static void load_msg_fields(hadc_ctx_t *ctx, json_t *m, hadc_msg_t *out)
 
 static void peer_touch(hadc_ctx_t *ctx, const char *id)
 {
+    HB_LOCK(ctx); /* the hb thread snapshots peer liveness for the seen bitmap */
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         if (!strcmp(ctx->conf.members[i].id, id)) {
             ctx->peers[i].alive = true;
@@ -647,9 +723,11 @@ static void peer_touch(hadc_ctx_t *ctx, const char *id)
             snprintf(ctx->peers[i].id, HADC_NODE_ID_MAX, "%s", id);
             ctx->peers[i].sync_address = ctx->conf.members[i].sync_address;
             ctx->n_peers = ctx->conf.n_members;
+            HB_UNLOCK(ctx);
             return;
         }
     }
+    HB_UNLOCK(ctx);
 }
 
 /* ---- shared-config sync (plan §6): the master's copy is authoritative ---- */
@@ -757,10 +835,10 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
             self = &ctx->conf.members[i];
     if (!self) {
         if (ctx->conf.n_members == 0) {
-            if (ctx->udp_fd >= 0) {
-                hadc_loop_del(ctx, ctx->udp_fd);
-                close(ctx->udp_fd);
-                ctx->udp_fd = -1;
+            int old = udp_fd_swap(ctx, -1);
+            if (old >= 0) {
+                hadc_loop_del(ctx, old);
+                close(old);
             }
             memset(&g_bound, 0, sizeof(g_bound));
             return 0;
@@ -772,28 +850,28 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
         memcmp(&g_bound.sin_addr, &self->sync_address, sizeof(self->sync_address)) == 0)
         return 0;
 
-    if (ctx->udp_fd >= 0) {
-        hadc_loop_del(ctx, ctx->udp_fd);
-        close(ctx->udp_fd);
-        ctx->udp_fd = -1;
+    int old = udp_fd_swap(ctx, -1);
+    if (old >= 0) {
+        hadc_loop_del(ctx, old);
+        close(old);
     }
-    ctx->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx->udp_fd < 0) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
         hadc_err("cluster: socket: %s", strerror(errno));
         return -1;
     }
     struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(ctx->conf.cluster.port),
                                 .sin_addr = self->sync_address };
-    if (bind(ctx->udp_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         char abuf[INET_ADDRSTRLEN];
         hadc_err("cluster: bind %s:%u: %s", hadc_ipv4_format(addr.sin_addr, abuf, sizeof(abuf)),
                  (unsigned)ctx->conf.cluster.port, strerror(errno));
-        close(ctx->udp_fd);
-        ctx->udp_fd = -1;
+        close(fd);
         return -1;
     }
-    fcntl(ctx->udp_fd, F_SETFL, O_NONBLOCK);
-    hadc_loop_add(ctx, ctx->udp_fd, udp_ready, 0);
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    udp_fd_swap(ctx, fd);
+    hadc_loop_add(ctx, fd, udp_ready, 0);
     g_bound = addr;
     {
         char abuf[INET_ADDRSTRLEN];
@@ -876,6 +954,13 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     if (p && msg.ts_ms != 0 && strcmp(msg.origin, ctx->conf.self))
         p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
 
+    /* seen-nodes bitmap (heartbeats only): the sender's own heard-members view,
+     * used by the quorum closure check; legacy bitmap-less frames stay unknown */
+    if (p && msg.seen_bits_known && strcmp(msg.origin, ctx->conf.self)) {
+        p->seen_bits = msg.seen_bits;
+        p->seen_known = true;
+    }
+
     /* Binary heartbeats have no room for graceful_restart_until_ms; only adopt
      * from JSON messages that carry the field explicitly. */
     if (m && msg.graceful_restart_until_ms != ctx->graceful_restart_until_ms &&
@@ -925,7 +1010,9 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                     (ctx->conf.cluster.preempt && om &&
                      (!cur || beats(om, cur->id, cur->priority)));
                 if (om && take) {
+                    HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
                     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", om->id);
+                    HB_UNLOCK(ctx);
                     ctx->takeover_from[0] = '\0';
                     set_role(ctx, HADC_ROLE_SLAVE);
                     hadc_info("cluster: following master %s (was %s)", om->id,
@@ -1022,9 +1109,11 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             if (!accept && claim && winner && !strcmp(winner->id, claim->id))
                 accept = ctx->conf.cluster.preempt || !master_is_alive(ctx, ctx->conf.designated_master);
             if (!accept && claim && winner && !strcmp(winner->id, claim->id))
-                /* During the brief post-handoff election cooldown, accept the
+                /* During the brief post-demote election cooldown, accept the
                    election winner (aged) even when preempt is off, so the
-                   handoff converges. Any other claim is still rejected. */
+                   demote settles cluster-wide. Any other claim is still
+                   rejected. (Handoff arms only g_handoff_until_ms, which gates
+                   this node's own preempt/election, not this accept path.) */
                 accept = (ctx->role == HADC_ROLE_SLAVE) &&
                     (uint64_t)hadc_now_ms() < g_no_elect_until_ms;
 
@@ -1035,7 +1124,9 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
             } else {
                 bool handoff = authority && strcmp(msg.origin, ctx->conf.self) != 0 &&
                                strcmp(msg.new_master, msg.origin) != 0;
+                HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
                 snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", msg.new_master);
+                HB_UNLOCK(ctx);
                 if (handoff)
                     g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000;
                 /* Seamless takeover: when we are being promoted by another live
@@ -1169,6 +1260,7 @@ static void age_peers(hadc_ctx_t *ctx)
 
     if (deadline == 0)
         deadline = 6000;
+    HB_LOCK(ctx); /* the hb thread snapshots peer liveness for the seen bitmap */
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         hadc_peer_t *p = &ctx->peers[i];
         if (p->last_seen_ms == 0) {
@@ -1177,6 +1269,7 @@ static void age_peers(hadc_ctx_t *ctx)
         }
         p->alive = now - p->last_seen_ms <= deadline;
     }
+    HB_UNLOCK(ctx);
 }
 
 static size_t alive_members(hadc_ctx_t *ctx)
@@ -1209,6 +1302,33 @@ static bool beats(const hadc_member_t *a, const char *b_id, int b_prio)
 {
     return a->priority > b_prio ||
         (a->priority == b_prio && strcmp(a->id, b_id) < 0);
+}
+
+/* Quorum closure via the heartbeat seen-nodes bitmap: a direct-view majority
+ * (ourselves plus the peers we hear) is only safe when the view is provably
+ * closed — every member we hear must report a seen set that is a subset of our
+ * own. A heard peer that reports seeing nodes we cannot see means a shared
+ * witness: the same node can sit in two "majorities", so another side may hold
+ * the role and promotion must not fire. A heard peer with no reported bitmap
+ * (legacy sender) makes the closure unprovable and blocks promotion. */
+static bool quorum_closure_ok(hadc_ctx_t *ctx)
+{
+    int self_idx = member_index(ctx, ctx->conf.self);
+    uint64_t view = self_idx >= 0 ? (1ULL << (uint64_t)self_idx) : 0;
+    for (size_t i = 0; i < ctx->conf.n_members; i++)
+        if (ctx->peers[i].alive)
+            view |= 1ULL << (uint64_t)i;
+    if (__builtin_popcountll(view) * 2 <= (int)ctx->conf.n_members)
+        return false; /* not a majority of the full membership */
+    for (size_t i = 0; i < ctx->conf.n_members; i++) {
+        if (i == (size_t)self_idx || !(view & (1ULL << (uint64_t)i)))
+            continue; /* our own view is the baseline; unseen peers cannot vote */
+        if (!ctx->peers[i].seen_known)
+            return false; /* mixed-version sender: closure unprovable */
+        if (ctx->peers[i].seen_bits & ~view)
+            return false; /* heard peer sees someone we do not: shared witness */
+    }
+    return true;
 }
 
 /* The member that should be master under plan §4, among the members we
@@ -1284,16 +1404,26 @@ static void failover_check(hadc_ctx_t *ctx)
     if (!master_dead)
         return;
 
-    if (ctx->conf.cluster.quorum == HADC_QUORUM_MAJORITY &&
-        alive_members(ctx) * 2 <= ctx->conf.n_members) {
-        if (now - last_alarm_ms >= deadline) {
-            last_alarm_ms = now;
-            hadc_warn("ALARM: master %s is down but only %zu/%zu members are alive; "
-                      "no quorum, not promoting",
-                      ctx->conf.designated_master, alive_members(ctx),
-                      ctx->conf.n_members);
+    if (ctx->conf.cluster.quorum == HADC_QUORUM_MAJORITY) {
+        if (alive_members(ctx) * 2 <= ctx->conf.n_members) {
+            if (now - last_alarm_ms >= deadline) {
+                last_alarm_ms = now;
+                hadc_warn("ALARM: master %s is down but only %zu/%zu members are alive; "
+                          "no quorum, not promoting",
+                          ctx->conf.designated_master, alive_members(ctx),
+                          ctx->conf.n_members);
+            }
+            return;
         }
-        return;
+        if (!quorum_closure_ok(ctx)) {
+            /* majority that is not a closed view is a shared-witness partition:
+             * the node we share with another group can make both sides a
+             * "majority", so a second master would not be settled by us alone */
+            log_refusal_once(HADC_LOG_INFO,
+                             "cluster: failover deferred: majority view not closed (a heard peer "
+                             "reports nodes we do not see); shared-witness partition, not promoting");
+            return;
+        }
     }
 
     winner = best_alive(ctx, true);
@@ -1589,7 +1719,9 @@ int hadc_cluster_startup_gate(hadc_ctx_t *ctx)
             self = &ctx->conf.members[i];
     if (!c || !self || !beats(c, ctx->conf.self, ctx->conf.priority))
         return 0;
+    HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
     snprintf(ctx->conf.designated_master, sizeof(ctx->conf.designated_master), "%s", c->id);
+    HB_UNLOCK(ctx);
     set_role(ctx, HADC_ROLE_SLAVE);
     hadc_info("startup: live master %s outranks us (%d > %d); following it instead of "
               "resuming master", c->id, c->priority, ctx->conf.priority);
@@ -1658,7 +1790,9 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         log_refusal_once(HADC_LOG_WARN, m);
         return -1;
     }
+    HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", target);
+    HB_UNLOCK(ctx);
     if (handoff) {
         if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) {
             /* Controlled handoff: keep public IP/routing and forwarding briefly so
@@ -1670,9 +1804,9 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
         }
         /* An operator handoff to a lower-ranked member must not be immediately
            undone by this node's own preempt/election; the authority push below
-           carries it cluster-wide. Failover (a dead master) is never suppressed. */
-        g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
-        g_handoff_until_ms = g_no_elect_until_ms;
+           carries it cluster-wide. Failover (a dead master) is never suppressed,
+           so only the handoff cooldown (preempt/election) is armed here. */
+        g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000;
     } else {
         /* self-promote: enter PROMOTING; cb_role_change will complete and flip to MASTER
          * only after dataplane+VIP+GARP are ready so heartbeats announce readiness. */
@@ -1706,12 +1840,16 @@ int hadc_cluster_demote(hadc_ctx_t *ctx)
     age_peers(ctx);
     const hadc_member_t *best = best_alive(ctx, false);
     if (best) {
+        HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
         snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
+        HB_UNLOCK(ctx);
         /* enter DEMOTING: keep forwarding, defer egress block until new master ready */
         set_role(ctx, HADC_ROLE_DEMOTING);
         hadc_info("cluster: demoted; handing the master role to %s (hold for handoff)", best->id);
     } else {
+        HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
         ctx->conf.designated_master[0] = '\0';
+        HB_UNLOCK(ctx);
         set_role(ctx, HADC_ROLE_SLAVE);
         g_no_elect_until_ms = (uint64_t)hadc_now_ms() +
             (ctx->conf.cluster.election_deadline_ms ? ctx->conf.cluster.election_deadline_ms
@@ -1739,14 +1877,15 @@ int hadc_cluster_handoff(hadc_ctx_t *ctx)
     const hadc_member_t *best = best_alive(ctx, false);
     if (!best)
         return 0;
+    HB_LOCK(ctx); /* hb thread snapshots it for the wire under lock */
     snprintf(ctx->conf.designated_master, HADC_NODE_ID_MAX, "%s", best->id);
+    HB_UNLOCK(ctx);
     /* Controlled handoff: enter DEMOTING so a caller that keeps running (e.g.
      * a self-monitor demote) keeps forwarding for the hold window while the
      * new master takes over; shutdown callers exit right after this returns,
      * so for them only the role broadcast goes out. */
     set_role(ctx, HADC_ROLE_DEMOTING);
-    g_no_elect_until_ms = (uint64_t)hadc_now_ms() + 60000;
-    g_handoff_until_ms = g_no_elect_until_ms;
+    g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000; /* preempt/election only; failover stays live */
     hadc_info("cluster: handing the master role to %s before shutdown", best->id);
     propagate_role(ctx);
     hadc_persist_save(ctx);
@@ -1800,16 +1939,17 @@ int hadc_cluster_push_state(hadc_ctx_t *ctx, const hadc_lease_t *lease)
  * The window also records which live peers asserted themselves as master:
  * cluster_startup_claim() reports the highest-ranked one, so a node never
  * resumes the master role under a live, higher-ranked master. */
-static char g_startup_claim[HADC_NODE_ID_MAX];
+static char g_startup_claims[HADC_MEMBERS_MAX][HADC_NODE_ID_MAX];
+static size_t g_n_startup_claims;
 
 int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz)
 {
-    if (!g_startup_claim[0])
+    if (!g_n_startup_claims)
         return 0;
-    const hadc_member_t *best = member_by_id(ctx, g_startup_claim);
-    for (size_t i = 0; i < ctx->conf.n_members; i++) {
-        const hadc_member_t *m = &ctx->conf.members[i];
-        if (!strcmp(m->id, g_startup_claim) && (!best || beats(m, best->id, best->priority)))
+    const hadc_member_t *best = NULL;
+    for (size_t c = 0; c < g_n_startup_claims; c++) {
+        const hadc_member_t *m = member_by_id(ctx, g_startup_claims[c]);
+        if (m && (!best || beats(m, best->id, best->priority)))
             best = m;
     }
     if (!best)
@@ -1843,14 +1983,14 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
 
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         const hadc_member_t *m = &ctx->conf.members[i];
-        uint8_t hb[HADC_WIRE_HB_LEN];
+        uint8_t hb[32];
         if (!strcmp(m->id, ctx->conf.self))
             continue;
-        build_bin_heartbeat(ctx, hb);
+        size_t hlen = build_bin_heartbeat(ctx, hb);
         struct sockaddr_in to = { .sin_family = AF_INET,
                                    .sin_port = htons(ctx->conf.cluster.port),
                                    .sin_addr = m->sync_address };
-        send_bytes(ctx, &to, hb, sizeof(hb));
+        send_bytes(ctx, &to, hb, hlen);
     }
 
     hadc_info("timesync: listening %llums for cluster clocks", (unsigned long long)window);
@@ -1907,11 +2047,22 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
         seen[j].seen_ms = (uint64_t)hadc_now_ms();
     }
 
-    /* Record live master claims seen during the window (startup gate). */
-    for (size_t j = 0; j < n_seen; j++)
-        if (seen[j].claims_master && !g_startup_claim[0])
-            snprintf(g_startup_claim, sizeof(g_startup_claim), "%.*s",
-                     (int)sizeof(g_startup_claim) - 1, seen[j].id);
+    /* Record every live master claim seen during the window (startup gate);
+     * cluster_startup_claim picks the highest-ranked claimant, not just the
+     * first one seen. */
+    for (size_t j = 0; j < n_seen; j++) {
+        if (!seen[j].claims_master)
+            continue;
+        size_t c = 0;
+        for (; c < g_n_startup_claims; c++)
+            if (!strcmp(g_startup_claims[c], seen[j].id))
+                break;
+        if (c == g_n_startup_claims && g_n_startup_claims < HADC_MEMBERS_MAX)
+            g_n_startup_claims++;
+        if (c < g_n_startup_claims)
+            snprintf(g_startup_claims[c], sizeof(g_startup_claims[c]), "%.*s",
+                     (int)sizeof(g_startup_claims[c]) - 1, seen[j].id);
+    }
 
     if (n_seen == 0) {
         hadc_info("timesync: no cluster clocks seen, keeping ours");

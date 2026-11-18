@@ -97,6 +97,7 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
 {
     uint8_t buf[1024];
 
+    hadc_maint_lock(); /* ping globals are shared with the maintenance worker (tick) */
     for (;;) {
         ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n < 0) {
@@ -148,6 +149,7 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
         }
         validate_retained_lease(ctx);
     }
+    hadc_maint_unlock();
 }
 
 static void send_probe(hadc_ctx_t *ctx, uint64_t now)
@@ -181,17 +183,20 @@ static void send_probe(hadc_ctx_t *ctx, uint64_t now)
 
 void hadc_gwping_start(hadc_ctx_t *ctx)
 {
+    /* ping globals are shared with the main loop and the worker (tick,
+     * ping_ready); the mutex is recursive, so tick callers are safe */
+    hadc_maint_lock();
     if (g_fd >= 0)
-        return;
+        goto out;
     if (!ctx->conf.apply.gateway_probe)
-        return;
+        goto out;
     if (ctx->gwping_start_after_ms && (uint64_t)hadc_now_ms() < ctx->gwping_start_after_ms)
-        return; /* delayed to avoid probe traffic/mac flips during handoff */
+        goto out; /* delayed to avoid probe traffic/mac flips during handoff */
     g_interval_ms = ctx->conf.apply.gateway_probe_interval_ms;
     g_timeout_ms = ctx->conf.apply.gateway_probe_timeout_ms;
     g_fail_threshold = ctx->conf.apply.gateway_probe_fail_threshold;
     if (g_interval_ms == 0 || g_timeout_ms == 0 || g_fail_threshold == 0)
-        return;
+        goto out;
     g_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, IPPROTO_ICMP);
     if (g_fd >= 0) {
         /* The kernel demuxes echo replies by the socket's bound ident, so a
@@ -212,13 +217,13 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
     if (g_fd < 0) {
         hadc_warn("gwping: ICMP socket failed: %s (probe skipped)",
                   strerror(errno));
-        return;
+        goto out;
     }
     if (hadc_loop_add(ctx, g_fd, ping_ready, 0) != 0) {
         hadc_warn("gwping: probe fd could not be registered; skipped");
         close(g_fd);
         g_fd = -1;
-        return;
+        goto out;
     }
     /* Always probe over the local route to the gateway: the socket follows the
        default route otherwise, and once the failover moves that default to the
@@ -236,12 +241,17 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
     g_last_send_ms = 0; /* the next tick sends the first probe at once */
     hadc_info("gwping: gateway probe active (every %ums, timeout %ums, failover after %u failures)",
               g_interval_ms, g_timeout_ms, g_fail_threshold);
+out:
+    hadc_maint_unlock();
 }
 
 void hadc_gwping_stop(hadc_ctx_t *ctx)
 {
-    if (g_fd < 0)
+    hadc_maint_lock(); /* ping globals are shared with the main loop and the worker */
+    if (g_fd < 0) {
+        hadc_maint_unlock();
         return;
+    }
     hadc_dbg("gwping: gateway probe stopped");
     hadc_loop_del(ctx, g_fd);
     close(g_fd);
@@ -253,14 +263,17 @@ void hadc_gwping_stop(hadc_ctx_t *ctx)
     g_failures = 0;
     g_unreachable_since_ms = 0;
     g_last_discover_ms = 0;
+    hadc_maint_unlock();
 }
 
 void hadc_gwping_tick(hadc_ctx_t *ctx)
 {
+    hadc_maint_lock(); /* serializes ping globals with the main loop (ping_ready); recursive */
     if (ctx->role != HADC_ROLE_MASTER) {
         ctx->gwping_start_after_ms = 0;
         if (g_fd >= 0)
             hadc_gwping_stop(ctx);
+        hadc_maint_unlock();
         return;
     }
     if (g_fd < 0) {
@@ -271,6 +284,7 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
             if (due)
                 hadc_info("gwping: delayed probe start reached");
         }
+        hadc_maint_unlock();
         return;
     }
     uint64_t now = (uint64_t)hadc_now_ms();
@@ -309,6 +323,7 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
     if (ctx->lease.gateway.s_addr && !g_awaiting &&
         now - g_last_send_ms >= g_interval_ms)
         send_probe(ctx, now);
+    hadc_maint_unlock();
 }
 
 bool hadc_gwping_unreachable(void)

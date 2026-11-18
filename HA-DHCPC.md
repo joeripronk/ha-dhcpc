@@ -157,10 +157,15 @@ Components:
 - **Heartbeat** (default every 2 s, bidirectional): a compact binary frame sized
   for the minimum Ethernet frame (~62 bytes on the wire; layout in
   `src/cluster.c`): message type, node id, master id and own role
-  (master/slave), lease-state version (monotonic), sender wall clock. Members
-  are referenced by index into the shared config; the lease summary is not
-  carried (state pushes carry it). All other message types stay canonical JSON.
-  Node identity for sync is the configured id — never the (shared) MAC.
+  (master/slave), lease-state version (monotonic), sender wall clock, and a
+  seen-nodes bitmap (1 byte covers members 0..7, a second byte extends the view
+  to 8..15): bit i set means the sender heard member i — including itself —
+  within its own deadline. Members are referenced by index into the shared
+  config; the lease summary is not carried (state pushes carry it). All other
+  message types stay canonical JSON. Node identity for sync is the configured
+  id — never the (shared) MAC. Bitmap-less frames from mixed-version senders are
+  accepted as unknown during an upgrade; run upgrade deploys inside the
+  graceful-restart window.
 - **State push:** master pushes on every lease change (new ACK, renew, rebind,
   server change, retention entry/exit). Slaves confirm with an **apply-ack**
   (applied version + config hash) so cluster status is observable.
@@ -169,10 +174,15 @@ Components:
 - **Role assignment — automatic:** a heartbeat older than
   `election_deadline_ms` marks the designated master dead. If quorum is satisfied
   (`majority` default; `none` allows a lone survivor), the highest-priority live
-  member (ties by node id) promotes itself. `default_role` still governs the
-  no-master bootstrap, and `ctl promote/demote` overrides everything. Dual-master
-  is settled by comparing `(priority, id)` on heartbeats and propagating the
-  winner; a demote issued anywhere also settles it cluster-wide.
+  member (ties by node id) promotes itself. For `majority`, the view must also be
+  *closed*: every member the node hears must report a seen-nodes bitmap that is a
+  subset of the node's own view. A heard peer that reports seeing nodes the
+  promoters cannot see is a shared witness — the same node can make two groups
+  "majorities" — so promotion does not fire there and the existing master keeps
+  serving. `default_role` still governs the no-master bootstrap, and
+  `ctl promote/demote` overrides everything. Dual-master is settled by comparing
+  `(priority, id)` on heartbeats and propagating the winner; a demote issued
+  anywhere also settles it cluster-wide.
 - **Election guards & preemption (`cluster.preempt`, default on):** election only
   fires when no live peer already asserts master (a live claimant is followed
   instead), and every election announces its winner cluster-wide via the normal

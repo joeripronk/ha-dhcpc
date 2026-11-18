@@ -61,6 +61,10 @@ typedef struct {
     char role[16];                       /* sender's own role: master|slave|unknown */
     uint64_t graceful_restart_until_ms;  /* global no-master-switch deadline (realtime ms) */
     bool steered;                        /* takeover_ack only: the acking node has its steering routes installed */
+    /* heartbeat only: sender's seen-nodes view (bit i = it heard member i,
+     * including itself); seen_bits_known false when the frame carried none */
+    uint64_t seen_bits;
+    bool seen_bits_known;
 } hadc_msg_t;
 
 /* Per-member view held by every node (fed by heartbeats/acks). */
@@ -74,6 +78,8 @@ typedef struct {
     int64_t clock_offset_ms;      /* peer CLOCK_REALTIME - ours, last heartbeat; 0 = unobserved */
     char master_view[HADC_NODE_ID_MAX]; /* peer's master_id from its last heartbeat */
     char role_view[16];           /* peer's self-reported role from its last heartbeat */
+    uint64_t seen_bits;           /* last heartbeat bitmap: bit i = sender heard member i */
+    bool seen_known;              /* the bitmap was carried (legacy 16-byte frames: false) */
     bool alive;
 } hadc_peer_t;
 
