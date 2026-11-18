@@ -20,16 +20,18 @@ run() {
 	if [ "$APPLY" = 1 ]; then sh -c "$1"; else echo "DRY-RUN: $1"; fi
 }
 
-if [ "$(id -u)" -ne 0 ]; then
-	exec sudo -- "$0" "$@"
-fi
-
 for f in ha-dhcpc.conf "$UNIT"; do
 	[ -f "$SRC_DIR/$f" ] || { echo "missing $SRC_DIR/$f" >&2; exit 1; }
 done
 
+# Build as the invoking user so tree artifacts stay user-owned (the OpenWrt
+# SDK build copies this tree and cannot read root-only files).
 make -C "$REPO_DIR" -s
 make -C "$REPO_DIR" -s test
+
+if [ "$(id -u)" -ne 0 ]; then
+	exec sudo -- "$0" "$@"
+fi
 
 changed=0
 for f in ha-dhcpc.conf; do

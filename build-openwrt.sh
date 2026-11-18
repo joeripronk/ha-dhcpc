@@ -34,6 +34,7 @@ if ! grep -q '^CONFIG_PACKAGE_ha-dhcpc=' "$SDK/.config"; then
 	echo "CONFIG_PACKAGE_ha-dhcpc=m" >> "$SDK/.config"
 	(cd "$SDK" && umask 022 && make defconfig > /dev/null)
 fi
+find "$SDK/bin/packages" \( -name 'ha-dhcpc*.apk' -o -name 'ha-dhcpc*.ipk' \) -delete -print
 
 # Force re-prepare so the current source tree is always what gets built.
 rm -rf "$SDK"/build_dir/target-*/ha-dhcpc-* \
