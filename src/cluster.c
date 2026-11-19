@@ -64,7 +64,6 @@ static const hadc_member_t *election_winner(hadc_ctx_t *ctx);
 int cluster_startup_claim(hadc_ctx_t *ctx, char *out, size_t outsz);
 static bool master_is_alive(hadc_ctx_t *ctx, const char *id);
 static void age_peers(hadc_ctx_t *ctx);
-static uint64_t realtime_ms(void);
 static int send_json(hadc_ctx_t *ctx, const struct sockaddr_in *to, json_t *msg);
 static void log_refusal_once(hadc_log_level_t level, const char *msg);
 static bool quorum_closure_ok(hadc_ctx_t *ctx);
@@ -123,7 +122,7 @@ bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
 {
     if (!ctx || ctx->graceful_restart_until_ms == 0)
         return false;
-    uint64_t now = realtime_ms();
+    uint64_t now = hadc_realtime_ms();
     if (now >= ctx->graceful_restart_until_ms) {
         /* expired: clear lazily */
         HB_LOCK(ctx);
@@ -150,7 +149,7 @@ void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx)
         if (!msg)
             continue;
         json_object_set_new(msg, "conf_sha256", json_string(ctx->conf.sha256));
-        json_object_set_new(msg, "ts_ms", json_integer((json_int_t)realtime_ms()));
+        json_object_set_new(msg, "ts_ms", json_integer((json_int_t)hadc_realtime_ms()));
         json_object_set_new(msg, "role", json_string(hadc_role_name(ctx->role)));
         struct sockaddr_in to = { .sin_family = AF_INET,
                                   .sin_port = htons(ctx->conf.cluster.port),
@@ -180,7 +179,7 @@ int hadc_cluster_set_graceful_restart(hadc_ctx_t *ctx, bool enable)
 {
     uint64_t until = 0;
     if (enable)
-        until = realtime_ms() + HADC_GRACEFUL_WINDOW_MS;
+        until = hadc_realtime_ms() + HADC_GRACEFUL_WINDOW_MS;
     if (until == ctx->graceful_restart_until_ms && enable == hadc_cluster_graceful_active(ctx))
         return 0;
     HB_LOCK(ctx);
@@ -222,7 +221,7 @@ static uint64_t get_be(const uint8_t *p, size_t n)
  * wrap does not turn the timestamp into garbage. */
 static uint64_t unwrap_ms(uint32_t low32)
 {
-    uint64_t now = realtime_ms();
+    uint64_t now = hadc_realtime_ms();
     int32_t delta = (int32_t)(uint32_t)(low32 - (uint32_t)now);
     return (uint64_t)((int64_t)now + delta);
 }
@@ -273,7 +272,7 @@ static size_t build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
     out[2] = (uint8_t)member_index(ctx, ctx->conf.designated_master);
     out[3] = role_wire(ctx->role);
     put_be(out + 4, ctx->lease.version, 8);
-    put_be(out + 12, realtime_ms() & 0xffffffffu, 4);
+    put_be(out + 12, hadc_realtime_ms() & 0xffffffffu, 4);
     uint64_t bits = hb_seen_bits(ctx);
     for (size_t j = 0; j < blen; j++)
         out[HADC_WIRE_HB_LEN + j] = (uint8_t)(bits >> (8 * j));
@@ -315,15 +314,6 @@ static int decode_bin_heartbeat(const hadc_ctx_t *ctx, const uint8_t *p, size_t 
                 out->seen_bits |= 1ULL << i;
     }
     return 0;
-}
-
-/* CLOCK_REALTIME ms — the clock messages timestamp (heartbeats carry it so a
- * starting node can sync and peers can spot drift; timers stay monotonic). */
-static uint64_t realtime_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
 /* Step the clock during startup timesync / alarm at runtime when a peer's
@@ -453,7 +443,7 @@ static void *hb_thread_main(void *arg)
         snap.master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
         snap.self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
         snap.graceful = (ctx->graceful_restart_until_ms != 0 &&
-                          realtime_ms() < ctx->graceful_restart_until_ms);
+                          (uint64_t)hadc_realtime_ms() < ctx->graceful_restart_until_ms);
         snap.cadence_ms = ctx->conf.cluster.heartbeat_ms;
         snap.gap_ms = ctx->conf.cluster.self_demote_gap_ms;
         snap.port = ctx->conf.cluster.port;
@@ -473,7 +463,7 @@ static void *hb_thread_main(void *arg)
         hb[2] = snap.master_idx;
         hb[3] = snap.role;
         put_be(hb + 4, snap.lease_version, 8);
-        put_be(hb + 12, (uint64_t)realtime_ms() & 0xffffffffu, 4);
+        put_be(hb + 12, (uint64_t)hadc_realtime_ms() & 0xffffffffu, 4);
         uint64_t bits = snap.self_idx < HADC_MEMBERS_MAX ? (1ULL << snap.self_idx) : 0;
         for (uint8_t i = 0; i < snap.n_members; i++)
             if (snap.peer_alive[i])
@@ -485,7 +475,7 @@ static void *hb_thread_main(void *arg)
             hb[HADC_WIRE_HB_LEN + j] = (uint8_t)(bits >> (8 * j));
         size_t hlen = HADC_WIRE_HB_LEN + blen;
 
-        uint64_t now_ms = (uint64_t)realtime_ms();
+        uint64_t now_ms = (uint64_t)hadc_realtime_ms();
         for (uint8_t i = 0; i < snap.n_members; i++) {
             const hadc_member_t *m = &snap.members[i];
             if (!strcmp(m->id, snap.self_id))
@@ -527,7 +517,7 @@ void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx)
         ;
     pthread_mutex_lock(&ctx->hb_lock);
     bool gactive = (ctx->graceful_restart_until_ms != 0 &&
-                    realtime_ms() < ctx->graceful_restart_until_ms);
+                    (uint64_t)hadc_realtime_ms() < ctx->graceful_restart_until_ms);
     bool fire = ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && ctx->conf.n_members >= 2 && !gactive);
     pthread_mutex_unlock(&ctx->hb_lock);
     if (fire) {
@@ -671,7 +661,7 @@ static json_t *build_msg(hadc_ctx_t *ctx, const char *type, int with_lease)
     /* every message carries our shared-document digest so a member can spot a
      * stale copy (plan §6) */
     json_object_set_new(m, "conf_sha256", json_string(ctx->conf.sha256));
-    json_object_set_new(m, "ts_ms", json_integer((json_int_t)realtime_ms()));
+    json_object_set_new(m, "ts_ms", json_integer((json_int_t)hadc_realtime_ms()));
     json_object_set_new(m, "graceful_restart_until_ms",
                         json_integer((json_int_t)ctx->graceful_restart_until_ms));
     json_object_set_new(m, "vip_neighbors", vip_neighs_json(ctx));
@@ -953,7 +943,7 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
     /* timestamps: every message carries the sender's CLOCK_REALTIME ms; keep
      * the observed offset per peer (startup timesync + drift alarm below) */
     if (p && msg.ts_ms != 0 && strcmp(msg.origin, ctx->conf.self))
-        p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
+        p->clock_offset_ms = (int64_t)msg.ts_ms - (int64_t)hadc_realtime_ms();
 
     /* seen-nodes bitmap (heartbeats only): the sender's own heard-members view,
      * used by the quorum closure check; legacy bitmap-less frames stay unknown */
@@ -1380,8 +1370,7 @@ static const hadc_member_t *best_alive(hadc_ctx_t *ctx, bool include_self)
 
         if (!alive)
             continue;
-        if (!best || m->priority > best->priority ||
-            (m->priority == best->priority && strcmp(m->id, best->id) < 0))
+        if (!best || beats(m, best->id, best->priority))
             best = m;
     }
     return best;
@@ -1663,8 +1652,7 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
         p = peer_entry(ctx, m->id);
         if (!p || !p->alive)
             continue; /* not visible: cannot vote in its absence */
-        if (m->priority > wprio ||
-            (m->priority == wprio && strcmp(m->id, winner) < 0)) {
+        if (beats(m, winner, wprio)) {
             wprio = m->priority;
             winner = m->id;
         }
@@ -2052,7 +2040,7 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
                      "ignored", msg.origin, (unsigned long long)msg.ts_ms);
             continue;
         }
-        int64_t offset = (int64_t)msg.ts_ms - (int64_t)realtime_ms();
+        int64_t offset = (int64_t)msg.ts_ms - (int64_t)hadc_realtime_ms();
         size_t j = 0;
         for (; j < n_seen; j++)
             if (!strcmp(seen[j].id, msg.origin))
@@ -2120,7 +2108,7 @@ int hadc_cluster_timesync(hadc_ctx_t *ctx)
         return 0;
     }
 
-    uint64_t target = realtime_ms() + (uint64_t)offset;
+    uint64_t target = hadc_realtime_ms() + (uint64_t)offset;
     struct timespec ts = {
         .tv_sec = (time_t)(target / 1000),
         .tv_nsec = (long)(target % 1000) * 1000000,

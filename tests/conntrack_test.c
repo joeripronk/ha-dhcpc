@@ -125,7 +125,7 @@ static void test_shadow_stage_prune_and_compact(void) {
     TASSERT(ct.n_shadow == 1 && ct.shadow[0].valid, "restage after compact");
     stage_or_apply(&ct, &e, true);
     TASSERT(ct.n_shadow == 1 && !ct.shadow[0].valid, "delete marks invalid");
-    prune_shadow(&ct, now_ms());
+    prune_shadow(&ct, (uint64_t)hadc_now_ms());
     TASSERT(ct.n_shadow == 0, "delete compacted");
 }
 

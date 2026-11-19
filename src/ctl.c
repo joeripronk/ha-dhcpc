@@ -27,24 +27,13 @@
 #include "ha-dhcpc/routing.h"
 #include "internal.h"
 
-static const char *role_name(hadc_role_t r)
-{
-    switch (r) {
-    case HADC_ROLE_MASTER:    return "master";
-    case HADC_ROLE_SLAVE:     return "slave";
-    case HADC_ROLE_PROMOTING: return "promoting";
-    case HADC_ROLE_DEMOTING:  return "demoting";
-    default:                  return "unknown";
-    }
-}
-
 static char g_ctl_path[HADC_PATH_MAX]; /* where ctl_fd is bound (rebind check) */
 
 static json_t *status_object(hadc_ctx_t *ctx)
 {
     bool gr_active = hadc_cluster_graceful_active(ctx);
     json_t *o = json_pack(
-        "{s:s, s:s, s:s, s:I, s:b, s:s, s:o}", "role", role_name(ctx->role), "self",
+        "{s:s, s:s, s:s, s:I, s:b, s:s, s:o}", "role", hadc_role_name(ctx->role), "self",
         ctx->conf.self, "master", ctx->conf.designated_master, "lease_version",
         (json_int_t)ctx->lease.version, "retention", (int)ctx->lease.retention_active,
         "conf_sha256", ctx->conf.sha256, "timers",
@@ -217,7 +206,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
          * re-read it from disk, apply it here, then publish it to every member. */
         if (ctx->role != HADC_ROLE_MASTER) {
             hadc_warn("ctl: update refused here (role %s); only the master publishes",
-                      role_name(ctx->role));
+                      hadc_role_name(ctx->role));
             reply = "{\"ok\":false,\"error\":\"not master\"}";
         } else if (hadc_conf_reload(ctx, "ctl_update") != 0) {
             reply = "{\"ok\":false,\"error\":\"reload failed; config in use unchanged\"}";
@@ -232,7 +221,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
     } else if (!strcmp(cmd, "renew")) {
         if (ctx->role != HADC_ROLE_MASTER) {
             hadc_warn("ctl: renew refused here (role %s); only the master speaks DHCP",
-                      role_name(ctx->role));
+                      hadc_role_name(ctx->role));
             reply = "{\"ok\":false,\"error\":\"not master\"}";
         } else if (hadc_dhcpcore_force_renew(ctx) != 0) {
             /* Stale lease: nothing to renew — fall back to a fresh lease
@@ -248,7 +237,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
     } else if (!strcmp(cmd, "newip")) {
         if (ctx->role != HADC_ROLE_MASTER) {
             hadc_warn("ctl: newip refused here (role %s); only the master speaks DHCP",
-                      role_name(ctx->role));
+                      hadc_role_name(ctx->role));
             reply = "{\"ok\":false,\"error\":\"not master\"}";
         } else if (hadc_dhcpcore_force_discover(ctx) != 0) {
             reply = "{\"ok\":false,\"error\":\"newip failed\"}";
@@ -266,7 +255,7 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
     } else if (!strcmp(cmd, "graceful-restart")) {
         if (ctx->role != HADC_ROLE_MASTER) {
             hadc_warn("ctl: graceful-restart refused here (role %s); only the master sets it",
-                      role_name(ctx->role));
+                      hadc_role_name(ctx->role));
             reply = "{\"ok\":false,\"error\":\"not master\"}";
         } else if (!strcmp(arg, "enable") || !strcmp(arg, "on")) {
             hadc_cluster_set_graceful_restart(ctx, true);

@@ -21,6 +21,7 @@
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/routing.h"
+#include "ha-dhcpc/util.h"
 #include "internal.h"
 
 /* magic + pid + per-probe seq + padding, so stray echo replies cannot be
@@ -45,20 +46,6 @@ static uint64_t g_last_discover_ms;
 static uint32_t g_interval_ms = 10000;
 static uint32_t g_timeout_ms = 2000;
 static unsigned g_fail_threshold = 3;
-
-static uint16_t icmp_checksum(const void *data, size_t len)
-{
-    const uint8_t *p = data;
-    uint32_t sum = 0;
-
-    for (size_t i = 0; i < len - 1; i += 2)
-        sum += (uint32_t)(p[i] << 8) + p[i + 1];
-    if (len & 1)
-        sum += (uint32_t)p[len - 1] << 8;
-    while (sum >> 16)
-        sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16_t)~sum;
-}
 
 /* The probe verdict drives the master default-route failover
  * (apply.master_backup_gateway), so a verdict change is acted on at once
@@ -168,7 +155,7 @@ static void send_probe(hadc_ctx_t *ctx, uint64_t now)
     memcpy(buf + sizeof(*icmp) + sizeof(g_token), &pid, sizeof(pid));
     memcpy(buf + sizeof(*icmp) + sizeof(g_token) + 4, &seq, sizeof(seq));
     if (g_raw)
-        icmp->checksum = htons(icmp_checksum(buf, sizeof(buf)));
+        icmp->checksum = htons(hadc_checksum_net(buf, sizeof(buf)));
     if (sendto(g_fd, buf, sizeof(buf), MSG_DONTWAIT,
                (struct sockaddr *)&to, sizeof(to)) < 0) {
         char gwbuf[INET_ADDRSTRLEN];

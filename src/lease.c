@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "ha-dhcpc/lease.h"
+#include "ha-dhcpc/util.h"
 
 uint32_t hadc_lease_remaining_one(long long at_utc, long long now_utc)
 {
@@ -79,8 +80,7 @@ json_t *hadc_lease_to_json(const hadc_lease_t *l)
     if (!dns)
         return NULL;
 
-    for (size_t i = 0; i < 32; i++)
-        sprintf(hex + 2 * i, "%02x", l->config_hash[i]);
+    hadc_hex_encode(l->config_hash, sizeof(l->config_hash), hex, sizeof(hex));
     for (size_t i = 0; i < l->n_dns; i++) {
         char buf[64];
         json_array_append_new(dns, json_string(inet_ntop(AF_INET, &l->dns[i], buf, sizeof(buf))));
@@ -103,8 +103,7 @@ json_t *hadc_lease_to_json(const hadc_lease_t *l)
     lease_put_addr(o, "server_id", l->server_id);
     if (l->gw_mac_valid) {
         char mac[2 * HADC_MAC_LEN + 1];
-        for (size_t i = 0; i < HADC_MAC_LEN; i++)
-            sprintf(mac + 2 * i, "%02x", l->gw_mac[i]);
+        hadc_hex_encode(l->gw_mac, HADC_MAC_LEN, mac, sizeof(mac));
         json_object_set_new(o, "gw_mac", json_string(mac));
     }
     return o;

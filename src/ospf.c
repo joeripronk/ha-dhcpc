@@ -21,6 +21,7 @@
 
 #include "ha-dhcpc/log.h"
 #include "ha-dhcpc/ipv4.h"
+#include "ha-dhcpc/util.h"
 #include "internal.h"
 #include <jansson.h>
 #include "ospf.h"
@@ -180,16 +181,6 @@ static ospf_state_t g_ospf;
 #define OSPF_UNLOCK() pthread_mutex_unlock(&g_ospf.lock)
 
 #define OSPF_TICK_MS 1000 /* poll timeout == the tick cadence the main loop used */
-
-static uint16_t ip_checksum(const void *data, size_t len)
-{
-    const uint16_t *p = data;
-    uint32_t sum = 0;
-    while (len > 1) { sum += *p++; len -= 2; }
-    if (len) sum += *(const uint8_t *)p;
-    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
-    return (uint16_t)(~sum);
-}
 
 /* Fletcher checksum for OSPF LSAs (RFC 2328, excluding age field). Sums run
  * over the whole LSA with the checksum field (offsets 16-17 in this
@@ -814,7 +805,7 @@ static void build_lsack(const ospf_lsa_hdr_t *hdrs, size_t count, uint8_t *buf, 
     h->length = htons((uint16_t)off);
     apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
-    h->checksum = ip_checksum(buf, off);
+    h->checksum = hadc_checksum_host(buf, off);
     *outlen = off;
 }
 
@@ -861,7 +852,7 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
     h->length = htons((uint16_t)off);
     apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
-    h->checksum = ip_checksum(buf, off);
+    h->checksum = hadc_checksum_host(buf, off);
     *outlen = off;
 }
 
@@ -931,7 +922,7 @@ static size_t flush_lsas_maxage_adv(uint32_t adv_net)
         oh->length = htons((uint16_t)plen);
         apply_auth(oh, g_ospf.ctx, pkt, plen);
         oh->checksum = 0;
-        oh->checksum = ip_checksum(pkt, plen);
+        oh->checksum = hadc_checksum_host(pkt, plen);
         size_t sent = 0;
         for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
             if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY) {
@@ -1001,7 +992,7 @@ static void build_hello(uint8_t *buf, size_t *outlen, ospf_if_t *iface)
     h->length = htons((uint16_t)off);
     apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
-    h->checksum = ip_checksum(buf, off);
+    h->checksum = hadc_checksum_host(buf, off);
     *outlen = off;
 }
 
@@ -1089,7 +1080,7 @@ static void build_dbdesc(uint8_t *buf, size_t *outlen, uint8_t flags, uint32_t s
     h->length = htons((uint16_t)off);
     apply_auth(h, g_ospf.ctx, buf, off);
     h->checksum = 0;
-    h->checksum = ip_checksum(buf, off);
+    h->checksum = hadc_checksum_host(buf, off);
     *outlen = off;
 }
 
@@ -1138,7 +1129,7 @@ static void nbr_send_lsreq(ospf_neighbor_t *n)
         return;
     oh->length = htons((uint16_t)ooff);
     apply_auth(oh, g_ospf.ctx, out, ooff);
-    oh->checksum = 0; oh->checksum = ip_checksum(out, ooff);
+    oh->checksum = 0; oh->checksum = hadc_checksum_host(out, ooff);
     send_to(n->ip, n->ifindex, out, ooff);
     n->last_lsreq_sent = now;
     {
@@ -1428,7 +1419,7 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
     oh->length = htons((uint16_t)ooff);
     apply_auth(oh, g_ospf.ctx, out, ooff);
     oh->checksum = 0;
-    oh->checksum = ip_checksum(out, ooff);
+    oh->checksum = hadc_checksum_host(out, ooff);
     if (iface && iface->ifindex)
         send_to(src, iface->ifindex, out, ooff);
     else
@@ -1883,7 +1874,7 @@ static void ospf_originate_locked(hadc_ctx_t *ctx,
                 size_t plen = sizeof(ospf_hdr_t) + 4 + l;
                 oh->length = htons((uint16_t)plen);
                 apply_auth(oh, g_ospf.ctx, pkt, plen);
-                oh->checksum = 0; oh->checksum = ip_checksum(pkt, plen);
+                oh->checksum = 0; oh->checksum = hadc_checksum_host(pkt, plen);
                 for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
                     if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY)
                         send_to(g_ospf.nbrs[k].ip, g_ospf.nbrs[k].ifindex, pkt, plen);
@@ -2004,7 +1995,7 @@ static void ospf_tick_locked(void)
                 size_t plen = sizeof(*oh) + 4 + l;
                 oh->length = htons((uint16_t)plen);
                 apply_auth(oh, g_ospf.ctx, pkt, plen);
-                oh->checksum = 0; oh->checksum = ip_checksum(pkt, plen);
+                oh->checksum = 0; oh->checksum = hadc_checksum_host(pkt, plen);
                 send_to(n->ip, n->ifindex, pkt, plen);
                 n->ls_rxmt[r].last_sent = now;
             }
@@ -2328,9 +2319,7 @@ static size_t ospf_learned_routes_locked(hadc_ctx_t *ctx, hadc_ospf_learned_rout
                 memset(r, 0, sizeof(*r));
                 r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
                 r->lsa_type = e->hdr.type; r->valid = true; r->age_s = lsa_effective_age(e);
-                uint32_t mv = ntohl(mask.s_addr);
-                unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
-                r->prefixlen = plen;
+                r->prefixlen = hadc_ipv4_netmask_prefix(mask);
                 u32_to_rid(ntohl(e->hdr.adv_router), r->origin, sizeof(r->origin));
             }
             continue;
@@ -2364,9 +2353,7 @@ static size_t ospf_learned_routes_locked(hadc_ctx_t *ctx, hadc_ospf_learned_rout
         memset(r, 0, sizeof(*r));
         r->prefix = pfx; r->mask = mask; r->nexthop = nh; r->metric = metric;
         r->lsa_type = e->hdr.type; r->valid = true; r->age_s = lsa_effective_age(e);
-        uint32_t mv = ntohl(mask.s_addr);
-        unsigned plen = 0; for (int b = 31; b >= 0; b--) { if (mv & (1u << b)) plen++; else break; }
-        r->prefixlen = plen;
+        r->prefixlen = hadc_ipv4_netmask_prefix(mask);
         u32_to_rid(ntohl(e->hdr.adv_router), r->origin, sizeof(r->origin));
     }
 
@@ -2410,10 +2397,7 @@ static void append_learned_prefix(json_t *arr, struct in_addr pfx, struct in_add
     char p[INET_ADDRSTRLEN], m[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &pfx, p, sizeof(p));
     inet_ntop(AF_INET, &mask, m, sizeof(m));
-    /* compute prefixlen */
-    uint32_t mv = ntohl(mask.s_addr);
-    int plen = 0;
-    for (int i = 31; i >= 0; i--) { if (mv & (1u << i)) plen++; else break; }
+    int plen = (int)hadc_ipv4_netmask_prefix(mask);
     json_array_append_new(arr, json_pack("{s:s,s:i,s:s,s:s,s:s,s:s,s:i}",
                                          "prefix", p, "prefixlen", plen, "mask", m,
                                          "origin", origin, "nexthop", nexthop, "source", source,
@@ -2604,9 +2588,7 @@ void hadc_ospf_collect_self_lsas(void *arr)
             continue;
         char hx[2 * OSPF_MTU + 1];
         size_t n = g_ospf.lsdb[i].body_len;
-        for (size_t k = 0; k < n; k++)
-            sprintf(hx + 2 * k, "%02x", g_ospf.lsdb[i].body[k]);
-        hx[2 * n] = '\0';
+        hadc_hex_encode(g_ospf.lsdb[i].body, n, hx, sizeof(hx));
         json_array_append_new(a, json_pack("{s:i, s:i, s:i, s:i, s:s}", "type",
                                            (json_int_t)g_ospf.lsdb[i].hdr.type, "id",
                                            (json_int_t)ntohl(g_ospf.lsdb[i].hdr.id), "seq",

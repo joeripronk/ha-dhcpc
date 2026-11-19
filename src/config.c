@@ -18,6 +18,7 @@
 #include "ha-dhcpc/config.h"
 #include "ha-dhcpc/ipv4.h"
 #include "ha-dhcpc/log.h"
+#include "ha-dhcpc/util.h"
 #include "internal.h"
 
 /* ---- YAML -> json_t (scalars resolved per YAML 1.1 plain-style rules) ---- */
@@ -175,9 +176,7 @@ int hadc_config_sha256_bytes(const void *data, size_t len, char out[HADC_CONF_SH
 {
     uint8_t digest[32];
     hadc_sha256(data, len, digest);
-    for (int i = 0; i < 32; i++)
-        sprintf(out + 2 * i, "%02x", digest[i]);
-    out[64] = '\0';
+    hadc_hex_encode(digest, sizeof(digest), out, HADC_CONF_SHA_HEX);
     return 0;
 }
 
@@ -261,9 +260,7 @@ int hadc_config_digest_json(const json_t *doc, char out[HADC_CONF_SHA_HEX])
     hadc_sha256(txt, strlen(txt), digest);
     free(txt);
     json_decref(fallback);
-    for (int i = 0; i < 32; i++)
-        sprintf(out + 2 * i, "%02x", digest[i]);
-    out[64] = '\0';
+    hadc_hex_encode(digest, sizeof(digest), out, HADC_CONF_SHA_HEX);
     return 0;
 }
 

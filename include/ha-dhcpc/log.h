@@ -15,7 +15,9 @@ void hadc_log_set_level(hadc_log_level_t level);
 #define hadc_warn(...) hadc_log(HADC_LOG_WARN, __VA_ARGS__)
 #define hadc_err(...)  hadc_log(HADC_LOG_ERR, __VA_ARGS__)
 
-/* Monotonic clock in milliseconds (timers are monotonic; plan §8). */
+/* Clocks in milliseconds. Timers use the monotonic clock (plan §8); message
+ * timestamps and wall-clock deadlines use the realtime clock. */
 long long hadc_now_ms(void);
+long long hadc_realtime_ms(void);
 
 #endif /* HA_DHCPC_LOG_H */

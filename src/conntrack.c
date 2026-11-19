@@ -267,13 +267,6 @@ struct hadc_conntrack {
     char compare_last_master[HADC_NODE_ID_MAX];
 };
 
-static uint64_t now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
-}
-
 static void ct_wake(struct hadc_conntrack *ct)
 {
     if (!ct || ct->wakefd < 0)
@@ -422,7 +415,7 @@ static void refresh_owned_addrs_getifaddrs(struct hadc_conntrack *ct, hadc_ctx_t
         freeifaddrs(ifas);
     }
     ct->addr_cache_valid = true;
-    ct->last_addr_refresh_ms = now_ms();
+    ct->last_addr_refresh_ms = (uint64_t)hadc_now_ms();
 }
 
 static int rtnl_open(struct hadc_conntrack *ct)
@@ -612,7 +605,7 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     }
     ct->ctnl_dump_pending=true;
     ct->ctnl_dump_aborted=false;
-    ct->ctnl_dump_start_ms = now_ms();
+    ct->ctnl_dump_start_ms = (uint64_t)hadc_now_ms();
     ct->dump_event_count = 0;
     ct->dump_event_overflow = false;
     hadc_dbg("conntrack: ct dump requested seq=%u", ct->ctnl_dump_seq);
@@ -912,13 +905,13 @@ static void shadow_mark_dirty(struct hadc_conntrack *ct, const hadc_ct_entry_v1_
     if (s) {
         s->e = *e;
         s->timer_dirty = true;
-        s->updated_ms = now_ms();
+        s->updated_ms = (uint64_t)hadc_now_ms();
         return;
     }
     s = shadow_alloc_slot(ct, e);
     if (!s) return;
     s->e = *e;
-    s->updated_ms = now_ms();
+    s->updated_ms = (uint64_t)hadc_now_ms();
     s->valid = true;
     s->seen_in_snapshot = false;
     s->timer_dirty = true;
@@ -928,7 +921,7 @@ static void shadow_mark_dirty(struct hadc_conntrack *ct, const hadc_ct_entry_v1_
 static void shadow_flush_timer_dirty(struct hadc_conntrack *ct)
 {
     if (!ct) return;
-    uint64_t now = now_ms();
+    uint64_t now = (uint64_t)hadc_now_ms();
     for (size_t i = 0; i < ct->n_shadow; i++) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[i];
         if (!s->valid) continue;
@@ -1198,7 +1191,7 @@ static void apply_shadow_all(struct hadc_conntrack *ct)
     if (!ct) return;
     if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
     if (ct->ctnl_fd < 0) return;
-    uint64_t now = now_ms();
+    uint64_t now = (uint64_t)hadc_now_ms();
     for (size_t i = 0; i < ct->n_shadow; i++) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[i];
         if (!s->valid) continue;
@@ -1272,10 +1265,10 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                         /* missing during replace attempt, retry as create */
                         ap->create = true;
                         ap->retries++;
-                        ap->next_retry_ms = now_ms() + 100;
+                        ap->next_retry_ms = (uint64_t)hadc_now_ms() + 100;
                     } else if ((e == EBUSY || e == EAGAIN) && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
                         ap->retries++;
-                        ap->next_retry_ms = now_ms() + 200;
+                        ap->next_retry_ms = (uint64_t)hadc_now_ms() + 200;
                     } else {
                         ap->in_use = false;
                         if (e != EEXIST && e != ENOENT && e != EBUSY)
@@ -1326,10 +1319,10 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                     master_queue_entry_all(ct, HADC_CT_MSG_SNAPSHOT_ENTRY, &e, NULL);
                     if (ct->timer_sync_interval_s > 0) {
                         hadc_ct_shadow_ent_t *s = shadow_find(ct, &e);
-                        if (s) { s->e = e; s->timer_dirty = false; s->updated_ms = now_ms(); }
+                        if (s) { s->e = e; s->timer_dirty = false; s->updated_ms = (uint64_t)hadc_now_ms(); }
                         else {
                             hadc_ct_shadow_ent_t *ns = shadow_alloc_slot(ct, &e);
-                            if (ns) { ns->e = e; ns->updated_ms = now_ms(); ns->valid = true; ns->seen_in_snapshot = false; ns->timer_dirty = false; shadow_link(ct, ns); }
+                            if (ns) { ns->e = e; ns->updated_ms = (uint64_t)hadc_now_ms(); ns->valid = true; ns->seen_in_snapshot = false; ns->timer_dirty = false; shadow_link(ct, ns); }
                         }
                     }
                     continue;
@@ -1358,13 +1351,13 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                     if (shadow && !ct_entry_significant_change(&shadow->e, &e)) {
                         shadow->e = e;
                         shadow->timer_dirty = true;
-                        shadow->updated_ms = now_ms();
+                        shadow->updated_ms = (uint64_t)hadc_now_ms();
                         continue;
                     }
                     if (shadow) {
                         shadow->e = e;
                         shadow->timer_dirty = false;
-                        shadow->updated_ms = now_ms();
+                        shadow->updated_ms = (uint64_t)hadc_now_ms();
                     } else {
                         shadow_mark_dirty(ct, &e);
                         hadc_ct_shadow_ent_t *s2 = shadow_find(ct, &e);
@@ -1418,8 +1411,8 @@ static bool probe_cthelper_sip(void)
     }
 
     bool found = false;
-    uint64_t deadline = now_ms() + 150;
-    while (now_ms() < deadline && !found) {
+    uint64_t deadline = (uint64_t)hadc_now_ms() + 150;
+    while ((uint64_t)hadc_now_ms() < deadline && !found) {
         struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int pr = poll(&pfd, 1, 50);
         if (pr <= 0) continue;
@@ -1459,7 +1452,7 @@ static void refresh_helper_cache_locked(struct hadc_conntrack *ct, bool nl_helpe
 {
     /* SIP/VoIP helper status cache; nfnetlink probe result supplied by caller
      * (probe can block briefly and must not run under ct->lock). */
-    ct->last_helper_refresh_ms = now_ms();
+    ct->last_helper_refresh_ms = (uint64_t)hadc_now_ms();
     if (ct->sip_mode == HADC_CT_SIP_OFF) {
         ct->st.sip_helper = HADC_CT_HELPER_UNAVAILABLE;
         snprintf(ct->st.sip_helper_reason, sizeof(ct->st.sip_helper_reason), "disabled");
@@ -1599,7 +1592,7 @@ static int peer_flush_partial(struct hadc_conntrack *ct, hadc_ct_peer_t *p)
         }
         if (w == 0) return 0;
         p->tx_partial_off += (size_t)w;
-        p->last_send_ms = now_ms();
+        p->last_send_ms = (uint64_t)hadc_now_ms();
     }
     if (!p->tx_partial_counted) {
         ct->st.tx_frames++;
@@ -1795,7 +1788,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
             ct->st.applied_entries++;
         } else {
             s->e = *e;
-            s->updated_ms = now_ms();
+            s->updated_ms = (uint64_t)hadc_now_ms();
             s->seen_in_snapshot = ct->rx_snapshot_active;
             s->timer_dirty = false;
             ct->st.applied_entries++;
@@ -1807,7 +1800,7 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
     s = shadow_alloc_slot(ct, e);
     if (!s) { ct->st.dropped_entries++; return; }
     s->e = *e;
-    s->updated_ms = now_ms();
+    s->updated_ms = (uint64_t)hadc_now_ms();
     s->valid = true;
     s->seen_in_snapshot = ct->rx_snapshot_active;
     s->timer_dirty = false;
@@ -1819,7 +1812,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
 {
     uint32_t len = ntohl(h->len);
     p->rx_seq = ntohl(h->seq);
-    p->last_seen_ms = now_ms();
+    p->last_seen_ms = (uint64_t)hadc_now_ms();
     ct->st.rx_frames++;
     if (h->type == HADC_CT_MSG_HELLO) {
         p->hello_ok = true;
@@ -1856,7 +1849,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
         if (ct->role == HADC_ROLE_SLAVE) {
             ct->rx_snapshot_active = true;
             ct->compare_in_progress = true;
-            ct->compare_started_ms = now_ms();
+            ct->compare_started_ms = (uint64_t)hadc_now_ms();
             ct->compare_missing_on_slave = 0;
             ct->compare_extra_on_slave = 0;
             ct->compare_matched = 0;
@@ -1889,7 +1882,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                 if (recent_handoff) {
                     /* recent master handoff: entry missing from master's snapshot */
                     s->seen_in_snapshot = true; /* avoid repeated reports for this snapshot cycle */
-                    s->updated_ms = now_ms();
+                    s->updated_ms = (uint64_t)hadc_now_ms();
                     if (ct->upsert_fixes) {
                         hadc_warn("conntrack: master snapshot missing entry, keeping and reporting fix: %s", desc);
                         if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
@@ -1924,7 +1917,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
             }
             ct->compare_extra_on_slave = extra;
             ct->compare_has_result = true;
-            ct->compare_at_ms = now_ms();
+            ct->compare_at_ms = (uint64_t)hadc_now_ms();
             ct->compare_last_missing = ct->compare_missing_on_slave;
             ct->compare_last_extra = ct->compare_extra_on_slave;
             ct->compare_last_matched = ct->compare_matched;
@@ -2017,12 +2010,12 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                         if (s) {
                             s->e = *e;
                             s->timer_dirty = false;
-                            s->updated_ms = now_ms();
+                            s->updated_ms = (uint64_t)hadc_now_ms();
                         } else {
                             s = shadow_alloc_slot(ct, e);
                             if (s) {
                                 s->e = *e;
-                                s->updated_ms = now_ms();
+                                s->updated_ms = (uint64_t)hadc_now_ms();
                                 s->valid = true;
                                 s->seen_in_snapshot = false;
                                 s->timer_dirty = false;
@@ -2098,7 +2091,7 @@ static void accept_peer(struct hadc_conntrack *ct)
         p->rxlen = 0;
         p->hello_sent = false;
         p->hello_ok = false;
-        p->last_seen_ms = now_ms();
+        p->last_seen_ms = (uint64_t)hadc_now_ms();
         {
             char abuf[INET_ADDRSTRLEN];
             hadc_info("conntrack: accepted peer %s from %s", p->id, hadc_ipv4_format(sa.sin_addr, abuf, sizeof(abuf)));
@@ -2110,7 +2103,7 @@ static void ensure_master_connections(struct hadc_conntrack *ct)
 {
     if (!ct->enabled || ct->role != HADC_ROLE_MASTER)
         return;
-    uint64_t t = now_ms();
+    uint64_t t = (uint64_t)hadc_now_ms();
     for (size_t i = 0; i < ct->n_peers; i++) {
         hadc_ct_peer_t *p = &ct->peers[i];
         if (!p->in_use || p->connected || p->fd >= 0)
@@ -2194,7 +2187,7 @@ static void *conntrack_thread_main(void *arg)
             break;
 
         pthread_mutex_lock(&ct->lock);
-        uint64_t now = now_ms();
+        uint64_t now = (uint64_t)hadc_now_ms();
         if (ct->enabled && ct->rtnl_fd < 0) {
             if (rtnl_open(ct) == 0)
                 rtnl_dump_addrs(ct);
@@ -2434,8 +2427,8 @@ int hadc_conntrack_init(hadc_ctx_t *ctx)
     shadow_hash_init(ct);
     ct->apply_shadow_pending = false;
     ct->generation = 1;
-    ct->last_resync_ms = now_ms();
-    ct->last_timer_sync_ms = now_ms();
+    ct->last_resync_ms = (uint64_t)hadc_now_ms();
+    ct->last_timer_sync_ms = (uint64_t)hadc_now_ms();
     bool nl_init = ctx->conf.conntrack_sync.helpers.sip != HADC_CT_SIP_OFF ? probe_cthelper_sip() : false;
     pthread_mutex_lock(&ct->lock);
     snapshot_config_locked(ct, ctx);
@@ -2572,7 +2565,7 @@ int hadc_conntrack_resync(hadc_ctx_t *ctx)
         ct->slave_resync_requested = true;
     }
     ct->st.resync_count++;
-    ct->last_resync_ms = now_ms();
+    ct->last_resync_ms = (uint64_t)hadc_now_ms();
     pthread_mutex_unlock(&ct->lock);
     ct_wake(ct);
     return 0;
@@ -2590,10 +2583,10 @@ int hadc_conntrack_compare(hadc_ctx_t *ctx)
     }
     ct->compare_requested = true;
     ct->compare_has_result = false;
-    ct->compare_started_ms = now_ms();
+    ct->compare_started_ms = (uint64_t)hadc_now_ms();
     ct->slave_resync_requested = true;
     ct->st.resync_count++;
-    ct->last_resync_ms = now_ms();
+    ct->last_resync_ms = (uint64_t)hadc_now_ms();
     pthread_mutex_unlock(&ct->lock);
     ct_wake(ct);
     return 0;
