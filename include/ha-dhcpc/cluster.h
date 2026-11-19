@@ -27,6 +27,7 @@
 #define HADC_MSG_CONF_ACK           "conf_ack"           /* member -> master: document written + applied */
 #define HADC_MSG_TAKEOVER_PREP      "takeover_prep"      /* new master -> old master (in hold): local env prepared (no GARP yet); steer via the /+1 routes and ack */
 #define HADC_MSG_TAKEOVER_ACK       "takeover_ack"       /* old master (in hold) -> new master: steering routes installed (steered=false when this node cannot steer); unblocks the new master's GARP + ready announce */
+#define HADC_MSG_GRACEFUL           "graceful_restart"   /* master -> all, graceful-restart window */
 
 /* Wire role codes for the compact binary heartbeat (the only binary message
  * type; its first byte is 0, so JSON datagrams — which always start with '{'
@@ -85,12 +86,9 @@ typedef struct {
 
 typedef struct hadc_cluster hadc_cluster_t;
 
-typedef struct hadc_ctx hadc_ctx_t; /* defined in internal.h; owns conf+state */
-
 /* Lifecycle: init registers the cluster with the event loop and binds the
  * UDP transport on the local node's sync_address. */
 int hadc_cluster_init(hadc_ctx_t *ctx);
-int hadc_cluster_step(hadc_ctx_t *ctx); /* pump transport; nonblocking */
 
 /* Startup time sync: a starting node first syncs its CLOCK_REALTIME with the
  * cluster before joining: heartbeats carry the sender's wall clock, the

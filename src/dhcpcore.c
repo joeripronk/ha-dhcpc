@@ -164,7 +164,7 @@ static int g_core_live;    /* core inited once; never re-inited */
 static int g_running;       /* fds + timerfd registered with the loop */
 static int g_core_fds[CORE_FDS_MAX];
 static int g_n_core_fds;
-static char g_lease_db[PATH_MAX]; /* lease DB we last told the core about */
+static char g_lease_db[HADC_PATH_MAX]; /* lease DB we last told the core about */
 static hadc_ctx_t *g_ctx;         /* for the core's fd-closed notification */
 
 /* The core closed one of its protocol fds (dead packet socket, removed
@@ -381,7 +381,7 @@ int hadc_dhcpcore_force_renew(hadc_ctx_t *ctx)
 
 int hadc_dhcpcore_write_lease_file(hadc_ctx_t *ctx, const hadc_lease_t *lease)
 {
-    char path[PATH_MAX], tmp[PATH_MAX + 8], buf[64], buf2[64];
+    char path[HADC_PATH_MAX], tmp[HADC_PATH_MAX + 8], buf[64], buf2[64];
     FILE *f;
 
     if (lease->address.s_addr == 0)

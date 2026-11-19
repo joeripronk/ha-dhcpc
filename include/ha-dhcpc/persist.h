@@ -9,8 +9,6 @@
 #include "lease.h"
 #include "types.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 /* State restored from disk at startup. */
 typedef struct {
     bool found;                  /* false => fresh start */

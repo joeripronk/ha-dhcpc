@@ -120,8 +120,15 @@ void hadc_validate_demote_route_config(hadc_ctx_t *ctx, const char *why)
 
 int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
 {
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
+
     pthread_mutex_lock(&g_fds_lock);
     if (g_nfds >= MAX_FDS || fd < 0) {
+        pthread_mutex_unlock(&g_fds_lock);
+        return -1;
+    }
+    if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        hadc_err("loop: epoll add fd %d: %s", fd, strerror(errno));
         pthread_mutex_unlock(&g_fds_lock);
         return -1;
     }
@@ -130,11 +137,6 @@ int hadc_loop_add(hadc_ctx_t *ctx, int fd, hadc_fd_cb_t cb, int events)
     g_fds[g_nfds].flags = events;
     g_nfds++;
     pthread_mutex_unlock(&g_fds_lock);
-    struct epoll_event ev = { .events = EPOLLIN, .data.fd = fd };
-    if (epoll_ctl(ctx->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
-        hadc_err("loop: epoll add fd %d: %s", fd, strerror(errno));
-        return -1;
-    }
     return 0;
 }
 
@@ -1168,9 +1170,9 @@ int main(int argc, char **argv)
     }
 
     /* Default state file: next to the shared config file (plan §3/§6). */
-    char persist_default[PATH_MAX];
+    char persist_default[HADC_PATH_MAX];
     if (!persist_path) {
-        char dir[PATH_MAX];
+        char dir[HADC_PATH_MAX];
         snprintf(dir, sizeof(dir), "%s", conf_path); /* conf_path may be a literal */
         char *slash = strrchr(dir, '/');
         if (slash) {
@@ -1425,7 +1427,6 @@ int main(int argc, char **argv)
             if (e != NULL && e->cb)
                 e->cb(ctx, fd);
         }
-        hadc_cluster_step(ctx);
         hadc_ctl_step(ctx);
         hadc_dhcpcore_step(ctx);
     }

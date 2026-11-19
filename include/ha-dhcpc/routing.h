@@ -11,8 +11,6 @@
 #define HADC_ROUTING_MAX_CANDIDATES 32
 #define HADC_ROUTING_ORIGIN_MAX 64
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 /* Attribution of a fabric-learned default route (0.0.0.0/0). */
 typedef enum {
     HADC_ROUTE_SCOPE_UNKNOWN = 0,

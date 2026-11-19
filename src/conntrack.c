@@ -525,9 +525,29 @@ static struct nlattr *nla_find(struct nlattr *head, int len, int type)
     }
     return NULL;
 }
-static uint32_t nla_get_u32(struct nlattr *n){ uint32_t v=0; if(n&&HADC_NLA_DATALEN(n)>=4) memcpy(&v,HADC_NLA_DATA(n),4); return v; }
-static uint16_t nla_get_u16(struct nlattr *n){ uint16_t v=0; if(n&&HADC_NLA_DATALEN(n)>=2) memcpy(&v,HADC_NLA_DATA(n),2); return v; }
-static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATALEN(n)>=1) memcpy(&v,HADC_NLA_DATA(n),1); return v; }
+static uint32_t nla_get_u32(struct nlattr *n)
+{
+    uint32_t v = 0;
+    if (n && HADC_NLA_DATALEN(n) >= 4)
+        memcpy(&v, HADC_NLA_DATA(n), 4);
+    return v;
+}
+
+static uint16_t nla_get_u16(struct nlattr *n)
+{
+    uint16_t v = 0;
+    if (n && HADC_NLA_DATALEN(n) >= 2)
+        memcpy(&v, HADC_NLA_DATA(n), 2);
+    return v;
+}
+
+static uint8_t nla_get_u8(struct nlattr *n)
+{
+    uint8_t v = 0;
+    if (n && HADC_NLA_DATALEN(n) >= 1)
+        memcpy(&v, HADC_NLA_DATA(n), 1);
+    return v;
+}
 
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
@@ -554,7 +574,8 @@ static void ctnl_abort_dump(struct hadc_conntrack *ct)
     ct->dump_event_overflow = false;
 }
 
-static void ctnl_close(struct hadc_conntrack *ct){
+static void ctnl_close(struct hadc_conntrack *ct)
+{
     if(ct->ctnl_fd>=0) close(ct->ctnl_fd);
     ct->ctnl_fd=-1;
     ct->ctnl_subscribed = false;
@@ -565,7 +586,8 @@ static void ctnl_close(struct hadc_conntrack *ct){
     ct->dump_event_overflow = false;
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
 }
-static int ctnl_open(struct hadc_conntrack *ct, bool subscribe_events){
+static int ctnl_open(struct hadc_conntrack *ct, bool subscribe_events)
+{
     if(ct->ctnl_fd>=0) {
         if (ct->ctnl_subscribed == subscribe_events)
             return 0;
@@ -592,7 +614,8 @@ static int ctnl_open(struct hadc_conntrack *ct, bool subscribe_events){
     memset(ct->apply_pending, 0, sizeof(ct->apply_pending));
     return 0;
 }
-static int ctnl_request_dump(struct hadc_conntrack *ct){
+static int ctnl_request_dump(struct hadc_conntrack *ct)
+{
     if(ct->ctnl_fd<0) return -1;
     struct {struct nlmsghdr nh; struct nfgenmsg nf;} req; memset(&req,0,sizeof(req));
     req.nh.nlmsg_len=NLMSG_LENGTH(sizeof(req.nf));
@@ -615,7 +638,8 @@ static int ctnl_request_dump(struct hadc_conntrack *ct){
     return 0;
 }
 
-static int parse_tuple_v4(struct nlattr *tuple,uint32_t *sip,uint16_t *sp,uint8_t *proto,uint32_t *dip,uint16_t *dp){
+static int parse_tuple_v4(struct nlattr *tuple,uint32_t *sip,uint16_t *sp,uint8_t *proto,uint32_t *dip,uint16_t *dp)
+{
     if(!tuple) return -1;
     uint8_t prnum = proto ? *proto : 0;
     struct nlattr *ta=(struct nlattr*)HADC_NLA_DATA(tuple); int tl=HADC_NLA_DATALEN(tuple);
@@ -641,7 +665,8 @@ static int parse_tuple_v4(struct nlattr *tuple,uint32_t *sip,uint16_t *sp,uint8_
     return 0;
 }
 
-static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out, bool *is_del, uint32_t *ct_id){
+static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out, bool *is_del, uint32_t *ct_id)
+{
     memset(out,0,sizeof(*out)); out->family=AF_INET; out->addr_len=4;
     if(is_del)*is_del=false;
     if(ct_id)*ct_id=0;
@@ -967,15 +992,29 @@ static bool nla_put(char *buf, size_t buflen, size_t *off, uint16_t type, const 
     *off += alen;
     return true;
 }
-static bool nla_put_u32(char *buf, size_t buflen, size_t *off, uint16_t type, uint32_t v){ return nla_put(buf,buflen,off,type,&v,sizeof(v)); }
-static bool nla_put_u16(char *buf, size_t buflen, size_t *off, uint16_t type, uint16_t v){ return nla_put(buf,buflen,off,type,&v,sizeof(v)); }
-static bool nla_put_u8(char *buf, size_t buflen, size_t *off, uint16_t type, uint8_t v){ return nla_put(buf,buflen,off,type,&v,sizeof(v)); }
-static size_t nla_nest_start(char *buf, size_t buflen, size_t *off, uint16_t type){
+static bool nla_put_u32(char *buf, size_t buflen, size_t *off, uint16_t type, uint32_t v)
+{
+    return nla_put(buf, buflen, off, type, &v, sizeof(v));
+}
+
+static bool nla_put_u16(char *buf, size_t buflen, size_t *off, uint16_t type, uint16_t v)
+{
+    return nla_put(buf, buflen, off, type, &v, sizeof(v));
+}
+
+static bool nla_put_u8(char *buf, size_t buflen, size_t *off, uint16_t type, uint8_t v)
+{
+    return nla_put(buf, buflen, off, type, &v, sizeof(v));
+}
+
+static size_t nla_nest_start(char *buf, size_t buflen, size_t *off, uint16_t type)
+{
     size_t start = *off;
     if (!nla_put(buf, buflen, off, (uint16_t)(type | NLA_F_NESTED), NULL, 0)) return (size_t)-1;
     return start;
 }
-static void nla_nest_end(char *buf, size_t start, size_t off){
+static void nla_nest_end(char *buf, size_t start, size_t off)
+{
     struct nlattr *nla = (struct nlattr *)(buf + start);
     nla->nla_len = (uint16_t)(off - start);
 }
@@ -1227,7 +1266,8 @@ static void prune_shadow(struct hadc_conntrack *ct, uint64_t now)
     (void)changed;
 }
 
-static void drain_ctnl(struct hadc_conntrack *ct){
+static void drain_ctnl(struct hadc_conntrack *ct)
+{
     if(ct->ctnl_fd<0) return;
     char buf[16384];
     bool in_dump = ct->ctnl_dump_pending && !ct->ctnl_dump_aborted;

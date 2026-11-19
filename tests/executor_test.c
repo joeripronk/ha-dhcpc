@@ -11,6 +11,7 @@
 
 #include "ha-dhcpc/cluster.h"
 #include "ha-dhcpc/executor.h"
+#include "executor_internal.h"
 #include "internal.h"
 
 bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)

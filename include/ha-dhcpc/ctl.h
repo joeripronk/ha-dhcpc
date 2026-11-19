@@ -17,15 +17,6 @@
 
 #include "types.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
-typedef enum {
-    HADC_CTL_PROMOTE = 0,  /* optional target node id (NULL = self) */
-    HADC_CTL_DEMOTE,
-    HADC_CTL_STATUS,
-    HADC_CTL_UPDATE,       /* re-read + publish the shared config (master only) */
-} hadc_ctl_cmd_t;
-
 int hadc_ctl_init(hadc_ctx_t *ctx);  /* bind + register with event loop */
 int hadc_ctl_step(hadc_ctx_t *ctx);  /* pump socket; nonblocking */
 

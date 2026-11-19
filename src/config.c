@@ -248,22 +248,6 @@ json_t *hadc_config_merge_json(json_t *base, json_t *overlay)
     return out;
 }
 
-int hadc_config_digest_json(const json_t *doc, char out[HADC_CONF_SHA_HEX])
-{
-    json_t *fallback = doc ? NULL : json_null();
-    char *txt = json_dumps(doc ? doc : fallback, JSON_PRESERVE_ORDER | JSON_COMPACT);
-    if (!txt) {
-        json_decref(fallback);
-        return -1;
-    }
-    uint8_t digest[32];
-    hadc_sha256(txt, strlen(txt), digest);
-    free(txt);
-    json_decref(fallback);
-    hadc_hex_encode(digest, sizeof(digest), out, HADC_CONF_SHA_HEX);
-    return 0;
-}
-
 /* ---- schema extraction helpers ---- */
 
 static char g_errbuf[512];

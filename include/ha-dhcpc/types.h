@@ -18,6 +18,10 @@
 #define HADC_CLUSTER_IF_MAX   8
 #define HADC_CLUSTER_ADDR_MAX 16
 
+/* The application context is defined in src/internal.h; every module API
+ * refers to it through this single shared typedef. */
+typedef struct hadc_ctx hadc_ctx_t;
+
 typedef enum {
     HADC_ROLE_UNKNOWN = 0,
     HADC_ROLE_MASTER,

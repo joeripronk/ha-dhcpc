@@ -114,23 +114,22 @@ static bool role_claims_master(hadc_role_t r) { return r == HADC_ROLE_MASTER || 
 #define HADC_WIRE_IDX_NONE     254
 
 
-#define HADC_MSG_GRACEFUL "graceful_restart"
 
 #define HADC_GRACEFUL_WINDOW_MS 180000ULL
 
 bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
 {
-    if (!ctx || ctx->graceful_restart_until_ms == 0)
+    if (!ctx)
         return false;
-    uint64_t now = hadc_realtime_ms();
-    if (now >= ctx->graceful_restart_until_ms) {
-        /* expired: clear lazily */
-        HB_LOCK(ctx);
+    HB_LOCK(ctx);
+    uint64_t until = ctx->graceful_restart_until_ms;
+    if (until && (uint64_t)hadc_realtime_ms() >= until) {
+        /* expired: clear lazily while already holding the lock */
         ctx->graceful_restart_until_ms = 0;
-        HB_UNLOCK(ctx);
-        return false;
+        until = 0;
     }
-    return true;
+    HB_UNLOCK(ctx);
+    return until != 0;
 }
 
 void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx)
@@ -431,13 +430,13 @@ static void *hb_thread_main(void *arg)
         } snap;
 
         /* sleep first, on the current cadence (re-read every tick) */
-        pthread_mutex_lock(&ctx->hb_lock);
+        HB_LOCK(ctx);
         struct timespec nap = { .tv_sec = ctx->conf.cluster.heartbeat_ms / 1000,
                                 .tv_nsec = (long)(ctx->conf.cluster.heartbeat_ms % 1000) * 1000000 };
-        pthread_mutex_unlock(&ctx->hb_lock);
+        HB_UNLOCK(ctx);
         clock_nanosleep(CLOCK_MONOTONIC, 0, &nap, NULL);
 
-        pthread_mutex_lock(&ctx->hb_lock);
+        HB_LOCK(ctx);
         snap.role = role_wire(ctx->role);
         snap.lease_version = ctx->lease.version;
         snap.master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
@@ -453,7 +452,7 @@ static void *hb_thread_main(void *arg)
         for (size_t i = 0; i < HADC_MEMBERS_MAX; i++)
             snap.peer_alive[i] = ctx->peers[i].alive ? 1 : 0;
         snap.udp_fd = ctx->udp_fd;
-        pthread_mutex_unlock(&ctx->hb_lock);
+        HB_UNLOCK(ctx);
         if (snap.cadence_ms == 0) /* hot-reload can zero the cadence: idle ticks */
             continue;
 
@@ -515,11 +514,11 @@ void hadc_cluster_selfpipe_ready(hadc_ctx_t *ctx)
     char buf[64];
     while (read(ctx->hb_selfpipe[0], buf, sizeof(buf)) > 0)
         ;
-    pthread_mutex_lock(&ctx->hb_lock);
+    HB_LOCK(ctx);
     bool gactive = (ctx->graceful_restart_until_ms != 0 &&
                     (uint64_t)hadc_realtime_ms() < ctx->graceful_restart_until_ms);
     bool fire = ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && ctx->conf.n_members >= 2 && !gactive);
-    pthread_mutex_unlock(&ctx->hb_lock);
+    HB_UNLOCK(ctx);
     if (fire) {
         hadc_info("cluster: self-monitor requested demote (main loop)");
         hadc_cluster_demote(ctx);
@@ -1247,13 +1246,13 @@ int hadc_cluster_init(hadc_ctx_t *ctx)
 static void age_peers(hadc_ctx_t *ctx)
 {
     uint64_t now = (uint64_t)hadc_now_ms();
-    uint32_t deadline = ctx->conf.cluster.election_deadline_ms;
-
-    if (deadline == 0)
-        deadline = 6000;
+    uint32_t deadline;
     uint32_t flush_rids[HADC_MEMBERS_MAX];
     size_t n_flush = 0;
     HB_LOCK(ctx); /* the hb thread snapshots peer liveness for the seen bitmap */
+    deadline = ctx->conf.cluster.election_deadline_ms;
+    if (deadline == 0)
+        deadline = 6000;
     for (size_t i = 0; i < ctx->conf.n_members; i++) {
         hadc_peer_t *p = &ctx->peers[i];
         bool was_alive = p->alive;
@@ -1583,7 +1582,15 @@ uint32_t hadc_cluster_maint_interval_ms(const hadc_ctx_t *ctx)
  * from periodic maintenance. */
 void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
 {
-    if (ctx->conf.n_members == 0) {
+    size_t n_members;
+    bool preempt;
+
+    HB_LOCK(ctx);
+    n_members = ctx->conf.n_members;
+    preempt = ctx->conf.cluster.preempt;
+    HB_UNLOCK(ctx);
+
+    if (n_members == 0) {
         hadc_cluster_elect_check(ctx);
         return;
     }
@@ -1593,7 +1600,7 @@ void hadc_cluster_heartbeat(hadc_ctx_t *ctx)
      * Here we only do the main-loop maintenance that mutates shared state. */
     age_peers(ctx);
     failover_check(ctx);
-    if (ctx->conf.cluster.preempt)
+    if (preempt)
         preempt_check(ctx);
     hadc_cluster_elect_check(ctx);
 }
@@ -1677,12 +1684,6 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     hadc_info("cluster: default-role election: promoting self (priority %d, %s)", wprio,
               all_alive ? "all members alive" : "cluster timeout elapsed");
     hadc_cluster_promote(ctx, ctx->conf.self);
-}
-
-int hadc_cluster_step(hadc_ctx_t *ctx)
-{
-    (void)ctx;
-    return 0;
 }
 
 /* Send a role_change cluster-wide (plan §4: every role change propagates). */

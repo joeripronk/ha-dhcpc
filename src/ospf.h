@@ -9,8 +9,6 @@
 #include "ha-dhcpc/config.h"
 #include "ha-dhcpc/routing.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 int hadc_ospf_init(hadc_ctx_t *ctx);
 int hadc_ospf_spawn(hadc_ctx_t *ctx); /* start the OSPF thread after init */
 void hadc_ospf_lock(void);   /* guards g_ospf incl. conf the thread reads */

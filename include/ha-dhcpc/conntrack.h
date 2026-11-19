@@ -9,8 +9,6 @@
 
 #include "types.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 typedef enum {
     HADC_CT_HELPER_UNKNOWN = 0,
     HADC_CT_HELPER_AVAILABLE,

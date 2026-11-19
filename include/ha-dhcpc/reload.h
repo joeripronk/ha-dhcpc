@@ -10,8 +10,6 @@
 
 #include "types.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 int hadc_conf_reload(hadc_ctx_t *ctx, const char *why);
 
 #endif /* HA_DHCPC_RELOAD_H */

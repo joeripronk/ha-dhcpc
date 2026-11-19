@@ -315,5 +315,8 @@ void hadc_gwping_tick(hadc_ctx_t *ctx)
 
 bool hadc_gwping_unreachable(void)
 {
-    return g_unreachable;
+    hadc_maint_lock(); /* writers hold it in hadc_gwping_tick(); recursive for callers under maint */
+    bool unreachable = g_unreachable;
+    hadc_maint_unlock();
+    return unreachable;
 }

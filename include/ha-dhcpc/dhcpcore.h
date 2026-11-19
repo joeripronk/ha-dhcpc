@@ -13,8 +13,6 @@
 #include "lease.h"
 #include "types.h"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 /* Engine -> cluster callbacks (invoked on the event loop thread). */
 typedef struct {
     /* New/updated lease state (ACK received): bump version, executor, push. */

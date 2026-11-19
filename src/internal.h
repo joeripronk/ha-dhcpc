@@ -9,7 +9,6 @@
 #include "ha-dhcpc/persist.h"
 #include "ha-dhcpc/types.h"
 
-#include <linux/limits.h>
 #include <pthread.h>
 
 struct hadc_conntrack;
@@ -25,8 +24,8 @@ struct hadc_ctx {
     hadc_peer_t peers[HADC_MEMBERS_MAX];
     size_t n_peers;
 
-    char persist_path[PATH_MAX];
-    char pidfile_path[PATH_MAX];
+    char persist_path[HADC_PATH_MAX];
+    char pidfile_path[HADC_PATH_MAX];
 
     int epfd;
     int maintfd;    /* cluster maintenance (peer aging/failover/election), decoupled from heartbeat send */
@@ -101,22 +100,6 @@ struct hadc_ctx {
 /* sha256 (frozen: config_hash = sha256 of canonical desired state) */
 void hadc_sha256(const void *data, size_t len, uint8_t out[32]);
 
-bool executor_action_is_fatal(int action_rc, bool action_is_fatal);
-
-/* Seamless-takeover VIP splits (executor.c): the two sub-prefixes at
- * prefixlen+1 covering each cluster address's CIDR subnet, used as steering
- * routes. Addresses with a host prefix (>31) or whose subnet contains the
- * steering nexthop are skipped. */
-typedef struct {
-	struct in_addr net;
-	unsigned plen;
-} vip_split_t;
-
-#define VIP_SPLIT_MAX (2 * HADC_CLUSTER_IF_MAX * HADC_CLUSTER_ADDR_MAX)
-
-size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
-    vip_split_t out[], size_t max);
-
 /* Complete a deferred promotion (main.c): GARP burst, DHCP core start, ready
  * announce (role flip), gateway probe, conntrack ownership + persist. Called
  * from the takeover_ack handler and the finalize deadline. */
@@ -136,7 +119,15 @@ void hadc_gwping_tick(hadc_ctx_t *ctx);
  * thread, fed by main-loop dirty/event signals, so a slow netlink dump or disk
  * sync does not delay packet/ctl handling. hadc_maint_lock serializes the
  * executor/routing/ping/persist state between the worker and the main loop;
- * take it outermost (before hb_lock/ospf_lock). */
+ * it is recursive so public entry points may nest.
+ *
+ * Lock order, outermost to innermost: hadc_maint_lock -> OSPF lock
+ * (hadc_ospf_lock/hadc_ospf_unlock) -> hb_lock (HB_LOCK in cluster.c). Never
+ * acquire an outer lock while holding an inner one: the OSPF thread and reload
+ * take OSPF->HB, while executor/routing take MAINT->OSPF and MAINT->HB. Do not
+ * hold HB across an OSPF call (age_peers releases it before flushing LSAs).
+ * conntrack's ct->lock must stay independent: never hold it while acquiring
+ * any lock above, and never hold those locks while calling conntrack. */
 typedef void (*hadc_maint_fn_t)(void *arg);
 int  hadc_maint_start(hadc_ctx_t *ctx);
 void hadc_maint_stop(void);

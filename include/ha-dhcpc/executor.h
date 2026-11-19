@@ -22,8 +22,6 @@
 #define HADC_REASON_RELEASE "RELEASE"
 #define HADC_REASON_DEBOUND "DEBOUND"
 
-typedef struct hadc_ctx hadc_ctx_t;
-
 typedef struct {
     char interface[HADC_IFNAME_MAX];
     bool present;              /* false = address should be absent */

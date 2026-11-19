@@ -13,7 +13,7 @@
 #include "ha-dhcpc/log.h"
 #include "internal.h"
 
-static char g_path[PATH_MAX];
+static char g_path[HADC_PATH_MAX];
 
 int hadc_persist_init(hadc_ctx_t *ctx, const char *path)
 {
@@ -108,7 +108,7 @@ static char *persist_build_json(hadc_ctx_t *ctx)
 /* Atomic rename + fsync. */
 static int persist_write_file(const char *path, const char *json)
 {
-    char tmp[PATH_MAX];
+    char tmp[HADC_PATH_MAX];
     size_t len = strlen(json);
 
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
