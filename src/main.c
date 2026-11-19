@@ -635,14 +635,21 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                 hadc_executor_default_route_present(ctx);
             if (!verified) {
                 hadc_warn("promotion: public ip/default route not verified before announcing VIPs; announcing without handshake");
-            } else if (hadc_cluster_send_takeover_prep(ctx) == 0) {
-                uint32_t wait_ms = ctx->conf.apply.handoff_hold_ms ? ctx->conf.apply.handoff_hold_ms : 5000;
-                if (wait_ms < 1000)
-                    wait_ms = 1000;
-                ctx->promotion_finalize_at_ms = (uint64_t)hadc_now_ms() + wait_ms;
-                deferred = true;
-                hadc_info("promotion: local env ready (public ip+routing verified, VIPs assigned, no GARP yet); signaled %s to steer via the /+1 routes; awaiting ack (budget %ums)",
-                          ctx->takeover_from, wait_ms);
+            } else {
+                /* Install the replicated conntrack/NAT state in the kernel
+                 * before asking the old master to steer: steered packets can
+                 * arrive before the ack/GARP, and a flow that creates its own
+                 * no-NAT entry here cannot be fixed by a later UPSERT. */
+                hadc_conntrack_apply_shadow(ctx);
+                if (hadc_cluster_send_takeover_prep(ctx) == 0) {
+                    uint32_t wait_ms = ctx->conf.apply.handoff_hold_ms ? ctx->conf.apply.handoff_hold_ms : 5000;
+                    if (wait_ms < 1000)
+                        wait_ms = 1000;
+                    ctx->promotion_finalize_at_ms = (uint64_t)hadc_now_ms() + wait_ms;
+                    deferred = true;
+                    hadc_info("promotion: local env ready (public ip+routing verified, VIPs assigned, no GARP yet); signaled %s to steer via the /+1 routes; awaiting ack (budget %ums)",
+                              ctx->takeover_from, wait_ms);
+                }
             }
         }
         if (!deferred)

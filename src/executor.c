@@ -675,6 +675,77 @@ static struct rtnl_route *find_prefix_route(struct nl_cache *cache, const struct
 	return m.found;
 }
 
+/* All live routes for a prefix, regardless of gateway (cleanup of stale
+ * steering routes installed via an earlier nexthop). */
+struct prefix_collect {
+	struct in_addr dst;
+	unsigned plen;
+	struct rtnl_route *out[16];
+	size_t n;
+};
+
+static void prefix_collect_cb(struct nl_object *obj, void *p)
+{
+	struct prefix_collect *c = p;
+	struct rtnl_route *r = (struct rtnl_route *)obj;
+	struct nl_addr *dst = rtnl_route_get_dst(r);
+	uint32_t base, got;
+
+	if (c->n >= sizeof(c->out) / sizeof(c->out[0]))
+		return;
+	if (rtnl_route_get_type(r) != RTN_UNICAST)
+		return;
+	if (!dst || nl_addr_get_family(dst) != AF_INET || nl_addr_get_len(dst) != 4 ||
+	    nl_addr_get_prefixlen(dst) != c->plen)
+		return;
+	base = ntohl(c->dst.s_addr) & hadc_ipv4_prefix_mask_host(c->plen);
+	got = ntohl(*(const uint32_t *)nl_addr_get_binary_addr(dst)) & hadc_ipv4_prefix_mask_host(c->plen);
+	if (got != base)
+		return;
+	c->out[c->n++] = r;
+}
+
+static size_t collect_prefix_routes(struct nl_cache *cache, const struct in_addr *dst,
+    unsigned plen, struct rtnl_route *out[], size_t max)
+{
+	struct prefix_collect c;
+	memset(&c, 0, sizeof(c));
+	c.dst = *dst;
+	c.plen = plen;
+	nl_cache_foreach(cache, prefix_collect_cb, &c);
+	size_t n = c.n < max ? c.n : max;
+	for (size_t i = 0; i < n; i++)
+		out[i] = c.out[i];
+	return n;
+}
+
+/* True when a route has at least one nexthop via gw. */
+static bool route_has_gateway(struct rtnl_route *r, const struct in_addr *gw)
+{
+	struct nl_addr *g;
+	for (int i = 0; i < rtnl_route_get_nnexthops(r); i++) {
+		g = rtnl_route_nh_get_gateway(rtnl_route_nexthop_n(r, i));
+		if (g && nl_addr_get_len(g) == 4 &&
+		    memcmp(nl_addr_get_binary_addr(g), gw, 4) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* Is this gateway one of ours (a cluster sync address or a steering nexthop
+ * we previously used)?  Used to avoid treating third-party /1 routes (e.g.
+ * VPN default-gateway def1) as our stale state. */
+static bool steering_nexthop_known(hadc_ctx_t *ctx, struct rtnl_route *r)
+{
+	for (size_t i = 0; i < ctx->conf.n_members; i++)
+		if (route_has_gateway(r, &ctx->conf.members[i].sync_address))
+			return true;
+	if (g_applied_valid && g_applied.steer_via.s_addr &&
+	    route_has_gateway(r, &g_applied.steer_via))
+		return true;
+	return false;
+}
+
 /* Seamless-takeover VIP splits: for each cluster address with a CIDR prefix
  * (prefixlen <= 31), the two sub-prefixes at prefixlen+1 covering its subnet.
  * They beat the connected route for the subnet, so forwarded traffic for
@@ -720,6 +791,99 @@ size_t vip_splits(const hadc_desired_t *d, const struct in_addr *via,
 		}
 	}
 	return n;
+}
+
+/* Count steering-prefix routes in rcache that are NOT via the expected
+ * gateway.  When steering is off (expected==NULL) every such route via a
+ * known cluster nexthop is stale.  Called unconditionally by drift verify so
+ * leftovers from an earlier hold are detected even after g_applied cleared. */
+static int steering_route_stale_count(hadc_ctx_t *ctx, struct nl_cache *rcache,
+    const struct in_addr *expected, const hadc_desired_t *d)
+{
+	static const struct in_addr split_low = { 0 };
+	struct in_addr split_high;
+	struct in_addr prefixes[2 + VIP_SPLIT_MAX];
+	unsigned plens[2 + VIP_SPLIT_MAX];
+	size_t n = 0;
+	int stale = 0;
+	struct rtnl_route *routes[16];
+
+	split_high.s_addr = htonl(0x80000000u);
+	prefixes[n] = split_low;     plens[n++] = 1;
+	prefixes[n] = split_high;    plens[n++] = 1;
+	/* vip_splits skips the subnet containing the nexthop; pass a zero
+	 * nexthop when steering is off so all subnets are considered. */
+	static const struct in_addr no_via = { 0 };
+	{
+		vip_split_t vips[VIP_SPLIT_MAX];
+		size_t nv = vip_splits(d, &no_via, vips, VIP_SPLIT_MAX);
+		for (size_t i = 0; i < nv && n < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+			prefixes[n] = vips[i].net;
+			plens[n++] = vips[i].plen;
+		}
+	}
+	for (size_t i = 0; i < n; i++) {
+		size_t nr = collect_prefix_routes(rcache, &prefixes[i], plens[i],
+		    routes, sizeof(routes) / sizeof(routes[0]));
+		for (size_t j = 0; j < nr; j++) {
+			if (!steering_nexthop_known(ctx, routes[j]))
+				continue; /* not one of ours */
+			if (expected && route_has_gateway(routes[j], expected))
+				continue; /* correct nexthop */
+			stale++;
+		}
+	}
+	return stale;
+}
+
+/* Delete every steering split route via a cluster nexthop other than
+ * expected (NULL = all of them).  Returns the number of failed deletes. */
+static int steering_route_cleanup(hadc_ctx_t *ctx, struct nl_sock *sk,
+    struct nl_cache *rcache, const hadc_desired_t *d,
+    const struct in_addr *expected, const char *reason)
+{
+	static const struct in_addr split_low = { 0 };
+	struct in_addr split_high;
+	struct in_addr prefixes[2 + VIP_SPLIT_MAX];
+	unsigned plens[2 + VIP_SPLIT_MAX];
+	size_t n = 0;
+	static const struct in_addr no_via = { 0 };
+	struct rtnl_route *routes[16];
+	int failed = 0;
+
+	split_high.s_addr = htonl(0x80000000u);
+	prefixes[n] = split_low;  plens[n++] = 1;
+	prefixes[n] = split_high; plens[n++] = 1;
+	{
+		vip_split_t vips[VIP_SPLIT_MAX];
+		size_t nv = vip_splits(d, &no_via, vips, VIP_SPLIT_MAX);
+		for (size_t i = 0; i < nv && n < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+			prefixes[n] = vips[i].net;
+			plens[n++] = vips[i].plen;
+		}
+	}
+	for (size_t i = 0; i < n; i++) {
+		char dstbuf[INET_ADDRSTRLEN];
+		hadc_ipv4_format(prefixes[i], dstbuf, sizeof(dstbuf));
+		size_t nr = collect_prefix_routes(rcache, &prefixes[i], plens[i],
+		    routes, sizeof(routes)/sizeof(routes[0]));
+		for (size_t j = 0; j < nr; j++) {
+			if (!steering_nexthop_known(ctx, routes[j]))
+				continue;
+			if (expected && route_has_gateway(routes[j], expected))
+				continue;
+			int ar = rtnl_route_delete(sk, routes[j], 0);
+			if (ar < 0 && ar != -NLE_OBJ_NOTFOUND) {
+				hadc_warn("executor: deleting stale steering route %s/%u failed: %s",
+				    dstbuf, plens[i], nl_geterror(ar));
+				failed++;
+			} else {
+				hadc_info("executor: removed stale steering route %s/%u (reason=%s)",
+				    dstbuf, plens[i], reason);
+			}
+		}
+	}
+	return failed;
 }
 
 static int nl_route_del_default_table(struct nl_sock *sk, uint32_t table, const struct in_addr *gw)
@@ -1397,6 +1561,11 @@ static int verify_desired(hadc_ctx_t *ctx, const hadc_desired_t *d)
 					drift++;
 			}
 		}
+		/* Stale split routes via an old nexthop survive if a delete failed
+		 * or the handoff target changed mid-hold.  Check unconditionally:
+		 * once g_applied.steer_via clears, the block above cannot see them. */
+		drift += steering_route_stale_count(ctx, rcache,
+		    d->steer_via.s_addr ? &d->steer_via : NULL, d);
 	}
 out:
 	if (link)
@@ -1909,36 +2078,17 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 					hadc_info("executor: added steering route %s/%u via %s (reason=%s)",
 					    dstbuf, vips[i].plen, viabuf, reason);
 			}
+			/* Handoff target may have changed mid-hold: remove split
+			 * routes still pointing at the previous nexthop. */
+			if (steering_route_cleanup(ctx, g_sk, rcache, desired,
+			        &desired->steer_via, reason))
+				fatal = -1;
 		} else if (prev && prev->steer_via.s_addr) {
-			char viabuf[INET_ADDRSTRLEN];
-			hadc_ipv4_format(prev->steer_via, viabuf, sizeof(viabuf));
-			for (size_t i = 0; i < 2; i++) {
-				char dstbuf[INET_ADDRSTRLEN];
-				hadc_ipv4_format(*split[i], dstbuf, sizeof(dstbuf));
-				sroute = find_prefix_route(rcache, split[i], 1, &prev->steer_via);
-				if (!sroute)
-					continue;
-				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
-					hadc_warn("executor: deleting steering route %s/1 via %s failed: %s",
-					    dstbuf, viabuf, nl_geterror(ar));
-				else
-					hadc_info("executor: removed steering route %s/1 via %s (reason=%s)",
-					    dstbuf, viabuf, reason);
-			}
-			n_vips = vip_splits(prev, &prev->steer_via, vips, VIP_SPLIT_MAX);
-			for (size_t i = 0; i < n_vips; i++) {
-				char dstbuf[INET_ADDRSTRLEN];
-				hadc_ipv4_format(vips[i].net, dstbuf, sizeof(dstbuf));
-				sroute = find_prefix_route(rcache, &vips[i].net, vips[i].plen, &prev->steer_via);
-				if (!sroute)
-					continue;
-				if ((ar = rtnl_route_delete(g_sk, sroute, 0)) < 0)
-					hadc_warn("executor: deleting steering route %s/%u via %s failed: %s",
-					    dstbuf, vips[i].plen, viabuf, nl_geterror(ar));
-				else
-					hadc_info("executor: removed steering route %s/%u via %s (reason=%s)",
-					    dstbuf, vips[i].plen, viabuf, reason);
-			}
+			/* Delete every live split route via a known cluster nexthop,
+			 * not just the last desired one: a failed delete or a target
+			 * change mid-hold can leave routes via earlier nexthops behind. */
+			if (steering_route_cleanup(ctx, g_sk, rcache, prev, NULL, reason))
+				fatal = -1; /* keep g_applied; retry on next audit */
 		}
 	}
 

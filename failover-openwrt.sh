@@ -471,7 +471,8 @@ if [ "$BASELINE_COUNT" -gt 0 ]; then
 		pat="sport=${o_sp}[[:space:]]+dport=${o_dp}|sport=${r_sp}[[:space:]]+dport=${r_dp}"
 		for ef in "$CAP_DIR"/analysis/*-events.log; do
 			[ -f "$ef" ] || continue
-			line=$(grep -E "$pat" "$ef" 2>/dev/null | grep -E 'CLOSE_WAIT|LAST_ACK|TIME_WAIT|CLOSE|FIN_WAIT|DELETE|DESTROY|REPLACED' | head -n 1 || true)
+			line=$(grep -E "$pat" "$ef" 2>/dev/null | grep -E 'CLOSE_WAIT|LAST_ACK|TIME_WAIT|CLOSE|FIN_WAIT|DELETE|DESTROY|REPLACED' |
+				awk '!/packets=0 bytes=0/ || /packets=[1-9]/' | head -n 1 || true)
 			[ -n "$line" ] || continue
 			printf '%s\t%s\t%s\n' "$opair $rpair" "$(basename "$ef")" "$line" >>"$EVENT_HITS"
 		done

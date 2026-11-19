@@ -326,9 +326,14 @@ done
 if [[ -n "$ok_node2" && -n "$ok_node1" ]]; then
     r1="$(ip netns exec "$NS1" ip -4 route show table main 2>/dev/null || true)"
     if ! printf '%s' "$r1" | grep -q "via $FAB2_IP"; then
-        pass "all steering routes (split /1s and VIP splits) removed after the hold"
+        pass "all steering routes via the handoff target removed after the hold"
     else
-        fail "steering routes lingered after the hold"
+        fail "steering routes via the handoff target lingered after the hold"
+    fi
+    if ! printf '%s' "$r1" | grep -Eq '^0\.0\.0\.0/1 |^128\.0\.0\.0/1 '; then
+        pass "no /+1 split routes remain via any gateway after the hold"
+    else
+        fail "stale /+1 split route lingered after the hold (via any gateway)"
     fi
     if ip netns exec "$NS1" ip -4 addr show dev "$VIP_IF" | grep -q "$VIP_IP"; then
         fail "node1 still holds the VIP after the hold"

@@ -224,6 +224,7 @@ struct hadc_conntrack {
     int slave_apply_mode;
     uint32_t max_entry_age_s;
     bool upsert_fixes;
+    uint16_t debug_port;
 
     hadc_role_t role;
     char self[HADC_NODE_ID_MAX];
@@ -537,6 +538,7 @@ static uint8_t  nla_get_u8 (struct nlattr *n){ uint8_t v=0; if(n&&HADC_NLA_DATAL
 
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
+static void ct_debug_entry(const struct hadc_conntrack *ct, const char *tag, const hadc_ct_entry_v1_t *e);
 
 static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b);
 static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude);
@@ -750,6 +752,19 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
             if (pmin) { out->nat_dst_port = nla_get_u16(pmin); out->flags |= 0x20; }
         }
     }
+    /* Kernel dumps/events on some versions omit CTA_NAT_SRC even though the
+     * reply tuple is already translated.  Derive the binding from the tuples so
+     * the slave can rebuild NAT on apply; explicit kernel attributes above win. */
+    if (!nats && out->repl_dst != out->orig_src) {
+        out->nat_src_ip = out->repl_dst;
+        out->nat_src_port = out->repl_dport;
+        out->flags |= 0x10;
+    }
+    if (!natd && out->repl_src != out->orig_dst) {
+        out->nat_dst_ip = out->repl_src;
+        out->nat_dst_port = out->repl_sport;
+        out->flags |= 0x20;
+    }
     if (sao) {
         struct nlattr *sa=(struct nlattr*)HADC_NLA_DATA(sao); int sl=HADC_NLA_DATALEN(sao);
         struct nlattr *cp=nla_find(sa,sl,CTA_SEQADJ_CORRECTION_POS), *ob=nla_find(sa,sl,CTA_SEQADJ_OFFSET_BEFORE), *oa=nla_find(sa,sl,CTA_SEQADJ_OFFSET_AFTER);
@@ -929,6 +944,7 @@ static void shadow_flush_timer_dirty(struct hadc_conntrack *ct)
 
 static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude)
 {
+    ct_debug_entry(ct, "tx", e);
     for (size_t i = 0; i < ct->n_peers; i++) {
         hadc_ct_peer_t *p = &ct->peers[i];
         if (!p->connected || !p->hello_ok) continue;
@@ -1044,7 +1060,10 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
             size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_SRC);
             if (nn != (size_t)-1) {
                 if (e->nat_src_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_src_ip, 4);
-                if (e->nat_src_port || e->proto == IPPROTO_TCP || e->proto == IPPROTO_UDP || e->proto == IPPROTO_SCTP || e->proto == IPPROTO_UDPLITE || e->proto == IPPROTO_DCCP) {
+                /* Only advertise an explicit port range when the replicated
+                 * entry actually has one. Sending min=max=0 makes the kernel
+                 * pick an arbitrary port, breaking port-preserving flows. */
+                if (e->nat_src_port) {
                     size_t pn = nla_nest_start(buf, buflen, &off, CTA_NAT_PROTO);
                     if (pn != (size_t)-1) {
                         (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MIN, e->nat_src_port);
@@ -1059,7 +1078,7 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
             size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_DST);
             if (nn != (size_t)-1) {
                 if (e->nat_dst_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_dst_ip, 4);
-                if (e->nat_dst_port || e->proto == IPPROTO_TCP || e->proto == IPPROTO_UDP || e->proto == IPPROTO_SCTP || e->proto == IPPROTO_UDPLITE || e->proto == IPPROTO_DCCP) {
+                if (e->nat_dst_port) {
                     size_t pn = nla_nest_start(buf, buflen, &off, CTA_NAT_PROTO);
                     if (pn != (size_t)-1) {
                         (void)nla_put_u16(buf, buflen, &off, CTA_PROTONAT_PORT_MIN, e->nat_dst_port);
@@ -1123,6 +1142,7 @@ static hadc_ct_apply_pending_t *ctnl_find_apply(struct hadc_conntrack *ct, uint3
 static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool is_del)
 {
     if (!ct || ct->ctnl_fd < 0 || !e) return -1;
+    ct_debug_entry(ct, is_del ? "apply-del" : "apply", e);
     /* Expectations are not fully representable in v1 wire/apply record; do not
      * mis-apply them as conntrack entries. Keep replicated/shadowed for
      * visibility and resync, but skip kernel apply on slave. */
@@ -1248,7 +1268,6 @@ static void drain_ctnl(struct hadc_conntrack *ct){
                         ap->create = false;
                         ap->retries++;
                         ap->next_retry_ms = 0;
-                        if (ctnl_send_apply(ct, ap) < 0) { ap->in_use = false; ct->st.dropped_entries++; }
                     } else if (!ap->is_del && e == ENOENT && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
                         /* missing during replace attempt, retry as create */
                         ap->create = true;
@@ -1502,6 +1521,7 @@ static void snapshot_config_locked(struct hadc_conntrack *ct, hadc_ctx_t *ctx)
     ct->slave_apply_mode = (int)ctx->conf.conntrack_sync.apply.slave_apply;
     ct->max_entry_age_s = ctx->conf.conntrack_sync.apply.max_entry_age_s;
     ct->upsert_fixes = ctx->conf.conntrack_sync.apply.upsert_fixes;
+    ct->debug_port = ctx->conf.conntrack_sync.apply.debug_port;
     ct->role = ctx->role;
     snprintf(ct->self, sizeof(ct->self), "%s", ctx->conf.self);
     snprintf(ct->interface, sizeof(ct->interface), "%s", ctx->conf.interface);
@@ -1705,6 +1725,30 @@ static void ct_entry_log_tuple(char *buf, size_t buflen, const hadc_ct_entry_v1_
              rs[0]?rs:"0.0.0.0", (unsigned)ntohs(e->repl_sport),
              rd[0]?rd:"0.0.0.0", (unsigned)ntohs(e->repl_dport),
              (unsigned)e->zone, (unsigned)e->mark);
+}
+
+/* Debug instrumentation: at info level, log the full wire record on both sides
+ * and at the kernel apply for one configured port.  Lets a failover capture
+ * show whether a bad tuple originated with the sender or the applier. */
+static void ct_debug_entry(const struct hadc_conntrack *ct, const char *tag,
+                           const hadc_ct_entry_v1_t *e)
+{
+    if (!ct || !e || !ct->debug_port)
+        return;
+    uint16_t os = (uint16_t)ntohs(e->orig_sport), ds = (uint16_t)ntohs(e->orig_dport);
+    uint16_t rs = (uint16_t)ntohs(e->repl_sport), rd = (uint16_t)ntohs(e->repl_dport);
+    if (os != ct->debug_port && ds != ct->debug_port &&
+        rs != ct->debug_port && rd != ct->debug_port)
+        return;
+    char desc[256];
+    ct_entry_log_tuple(desc, sizeof(desc), e);
+    hadc_info("conntrack debug %s: %s proto=%u ct_kind=%u flags=0x%x status=0x%x timeout=%u "
+              "nat_src_ip=%08x nat_src_port=%u nat_dst_ip=%08x nat_dst_port=%u seqadj_o=%d/%d",
+              tag, desc, (unsigned)e->proto, (unsigned)e->ct_kind, (unsigned)e->flags,
+              (unsigned)e->status, (unsigned)e->timeout_s,
+              (unsigned)e->nat_src_ip, (unsigned)ntohs(e->nat_src_port),
+              (unsigned)e->nat_dst_ip, (unsigned)ntohs(e->nat_dst_port),
+              (int)e->seqadj_orig_offset_before, (int)e->seqadj_orig_offset_after);
 }
 
 static void send_hello(struct hadc_conntrack *ct, hadc_ct_peer_t *p)
@@ -1917,6 +1961,7 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
     if ((h->type == HADC_CT_MSG_SNAPSHOT_ENTRY || h->type == HADC_CT_MSG_UPSERT || h->type == HADC_CT_MSG_DELETE) &&
         ntohl(h->len) >= sizeof(hadc_ct_entry_v1_t)) {
         const hadc_ct_entry_v1_t *e = (const hadc_ct_entry_v1_t *)payload;
+        ct_debug_entry(ct, "rx", e);
         const char *reason = NULL;
         bool del = (h->type == HADC_CT_MSG_DELETE) || (e->flags & 8);
         if (ct->role == HADC_ROLE_SLAVE) {
@@ -2498,6 +2543,20 @@ void hadc_conntrack_notify_config(hadc_ctx_t *ctx)
 void hadc_conntrack_notify_vip(hadc_ctx_t *ctx)
 {
     hadc_conntrack_notify_config(ctx);
+}
+
+/* Synchronously push the replicated shadow table into the kernel.  Used by a
+ * promoting node before it signals the old master: steering traffic can arrive
+ * before the GARP/ack, so the NAT/conntrack state must already be installed. */
+void hadc_conntrack_apply_shadow(hadc_ctx_t *ctx)
+{
+    struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
+    if (!ct || !ct->enabled)
+        return;
+    pthread_mutex_lock(&ct->lock);
+    ct->apply_shadow_pending = false;
+    apply_shadow_all(ct);
+    pthread_mutex_unlock(&ct->lock);
 }
 
 int hadc_conntrack_resync(hadc_ctx_t *ctx)

@@ -45,6 +45,7 @@ void hadc_conntrack_shutdown(hadc_ctx_t *ctx);
 void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role_t new_role);
 void hadc_conntrack_notify_config(hadc_ctx_t *ctx);
 void hadc_conntrack_notify_vip(hadc_ctx_t *ctx);
+void hadc_conntrack_apply_shadow(hadc_ctx_t *ctx);
 int hadc_conntrack_resync(hadc_ctx_t *ctx);
 int hadc_conntrack_compare(hadc_ctx_t *ctx);
 bool hadc_conntrack_compare_done(const hadc_ctx_t *ctx);

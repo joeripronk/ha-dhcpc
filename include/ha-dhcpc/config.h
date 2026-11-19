@@ -178,6 +178,7 @@ typedef struct {
             enum { HADC_CT_APPLY_STAGED = 0, HADC_CT_APPLY_IMMEDIATE = 1 } slave_apply;
             uint32_t max_entry_age_s;
             bool upsert_fixes; /* apply/report upsert fixes; false = log only */
+            uint16_t debug_port; /* 0 = off; log full wire entry on tx/rx/apply for this port */
         } apply;
     } conntrack_sync;
     char ctl_socket[HADC_PATH_MAX];

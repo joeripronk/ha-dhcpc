@@ -904,6 +904,7 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     out->conntrack_sync.apply.slave_apply = HADC_CT_APPLY_STAGED;
     out->conntrack_sync.apply.max_entry_age_s = 300;
     out->conntrack_sync.apply.upsert_fixes = true;
+    out->conntrack_sync.apply.debug_port = 0;
     {
         json_t *r = json_object_get(root, "routing");
         if (r) {
@@ -1214,6 +1215,12 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 }
                 out->conntrack_sync.apply.max_entry_age_s = (uint32_t)v;
                 if (get_bool(ap, "upsert_fixes", &out->conntrack_sync.apply.upsert_fixes, true)) goto derr;
+                if (get_int(ap, "debug_port", &v, 0, false, "conntrack_sync.apply")) goto derr;
+                if (v < 0 || v > 65535) {
+                    snprintf(err, errlen, "config: conntrack_sync.apply.debug_port out of range 0..65535");
+                    goto derr;
+                }
+                out->conntrack_sync.apply.debug_port = (uint16_t)v;
             }
         }
     }
