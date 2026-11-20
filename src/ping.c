@@ -161,6 +161,10 @@ static void send_probe(hadc_ctx_t *ctx, uint64_t now)
         char gwbuf[INET_ADDRSTRLEN];
         hadc_warn("gwping: probe to %s failed: %s", hadc_ipv4_format(to.sin_addr, gwbuf, sizeof(gwbuf)),
                   strerror(errno));
+        /* Count this like an unanswered probe: otherwise the timeout path
+         * never runs and the gateway can never be declared unreachable. */
+        g_last_send_ms = now;
+        g_awaiting = true;
         return;
     }
     g_last_send_ms = now;

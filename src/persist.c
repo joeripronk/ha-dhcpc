@@ -122,8 +122,17 @@ static int persist_write_file(const char *path, const char *json)
         fclose(f);
         return -1;
     }
-    fsync(fileno(f));
-    fclose(f);
+    if (fsync(fileno(f)) != 0) {
+        hadc_err("persist: fsync %s failed: %s", tmp, strerror(errno));
+        fclose(f);
+        unlink(tmp);
+        return -1;
+    }
+    if (fclose(f) != 0) {
+        hadc_err("persist: close %s failed: %s", tmp, strerror(errno));
+        unlink(tmp);
+        return -1;
+    }
     if (rename(tmp, path) != 0) {
         hadc_err("persist: rename to %s: %s", path, strerror(errno));
         return -1;

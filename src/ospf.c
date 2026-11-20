@@ -328,11 +328,14 @@ int hadc_ospf_init(hadc_ctx_t *ctx)
             json_t *jt = json_object_get(e, "type"), *ji = json_object_get(e, "id"),
                    *js = json_object_get(e, "seq"), *ja = json_object_get(e, "age"),
                    *jb = json_object_get(e, "body_hex");
-            if (!jt || !ji || !js || !ja || !jb || !json_is_string(jb))
+            if (!jt || !ji || !js || !ja || !jb || !json_is_string(jb) ||
+                !json_is_integer(jt) || !json_is_integer(ji) ||
+                !json_is_integer(js) || !json_is_integer(ja))
                 continue;
             const char *hx = json_string_value(jb);
             size_t blen = strlen(hx) / 2;
-            if (blen > OSPF_MTU)
+            /* full[] below holds hdr + body; a larger body would overflow it */
+            if (blen > OSPF_MTU - sizeof(ospf_lsa_hdr_t))
                 break;
             ospf_lsa_t *ls = &g_ospf.lsdb[g_ospf.n_lsas];
             memset(ls, 0, sizeof(*ls));
@@ -818,7 +821,12 @@ static size_t lsa_wire_len(ospf_lsa_t *e)
     return l;
 }
 
-static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
+/* Build one LS Update starting at LSDB index start. *next is the first index
+ * not included; returns 1 when more sendable LSAs remain, so callers can page
+ * the whole LSDB across several packets instead of silently dropping entries
+ * that exceed one MTU-sized packet. */
+static int build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only,
+                          size_t start, size_t *next)
 {
     memset(buf, 0, OSPF_MTU);
     ospf_hdr_t *h = (ospf_hdr_t *)buf;
@@ -826,17 +834,20 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
     h->type = OSPF_LSUPDATE;
     h->router_id = htonl(g_ospf.router_id);
     h->area_id = htonl(OSPF_AREA_BACKBONE);
-    size_t off = sizeof(*h) + 4; /* + #lsas */
+    size_t base = sizeof(*h) + 4; /* + #lsas */
+    size_t max_lsa = OSPF_MTU - base;
+    size_t off = base;
     uint32_t nlsas = 0;
-    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+    size_t i = start;
+    for (; i < g_ospf.n_lsas; i++) {
         ospf_lsa_t *e = &g_ospf.lsdb[i];
-        if (!e->valid)
-            continue;
-        if (self_only && !e->self)
+        if (!e->valid || (self_only && !e->self))
             continue;
         size_t l = lsa_wire_len(e);
+        if (l > max_lsa)
+            continue; /* cannot fit in any packet */
         if (off + l > OSPF_MTU)
-            continue; /* try to fit smaller ones later */
+            break;
         memcpy(buf + off, &e->hdr, sizeof(e->hdr));
         if (e->body_len && e->body)
             memcpy(buf + off + sizeof(e->hdr), e->body, e->body_len);
@@ -847,6 +858,15 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
         off += l;
         nlsas++;
     }
+    *next = i;
+    int more = 0;
+    for (size_t j = i; j < g_ospf.n_lsas; j++) {
+        ospf_lsa_t *e = &g_ospf.lsdb[j];
+        if (e->valid && (!self_only || e->self) && lsa_wire_len(e) <= max_lsa) {
+            more = 1;
+            break;
+        }
+    }
     uint32_t nl = htonl(nlsas);
     memcpy(buf + sizeof(*h), &nl, 4);
     h->length = htons((uint16_t)off);
@@ -854,32 +874,42 @@ static void build_lsupdate(uint8_t *buf, size_t *outlen, bool self_only)
     h->checksum = 0;
     h->checksum = hadc_checksum_host(buf, off);
     *outlen = off;
+    return more;
 }
 
 static void flood_lsas_to_neighbor(ospf_neighbor_t *n, bool self_only)
 {
     uint8_t pkt[OSPF_MTU];
-    size_t len = 0;
-    build_lsupdate(pkt, &len, self_only);
-    if (len <= sizeof(ospf_hdr_t) + 4)
-        return; /* no lsas */
-    /* add sent LSAs to retransmission list */
-    uint32_t nlsas = 0;
-    memcpy(&nlsas, pkt + sizeof(ospf_hdr_t), 4);
-    nlsas = ntohl(nlsas);
-    size_t off = sizeof(ospf_hdr_t) + 4;
-    for (uint32_t i = 0; i < nlsas && off + sizeof(ospf_lsa_hdr_t) <= len; i++) {
-        const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
-        uint16_t llen = ntohs(lh->length);
-        if (llen < sizeof(*lh) || off + llen > len) break;
-        nbr_lsrx_add(n, lh);
-        off += llen;
-    }
-    send_to(n->ip, n->ifindex, pkt, len);
-    {
+    size_t cursor = 0;
+    for (;;) {
+        size_t len = 0, next = cursor;
+        int more = build_lsupdate(pkt, &len, self_only, cursor, &next);
+        if (next <= cursor && more)
+            break; /* no progress: avoid spinning on an unsendable entry */
+        cursor = next;
+        if (len <= sizeof(ospf_hdr_t) + 4) {
+            if (!more)
+                break;
+            continue;
+        }
+        /* add sent LSAs to retransmission list */
+        uint32_t nlsas = 0;
+        memcpy(&nlsas, pkt + sizeof(ospf_hdr_t), 4);
+        nlsas = ntohl(nlsas);
+        size_t off = sizeof(ospf_hdr_t) + 4;
+        for (uint32_t k = 0; k < nlsas && off + sizeof(ospf_lsa_hdr_t) <= len; k++) {
+            const ospf_lsa_hdr_t *lh = (const ospf_lsa_hdr_t *)(pkt + off);
+            uint16_t llen = ntohs(lh->length);
+            if (llen < sizeof(*lh) || off + llen > len) break;
+            nbr_lsrx_add(n, lh);
+            off += llen;
+        }
+        send_to(n->ip, n->ifindex, pkt, len);
         char nbuf[INET_ADDRSTRLEN];
         hadc_dbg("ospf: sent LS Update (%s, %u lsas) to %s", self_only ? "self" : "lsdb",
                  nlsas, hadc_ipv4_format(n->ip, nbuf, sizeof(nbuf)));
+        if (!more)
+            break;
     }
 }
 
@@ -1386,54 +1416,59 @@ static void handle_lsreq(const uint8_t *pkt, size_t len, struct in_addr src, osp
 {
     if (len < sizeof(ospf_hdr_t) + 12)
         return;
-    size_t off = sizeof(ospf_hdr_t);
-    uint8_t out[OSPF_MTU];
-    memset(out, 0, sizeof(out));
-    ospf_hdr_t *oh = (ospf_hdr_t *)out;
-    oh->version = OSPF_VERSION;
-    oh->type = OSPF_LSUPDATE;
-    oh->router_id = htonl(g_ospf.router_id);
-    oh->area_id = htonl(OSPF_AREA_BACKBONE);
-    size_t ooff = sizeof(ospf_hdr_t) + 4;
-    uint32_t nlsas = 0;
-    while (off + 12 <= len) {
-        uint32_t type, id, adv;
-        memcpy(&type, pkt + off, 4);
-        memcpy(&id, pkt + off + 4, 4);
-        memcpy(&adv, pkt + off + 8, 4);
-        off += 12;
-        ospf_lsa_hdr_t key = {0};
-        key.type = (uint8_t)ntohl(type);
-        key.id = id;
-        key.adv_router = adv;
-        ospf_lsa_t *e = find_lsa(&key);
-        if (!e || !e->valid)
-            continue;
-        size_t l = sizeof(ospf_lsa_hdr_t) + e->body_len;
-        if (ooff + l > OSPF_MTU)
-            break;
-        memcpy(out + ooff, &e->hdr, sizeof(e->hdr));
-        if (e->body_len && e->body)
-            memcpy(out + ooff + sizeof(e->hdr), e->body, e->body_len);
-        lsa_checksum(out + ooff, l);
-        ooff += l;
-        nlsas++;
-    }
-    if (!nlsas)
-        return;
-    uint32_t nl = htonl(nlsas);
-    memcpy(out + sizeof(ospf_hdr_t), &nl, 4);
-    oh->length = htons((uint16_t)ooff);
-    apply_auth(oh, g_ospf.ctx, out, ooff);
-    oh->checksum = 0;
-    oh->checksum = hadc_checksum_host(out, ooff);
-    if (iface && iface->ifindex)
-        send_to(src, iface->ifindex, out, ooff);
-    else
-        send_to(src, 0, out, ooff);
-    {
-        char sbuf[INET_ADDRSTRLEN];
-        hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s", nlsas, hadc_ipv4_format(src, sbuf, sizeof(sbuf)));
+    size_t req = sizeof(ospf_hdr_t);
+    for (;;) {
+        uint8_t out[OSPF_MTU];
+        memset(out, 0, sizeof(out));
+        ospf_hdr_t *oh = (ospf_hdr_t *)out;
+        oh->version = OSPF_VERSION;
+        oh->type = OSPF_LSUPDATE;
+        oh->router_id = htonl(g_ospf.router_id);
+        oh->area_id = htonl(OSPF_AREA_BACKBONE);
+        size_t ooff = sizeof(ospf_hdr_t) + 4;
+        uint32_t nlsas = 0;
+        while (req + 12 <= len) {
+            uint32_t type, id, adv;
+            memcpy(&type, pkt + req, 4);
+            memcpy(&id, pkt + req + 4, 4);
+            memcpy(&adv, pkt + req + 8, 4);
+            req += 12;
+            ospf_lsa_hdr_t key = {0};
+            key.type = (uint8_t)ntohl(type);
+            key.id = id;
+            key.adv_router = adv;
+            ospf_lsa_t *e = find_lsa(&key);
+            if (!e || !e->valid)
+                continue;
+            size_t l = sizeof(ospf_lsa_hdr_t) + e->body_len;
+            if (ooff + l > OSPF_MTU) {
+                req -= 12; /* retry this request in the next packet */
+                break;
+            }
+            memcpy(out + ooff, &e->hdr, sizeof(e->hdr));
+            if (e->body_len && e->body)
+                memcpy(out + ooff + sizeof(e->hdr), e->body, e->body_len);
+            lsa_checksum(out + ooff, l);
+            ooff += l;
+            nlsas++;
+        }
+        if (nlsas) {
+            uint32_t nl = htonl(nlsas);
+            memcpy(out + sizeof(ospf_hdr_t), &nl, 4);
+            oh->length = htons((uint16_t)ooff);
+            apply_auth(oh, g_ospf.ctx, out, ooff);
+            oh->checksum = 0;
+            oh->checksum = hadc_checksum_host(out, ooff);
+            if (iface && iface->ifindex)
+                send_to(src, iface->ifindex, out, ooff);
+            else
+                send_to(src, 0, out, ooff);
+            char sbuf[INET_ADDRSTRLEN];
+            hadc_dbg("ospf: replied LS Update with %u LSA(s) to LS Request from %s",
+                     nlsas, hadc_ipv4_format(src, sbuf, sizeof(sbuf)));
+        }
+        if (req + 12 > len || !nlsas)
+            break; /* done, or no progress possible */
     }
 }
 
