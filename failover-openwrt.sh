@@ -122,13 +122,15 @@ ct_flows() {
 }
 ct_established() {
 	host=$1
-	# Only flows with enough remaining lifetime to outlive the post-failover
-	# settle plus recheck window: a tuple seconds from expiry is not a failover
-	# disconnect when it disappears. Field 3 of `conntrack -L` is the seconds
-	# remaining.
+	# Optional minimum remaining lifetime, used only when qualifying the
+	# baseline (a flow about to expire is not a failover disconnect). Presence
+	# checks must not filter: a live baseline tuple whose remaining lifetime
+	# drops below that threshold during the window is still alive. Field 3 of
+	# `conntrack -L` is the seconds remaining.
+	min_life=${2:-0}
 	ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$host" \
 		"conntrack -L -p tcp 2>/dev/null | grep ESTABLISHED | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' || true" \
-		2>/dev/null | sed '/^$/d' | awk '$3 >= 90' | sort
+		2>/dev/null | sed '/^$/d' | awk -v min="$min_life" '$3 >= min' | sort
 }
 ct_tuples() {
 	sed -n 's/.*src=\([^ ]*\) dst=\([^ ]*\) sport=\([^ ]*\) dport=\([^ ]*\).*src=\([^ ]*\) dst=\([^ ]*\) sport=\([^ ]*\) dport=\([^ ]*\).*/orig \1:\3->\2:\4 reply \5:\7->\6:\8/p' | sort -u
@@ -315,7 +317,7 @@ analysis_start
 
 echo "== pre-failover =="
 for h in $ALL_HOSTS; do
-	ct_established "$h" >"$tmpdir/pre.$h.raw"
+	ct_established "$h" 90 >"$tmpdir/pre.$h.raw"
 	ct_flows "$h" >"$tmpdir/pre.all.$h.raw"
 	ct_tuples <"$tmpdir/pre.$h.raw" >"$tmpdir/pre.$h.tuples"
 	est=$(wc -l <"$tmpdir/pre.$h.tuples" | tr -d ' ')
