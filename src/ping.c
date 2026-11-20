@@ -88,8 +88,34 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
     for (;;) {
         ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK)
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                break;
+            /* Ping sockets report ICMP errors (EHOSTUNREACH, ENETUNREACH,
+             * ECONNREFUSED, EMSGSIZE, ...) through recv(). Those are missed
+             * probes, not a broken fd: leave g_awaiting set so the timeout
+             * path counts them and the unreachable verdict still fires. */
+            if (errno != EBADF && errno != ENOTSOCK && errno != ENOTCONN) {
                 hadc_dbg("gwping: recv error %s", strerror(errno));
+                break;
+            }
+            /* Genuinely unusable fd: EPOLLERR/HUP with HADC_FD_ERR_DROP
+             * reaches us once before the main loop deregisters. */
+            hadc_warn("gwping: probe socket unusable: %s; restarting", strerror(errno));
+            if (fd == g_fd) {
+                bool was_unreachable = g_unreachable;
+                close(fd);
+                g_fd = -1;
+                g_awaiting = false;
+                g_failures = 0;
+                g_probe_logged = false;
+                ctx->gwping_start_after_ms = hadc_now_ms() + g_interval_ms;
+                if (was_unreachable) {
+                    g_unreachable = false;
+                    g_unreachable_logged = false;
+                    g_unreachable_since_ms = 0;
+                    reroute(ctx, "GWPING-FD-RESET");
+                }
+            }
             break;
         }
         size_t off = 0;
@@ -210,7 +236,7 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
                   strerror(errno));
         goto out;
     }
-    if (hadc_loop_add(ctx, g_fd, ping_ready, 0) != 0) {
+    if (hadc_loop_add(ctx, g_fd, ping_ready, HADC_FD_ERR_DROP) != 0) {
         hadc_warn("gwping: probe fd could not be registered; skipped");
         close(g_fd);
         g_fd = -1;

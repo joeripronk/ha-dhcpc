@@ -43,6 +43,7 @@ typedef struct {
 } ctl_pending_t;
 
 static ctl_pending_t g_pending[CTL_PENDING_MAX];
+static long long g_ctl_retry_at_ms; /* broken listener recreation deadline */
 
 static json_t *status_object(hadc_ctx_t *ctx)
 {
@@ -357,8 +358,22 @@ static void ctl_ready(hadc_ctx_t *ctx, int fd)
      * accept(); without accept4 a client that connects and sends nothing
      * blocks this epoll callback and stalls the whole main loop. */
     int c = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (c < 0)
+    if (c < 0) {
+        /* Deregister here as well: on a plain EPOLLIN the main loop would not
+         * do it, leaving a stale g_fds entry that could match a reused fd.
+         * hadc_ctl_step() recreates the listener after a short delay. */
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR &&
+            errno != EMFILE && errno != ENFILE) {
+            hadc_warn("ctl: listener fd %d unusable: %s", fd, strerror(errno));
+            hadc_loop_del(ctx, fd);
+            close(fd);
+            if (ctx->ctl_fd == fd) {
+                ctx->ctl_fd = -1;
+                g_ctl_retry_at_ms = hadc_now_ms() + 1000;
+            }
+        }
         return;
+    }
     char line[256];
     size_t used = 0;
     for (;;) {
@@ -434,7 +449,7 @@ int hadc_ctl_init(hadc_ctx_t *ctx)
         return -1;
     }
     listen(ctx->ctl_fd, 8);
-    hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, 0);
+    hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, HADC_FD_ERR_DROP);
     snprintf(g_ctl_path, sizeof(g_ctl_path), "%s", addr.sun_path);
     hadc_info("ctl: listening on %s", ctx->conf.ctl_socket);
     return 0;
@@ -494,7 +509,7 @@ int hadc_ctl_rebind(hadc_ctx_t *ctx)
         return -1;
     }
     listen(fd, 8);
-    if (hadc_loop_add(ctx, fd, ctl_ready, 0) != 0) {
+    if (hadc_loop_add(ctx, fd, ctl_ready, HADC_FD_ERR_DROP) != 0) {
         hadc_err("ctl: cannot register new control socket: %s", strerror(errno));
         close(fd);
         unlink(addr.sun_path);
@@ -535,6 +550,11 @@ static char *compare_reply_json(hadc_ctx_t *ctx, bool done)
 
 int hadc_ctl_step(hadc_ctx_t *ctx)
 {
+    if (ctx->ctl_fd < 0 && g_ctl_retry_at_ms &&
+        hadc_now_ms() >= g_ctl_retry_at_ms) {
+        int rc = hadc_ctl_rebind(ctx);
+        g_ctl_retry_at_ms = rc >= 0 ? 0 : hadc_now_ms() + 1000;
+    }
     for (size_t i = 0; i < CTL_PENDING_MAX; i++) {
         ctl_pending_t *p = &g_pending[i];
         if (p->fd < 0)

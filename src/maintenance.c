@@ -89,7 +89,10 @@ static void *worker_main(void *arg)
 int hadc_maint_start(hadc_ctx_t *ctx)
 {
     pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
+    if (pthread_mutexattr_init(&attr) != 0) {
+        hadc_err("maintenance: mutex attribute init failed");
+        return -1;
+    }
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     if (pthread_mutex_init(&g_state_lock, &attr) != 0) {
         pthread_mutexattr_destroy(&attr);
@@ -97,9 +100,15 @@ int hadc_maint_start(hadc_ctx_t *ctx)
         return -1;
     }
     pthread_mutexattr_destroy(&attr);
-    if (pthread_mutex_init(&g_qlock, NULL) != 0 ||
-        pthread_cond_init(&g_qcond, NULL) != 0) {
+    if (pthread_mutex_init(&g_qlock, NULL) != 0) {
+        pthread_mutex_destroy(&g_state_lock);
         hadc_err("maintenance: queue lock init failed");
+        return -1;
+    }
+    if (pthread_cond_init(&g_qcond, NULL) != 0) {
+        pthread_mutex_destroy(&g_qlock);
+        pthread_mutex_destroy(&g_state_lock);
+        hadc_err("maintenance: queue condition init failed");
         return -1;
     }
     g_head = g_tail = NULL;
@@ -107,6 +116,9 @@ int hadc_maint_start(hadc_ctx_t *ctx)
     g_tick_pending = false;
     g_ctx = ctx;
     if (pthread_create(&g_thread, NULL, worker_main, NULL) != 0) {
+        pthread_cond_destroy(&g_qcond);
+        pthread_mutex_destroy(&g_qlock);
+        pthread_mutex_destroy(&g_state_lock);
         hadc_err("maintenance: pthread_create failed");
         return -1;
     }

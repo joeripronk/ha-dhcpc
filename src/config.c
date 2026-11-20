@@ -376,6 +376,8 @@ static int parse_cidr4(const char *s, struct in_addr *out, unsigned *prefixlen)
 int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t *out,
                      char *err, size_t errlen)
 {
+    if (err && errlen)
+        err[0] = '\0';
     char err2[256];
     char *bytes = NULL;
     size_t byteslen = 0;
@@ -1289,6 +1291,8 @@ derr:
  * 0 on success, -1 with err filled. */
 int hadc_config_identity_check(const hadc_conf_t *conf, char *err, size_t errlen)
 {
+    if (err && errlen)
+        err[0] = '\0';
     const hadc_member_t *self = NULL;
     struct ifaddrs *ifas = NULL;
 
