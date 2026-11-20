@@ -53,7 +53,10 @@
 #define HADC_CT_SHADOW_HASH 8192
 #define HADC_CT_TXQ_MAX 1024
 #define HADC_CT_BATCH_MAX 32
-#define HADC_CT_APPLY_PENDING_MAX 2048
+/* Promotion reinstalls each shadow entry with DELETE+CREATE, so allow two
+ * slots per shadow entry plus headroom. */
+#define HADC_CT_APPLY_PENDING_MAX (2 * HADC_CT_SHADOW_MAX + 256)
+#define HADC_CT_APPLY_ACK_MS 1000
 #define HADC_CT_APPLY_MAX_RETRIES 3
 #define HADC_CT_DUMP_EVENT_BUF_MAX 2048
 /* A master's DELETE may be its own local teardown during a handoff, not a
@@ -209,6 +212,7 @@ struct hadc_conntrack {
     hadc_ct_dump_ev_t dump_event_buf[HADC_CT_DUMP_EVENT_BUF_MAX];
     size_t dump_event_count;
     bool dump_event_overflow;
+    bool dump_failed; /* dump failed/overflowed: never send an empty SNAPSHOT_END */
     bool apply_shadow_pending;
     bool rx_snapshot_active;
     bool slave_resync_requested;
@@ -579,6 +583,7 @@ static void ctnl_abort_dump(struct hadc_conntrack *ct)
     ct->ctnl_dump_start_ms = 0;
     ct->dump_event_count = 0;
     ct->dump_event_overflow = false;
+    ct->dump_failed = true; /* never let a slave prune on a partial dump */
 }
 
 static void ctnl_close(struct hadc_conntrack *ct)
@@ -638,6 +643,7 @@ static int ctnl_request_dump(struct hadc_conntrack *ct)
     ct->ctnl_dump_start_ms = (uint64_t)hadc_now_ms();
     ct->dump_event_count = 0;
     ct->dump_event_overflow = false;
+    ct->dump_failed = false;
     hadc_dbg("conntrack: ct dump requested seq=%u", ct->ctnl_dump_seq);
     /* best-effort: also request expectation dump on same socket/seq space logic
      * is complex to multiplex; expectations arrive as events and are treated as
@@ -1095,9 +1101,13 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
      * the already-translated public IP here makes it a no-op that sets only
      * IPS_SRC_NAT_DONE, so outbound packets are never SNATed. Use the original
      * source address and let CTA_NAT_SRC perform the translation. */
+    /* Same rule for destination NAT: repl_src holds the already-translated
+     * destination, so send the original destination and let CTA_NAT_DST do the
+     * translation (netfilter only sets IPS_DST_NAT when the tuple changes). */
+    uint32_t reply_src = (create && (e->flags & 0x20)) ? e->orig_dst : e->repl_src;
     uint32_t reply_dst = (create && (e->flags & 0x10)) ? e->orig_src : e->repl_dst;
     if (!build_tuple_nla(buf, buflen, &off, CTA_TUPLE_REPLY,
-                         e->repl_src, reply_dst, e->proto, e->repl_sport, e->repl_dport)) return 0;
+                         reply_src, reply_dst, e->proto, e->repl_sport, e->repl_dport)) return 0;
 
     if (!is_del) {
         uint32_t timeout = htonl(e->timeout_s ? e->timeout_s : 120);
@@ -1221,12 +1231,12 @@ static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t 
     if (e->ct_kind == 1) return 0;
     hadc_ct_apply_pending_t *ap = ctnl_alloc_apply(ct);
     if (!ap) {
-        /* pending table full: send untracked replace attempt for existing-entry
-         * timeout/status refresh; avoid create-only send that cannot recover
-         * from EEXIST without tuple context. */
+        /* Pending table full: untracked best effort. Still send a real CREATE
+         * for entries (the paired DELETE removed the kernel entry): a
+         * create-less update has no NAT attributes and cannot re-install it. */
         char buf[1024];
         uint32_t seq = ++ct->ctnl_apply_seq;
-        bool create = is_del ? false : false;
+        bool create = !is_del;
         size_t off = ctnl_build_apply_msg(buf, sizeof(buf), e, is_del, create, seq);
         if (!off) return -1;
         struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
@@ -1242,7 +1252,8 @@ static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t 
     ap->is_del = is_del;
     ap->create = !is_del; /* try create; on EEXIST resolve by replacing without CREATE */
     ap->retries = 0;
-    ap->next_retry_ms = 0;
+    /* Arm an ACK timeout: a lost ACK must not pin the slot forever. */
+    ap->next_retry_ms = (uint64_t)hadc_now_ms() + HADC_CT_APPLY_ACK_MS;
     if (ctnl_send_apply(ct, ap) < 0) {
         ap->in_use = false;
         return -1;
@@ -1257,10 +1268,18 @@ static void ctnl_apply_retry_tick(struct hadc_conntrack *ct, uint64_t now)
         hadc_ct_apply_pending_t *ap = &ct->apply_pending[i];
         if (!ap->in_use) continue;
         if (ap->next_retry_ms == 0 || now < ap->next_retry_ms) continue;
+        if (ap->retries >= HADC_CT_APPLY_MAX_RETRIES) {
+            ap->in_use = false;
+            ct->st.dropped_entries++;
+            continue;
+        }
         ap->next_retry_ms = 0;
         if (ctnl_send_apply(ct, ap) < 0) {
             ap->in_use = false;
             ct->st.dropped_entries++;
+        } else {
+            ap->retries++; /* counts resends; ACK handlers only schedule them */
+            ap->next_retry_ms = now + HADC_CT_APPLY_ACK_MS;
         }
     }
 }
@@ -1332,7 +1351,6 @@ static void drain_ctnl(struct hadc_conntrack *ct)
 {
     if(ct->ctnl_fd<0) return;
     char buf[16384];
-    bool in_dump = ct->ctnl_dump_pending && !ct->ctnl_dump_aborted;
     for(;;){
         ssize_t n=recv(ct->ctnl_fd,buf,sizeof(buf),MSG_DONTWAIT);
         if(n<0){ if(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR) break; ctnl_close(ct); return; }
@@ -1345,7 +1363,6 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                     ct->ctnl_dump_pending = false;
                 ct->ctnl_dump_aborted = false;
                 ct->ctnl_dump_start_ms = 0;
-                in_dump = false;
                 continue;
             }
             if(nh->nlmsg_type==NLMSG_ERROR){
@@ -1366,16 +1383,13 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                          * without NAT attrs) to refresh state/timeout only. */
                         ct_debug_entry(ct, e == EOPNOTSUPP ? "retry-nat" : "retry-exists", &ap->e);
                         ap->create = false;
-                        ap->retries++;
                         /* 0 means "no retry scheduled" to the retry tick. */
                         ap->next_retry_ms = (uint64_t)hadc_now_ms();
                     } else if (!ap->is_del && e == ENOENT && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
                         /* missing during replace attempt, retry as create */
                         ap->create = true;
-                        ap->retries++;
                         ap->next_retry_ms = (uint64_t)hadc_now_ms() + 100;
                     } else if ((e == EBUSY || e == EAGAIN) && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
-                        ap->retries++;
                         ap->next_retry_ms = (uint64_t)hadc_now_ms() + 200;
                     } else {
                         ap->in_use = false;
@@ -1393,7 +1407,6 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                             /* dump request failed/aborted: do not send incomplete snapshot */
                             hadc_warn("conntrack: dump nlerr %d seq=%u dump_seq=%u", e, eseq, ct->ctnl_dump_seq);
                             ctnl_abort_dump(ct);
-                            in_dump = false;
                             continue;
                         }
                         /* benign races for best-effort sync (already exists/gone) */
@@ -1407,8 +1420,15 @@ static void drain_ctnl(struct hadc_conntrack *ct)
             }
             if(NFNL_SUBSYS_ID(nh->nlmsg_type)!=NFNL_SUBSYS_CTNETLINK) continue;
             uint16_t mtype_raw = nh->nlmsg_type & 0x00ff;
-            bool event_msg = (mtype_raw == IPCTNL_MSG_CT_NEW || mtype_raw == IPCTNL_MSG_CT_DELETE);
-            bool is_ct_new_msg = (mtype_raw == IPCTNL_MSG_CT_NEW);
+            /* Kernel dump rows reuse IPCTNL_MSG_CT_NEW and carry the dump
+             * request's seq; live multicast events carry seq 0. Treating dump
+             * rows as events fills the event buffer, discards the dump and
+             * sends an empty SNAPSHOT_END that wipes slave state. */
+            bool dump_row = ct->ctnl_dump_pending && !ct->ctnl_dump_aborted &&
+                            nh->nlmsg_seq == ct->ctnl_dump_seq;
+            bool event_msg = !dump_row &&
+                             (mtype_raw == IPCTNL_MSG_CT_NEW || mtype_raw == IPCTNL_MSG_CT_DELETE);
+            bool is_ct_new_msg = !dump_row && mtype_raw == IPCTNL_MSG_CT_NEW;
             hadc_ct_entry_v1_t e; bool del=false; uint32_t ct_id=0;
             if(!parse_ct_entry_v4(nh,&e,&del,&ct_id)) continue;
             const char *reason=NULL;
@@ -1428,7 +1448,7 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                     }
                     continue;
                 }
-                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && !del) {
+                if (dump_row && !del) {
                     master_queue_entry_all(ct, HADC_CT_MSG_SNAPSHOT_ENTRY, &e, NULL);
                     if (ct->timer_sync_interval_s > 0) {
                         hadc_ct_shadow_ent_t *s = shadow_find(ct, &e);
@@ -1440,7 +1460,7 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                     }
                     continue;
                 }
-                if (ct->ctnl_dump_pending && !ct->ctnl_dump_aborted && in_dump && !event_msg && del) {
+                if (dump_row && del) {
                     e.flags |= 8;
                     master_queue_entry_all(ct, HADC_CT_MSG_DELETE, &e, NULL);
                     {
@@ -2414,11 +2434,21 @@ static void *conntrack_thread_main(void *arg)
         /* replay buffered live events after successful dump completion, before ending snapshots */
         if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending && !ct->ctnl_dump_aborted) {
             if (ct->dump_event_overflow) {
-                for (size_t i = 0; i < ct->n_peers; i++)
-                    if (ct->peers[i].connected && ct->peers[i].snapshot_active)
-                        ct->peers[i].need_resync = true;
+                /* The snapshot was partial: never end it (a slave would prune
+                 * on incomplete data), but release each peer's snapshot_active
+                 * so need_resync can start a fresh dump. Leaving it set would
+                 * wedge the peer forever: no SNAPSHOT_END, no new dump. */
+                for (size_t i = 0; i < ct->n_peers; i++) {
+                    hadc_ct_peer_t *p = &ct->peers[i];
+                    if (p->snapshot_active) {
+                        p->snapshot_active = false;
+                        p->need_resync = true;
+                        ct->st.resync_count++;
+                    }
+                }
                 ct->dump_event_count = 0;
                 ct->dump_event_overflow = false;
+                ct->dump_failed = true; /* suppress SNAPSHOT_END: the dump was partial */
             } else if (ct->dump_event_count > 0) {
                 for (size_t di = 0; di < ct->dump_event_count; di++) {
                     hadc_ct_entry_v1_t ee = ct->dump_event_buf[di].e;
@@ -2429,8 +2459,9 @@ static void *conntrack_thread_main(void *arg)
                 ct->dump_event_count = 0;
             }
         }
-        /* if a dump finished, close snapshot for peers after queued entries flush */
-        if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending) {
+        /* if a dump finished successfully, close snapshot for peers after queued
+         * entries flush; a failed/overflowed dump must never end a snapshot. */
+        if (ct->role == HADC_ROLE_MASTER && !ct->ctnl_dump_pending && !ct->dump_failed) {
             for (size_t i = 0; i < ct->n_peers; i++) {
                 hadc_ct_peer_t *p = &ct->peers[i];
                 if (!p->connected || !p->snapshot_active) continue;

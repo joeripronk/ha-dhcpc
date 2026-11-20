@@ -358,7 +358,10 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             /* Keep present/gateway/dns/routes from the synced lease (like master), but no VIPs. */
             if (lease->address.s_addr == 0 || lease->state == HADC_LEASE_NONE)
                 out->present = false;
-        } else {
+        } else if (!forwarding) {
+            /* Only a plain slave drops the lease default route. A designated
+             * master or a node in the post-handoff grace is still forwarding
+             * and must keep it (the forwarding branch below re-enables routes). */
             out->gateway.s_addr = 0;
         }
     } else if (forwarding && lease->state != HADC_LEASE_NONE)
@@ -426,6 +429,11 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
 }
 
 static hadc_desired_t g_applied;
+/* Takeover nft state is tracked separately: an apply can install the chains and
+ * then fail later (fatal route cleanup), leaving g_applied unchanged. Teardown
+ * must follow what was actually installed, not the last committed desired. */
+static hadc_desired_t g_nft_installed;
+static bool g_nft_valid;
 static bool g_applied_valid;
 
 struct addr_match {
@@ -2400,12 +2408,14 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
     bool was_active, is_active;
 
     demote_hold_signature(desired, sig_new, sizeof(sig_new));
-    demote_hold_signature(prev, sig_old, sizeof(sig_old));
-    if (prev && !strcmp(sig_new, sig_old))
-        return; /* no transition, no delta */
+    /* Use what is actually installed, not the last committed desired state. */
+    const hadc_desired_t *installed = g_nft_valid ? &g_nft_installed : prev;
+    demote_hold_signature(installed, sig_old, sizeof(sig_old));
+    if (g_nft_valid && !strcmp(sig_new, sig_old))
+        return; /* already in this state */
 
-    was_active = prev && (prev->vip_hold_suppress || prev->nat_bypass_mark ||
-        prev->nat_bypass_notrack);
+    was_active = installed && (installed->vip_hold_suppress || installed->nat_bypass_mark ||
+        installed->nat_bypass_notrack);
     is_active = desired->vip_hold_suppress || desired->nat_bypass_mark ||
         desired->nat_bypass_notrack;
     if (!was_active && !is_active)
@@ -2417,22 +2427,22 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
      * tables are ours alone — the netdev slave-egress table ha_dhcpc has its
      * own lifecycle and must not share one with the ar_* chains). */
     if (was_active) {
-        if (prev->vip_hold_suppress) {
-            for (size_t i = 0; i < prev->n_cluster_ifaces; i++) {
-                if (!prev->cluster_ifaces[i].n_addrs)
+        if (installed->vip_hold_suppress) {
+            for (size_t i = 0; i < installed->n_cluster_ifaces; i++) {
+                if (!installed->cluster_ifaces[i].n_addrs)
                     continue;
-                nft_chain_name(prev->cluster_ifaces[i].interface, san, sizeof(san));
+                nft_chain_name(installed->cluster_ifaces[i].interface, san, sizeof(san));
                 snprintf(cmd, sizeof(cmd), "nft 'delete chain netdev " HADC_TAKEOVER_NFT_TABLE " ar_%s' 2>/dev/null", san);
                 nft_run(cmd, reason, false);
             }
             nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " out' 2>/dev/null", reason, false);
         }
-        if (prev->nat_bypass_mark || prev->nat_bypass_notrack) {
+        if (installed->nat_bypass_mark || installed->nat_bypass_notrack) {
             nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " pre' 2>/dev/null", reason, false);
             nft_run("nft 'delete chain ip " HADC_TAKEOVER_NFT_TABLE " post' 2>/dev/null", reason, false);
         }
         if (!is_active) {
-            if (prev->vip_hold_suppress)
+            if (installed->vip_hold_suppress)
                 nft_run("nft 'delete table netdev " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null", reason, false);
             nft_run("nft 'delete table ip " HADC_TAKEOVER_NFT_TABLE "' 2>/dev/null", reason, false);
         }
@@ -2440,6 +2450,7 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
 
     if (!is_active) {
         hadc_dbg("executor: takeover ARP/NAT scoping cleared (reason=%s)", reason);
+        g_nft_valid = false;
         return;
     }
 
@@ -2544,6 +2555,8 @@ static void apply_demote_hold_nft(hadc_ctx_t *ctx, const hadc_desired_t *desired
                   "zone-based firewalls must accept marked/untracked steered traffic; "
                   "reason=%s)", m, desired->nat_bypass_notrack ? "on" : "off", reason);
     }
+    g_nft_installed = *desired;
+    g_nft_valid = true;
 }
 
 void hadc_executor_clear_slave_isolation(const char *ifname)

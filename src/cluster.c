@@ -372,6 +372,13 @@ static void set_role(hadc_ctx_t *ctx, hadc_role_t new_role)
         return;
     }
     ctx->role = new_role;
+    if (new_role == HADC_ROLE_DEMOTING || new_role == HADC_ROLE_SLAVE) {
+        /* Abandoned promotion: never let a stale pending flag suppress the
+         * next role announcement or fire a stale finalize deadline. */
+        ctx->promotion_pending = false;
+        ctx->promotion_finalize_at_ms = 0;
+        ctx->takeover_from[0] = '\0';
+    }
     HB_UNLOCK(ctx);
     if (g_role_hook != NULL)
         g_role_hook(g_role_hook_arg, old_role, new_role);
@@ -1863,9 +1870,10 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
     }
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->conf.designated_master,
               hadc_role_name(ctx->role));
-    /* During a pending promotion the role is committed internally but not yet
-     * announced: promotion_finalize() propagates once the dataplane is ready. */
-    if (!ctx->promotion_pending)
+    /* Self-promotion is announced by promotion_finalize() once the dataplane
+     * is ready (immediately or at its deadline). Only a handoff, where this
+     * node steps down, needs an announcement here. */
+    if (handoff)
         propagate_role(ctx);
     hadc_persist_save(ctx);
     return 0;
