@@ -2043,6 +2043,12 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
         }
     }
 
+    /* Install the mark/NOTRACK chains before any steering route: once a split
+     * /1 is in place, client packets are forwarded over the fabric, and a
+     * tracked/NATed packet there would arrive at the new master already SNATed
+     * and create a conflicting no-source-NAT entry there. */
+    apply_demote_hold_nft(ctx, desired, prev, reason);
+
     /* Seamless takeover steering routes: additive split /1s plus per-VIP-subnet
      * splits at prefixlen+1 via the new master's fabric nexthop. Longest-prefix
      * match beats the default route without touching it (and beats the
@@ -2112,8 +2118,6 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
     }
 
     apply_slave_nft_block(desired->interface, desired->slave_nft_block, reason);
-
-    apply_demote_hold_nft(ctx, desired, prev, reason);
 
     if (ctx->conf.apply.dns_hook[0]) {
         char *argv[2] = { ctx->conf.apply.dns_hook, NULL };

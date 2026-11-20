@@ -122,9 +122,13 @@ ct_flows() {
 }
 ct_established() {
 	host=$1
+	# Only flows with enough remaining lifetime to outlive the post-failover
+	# settle plus recheck window: a tuple seconds from expiry is not a failover
+	# disconnect when it disappears. Field 3 of `conntrack -L` is the seconds
+	# remaining.
 	ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$host" \
 		"conntrack -L -p tcp 2>/dev/null | grep ESTABLISHED | grep -E '(^|[[:space:]])(sport=${PORT}|dport=${PORT})([[:space:]]|$)' || true" \
-		2>/dev/null | sed '/^$/d' | sort
+		2>/dev/null | sed '/^$/d' | awk '$3 >= 90' | sort
 }
 ct_tuples() {
 	sed -n 's/.*src=\([^ ]*\) dst=\([^ ]*\) sport=\([^ ]*\) dport=\([^ ]*\).*src=\([^ ]*\) dst=\([^ ]*\) sport=\([^ ]*\) dport=\([^ ]*\).*/orig \1:\3->\2:\4 reply \5:\7->\6:\8/p' | sort -u
@@ -320,12 +324,16 @@ for h in $ALL_HOSTS; do
 done
 
 BASELINE_TUPLES="$tmpdir/baseline.tuples"
-: >"$BASELINE_TUPLES"
-for h in $ALL_HOSTS; do
-	if [ -s "$tmpdir/pre.$h.tuples" ]; then
-		cat "$tmpdir/pre.$h.tuples" >>"$BASELINE_TUPLES"
-	fi
-done
+# Only the current master owns the served (NAT'd) flows. Slaves can hold local
+# kernel-created no-NAT variants of the same tuples from steered/mirrored
+# packets; those are not connections to preserve and disappear on promotion.
+# Taking the union would count them as separate baseline flows and produce
+# false failures.
+if [ -s "$tmpdir/pre.$CURRENT_MASTER.tuples" ]; then
+	cp "$tmpdir/pre.$CURRENT_MASTER.tuples" "$BASELINE_TUPLES"
+else
+	: >"$BASELINE_TUPLES"
+fi
 sort -u -o "$BASELINE_TUPLES" "$BASELINE_TUPLES"
 BASELINE_COUNT=$(wc -l <"$BASELINE_TUPLES" | tr -d ' ')
 echo "baseline: $BASELINE_COUNT established conntrack tuple(s) for port $PORT across the cluster"
@@ -434,6 +442,9 @@ if [ "$BASELINE_COUNT" -gt 0 ]; then
 				*"-${CURRENT_MASTER}-events.log") continue ;;
 			esac
 			line=$(grep -E "$pat" "$ef" 2>/dev/null | grep -E 'CLOSE_WAIT|LAST_ACK|TIME_WAIT|CLOSE|FIN_WAIT|DELETE|DESTROY|REPLACED' |
+				# The promotion reinstall issues its own DELETE then CREATE; that
+				# DELETE is not a disconnect when the tuple is still present.
+				grep -v '\[DESTROY\].*progname=ha-dhcpc' |
 				awk '!/packets=0 bytes=0/ || /packets=[1-9]/' | head -n 1 || true)
 			[ -n "$line" ] || continue
 			printf '%s\t%s\t%s\n' "$opair $rpair" "$(basename "$ef")" "$line" >>"$EVENT_HITS"

@@ -790,6 +790,21 @@ static bool parse_ct_entry_v4(const struct nlmsghdr *nh, hadc_ct_entry_v1_t *out
         out->nat_dst_port = out->repl_sport;
         out->flags |= 0x20;
     }
+    /* HA replication only works with port-preserving NAT. A binding whose
+     * translated port differs from the original source port cannot be adopted
+     * on another node: that peer's connection uses the original port, so the
+     * replica would be installed with a bogus reply tuple and break the flow.
+     * Such entries are usually kernel-created without CTA_NAT_SRC (e.g. a
+     * steered packet on a non-owner), with the port derived from a transient
+     * reply tuple. Drop them instead of propagating the bad binding. */
+    if ((out->flags & 0x10) && out->nat_src_port &&
+        (out->proto == IPPROTO_TCP || out->proto == IPPROTO_UDP ||
+         out->proto == IPPROTO_SCTP || out->proto == IPPROTO_DCCP) &&
+        out->nat_src_port != out->orig_sport) {
+        hadc_dbg("conntrack: skip port-changing NAT binding %u->%u",
+                 ntohs(out->orig_sport), ntohs(out->nat_src_port));
+        return false;
+    }
     if (sao) {
         struct nlattr *sa=(struct nlattr*)HADC_NLA_DATA(sao); int sl=HADC_NLA_DATALEN(sao);
         struct nlattr *cp=nla_find(sa,sl,CTA_SEQADJ_CORRECTION_POS), *ob=nla_find(sa,sl,CTA_SEQADJ_OFFSET_BEFORE), *oa=nla_find(sa,sl,CTA_SEQADJ_OFFSET_AFTER);
