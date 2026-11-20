@@ -585,7 +585,11 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
                          (ctx->lease.state == HADC_LEASE_BOUND ||
                           ctx->lease.state == HADC_LEASE_RENEW ||
                           ctx->lease.state == HADC_LEASE_REBIND);
-    bool backup = on_backup_path(ctx);
+    /* A node that just handed off still receives traffic addressed to the old
+     * VIP: keep the primary default route until the forwarding grace expires
+     * instead of switching to slave/backup routing. */
+    bool forwarding = hadc_route_forwarding(ctx);
+    bool backup = on_backup_path(ctx) && !forwarding;
 
     if (reason && *reason)
         snprintf(g_rs.reason, sizeof(g_rs.reason), "%s", reason);
@@ -680,7 +684,10 @@ void hadc_routing_reconcile(hadc_ctx_t *ctx, const char *reason)
     }
 
     struct in_addr prev_bgw = g_rs.backup_gw;
-    select_backup_gateway(ctx);
+    if (forwarding)
+        g_rs.backup_gw.s_addr = 0; /* no fabric backup while still forwarding */
+    else
+        select_backup_gateway(ctx);
 
     backend_apply(ctx, want_pub, want_def, prev_bgw, g_rs.reason);
     hadc_ospf_originate(ctx, &g_rs.public_ip32, want_pub, want_def, NULL, 0);

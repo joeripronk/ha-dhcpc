@@ -218,55 +218,12 @@ ct_dump_remote() {
 	printf '%s\n' "$host $label $rbase" >>"$tmpdir/analysis.files"
 }
 
-# Read the counters of the watched raw_prerouting_local rules (see
-# production/routers/nftables.d/99-forward-notrack.nft) on every node into
-# $tmpdir/nft.<label> as host<TAB>rule<TAB>packets<TAB>bytes lines.
-nft_counters() {
-	label=$1
-	: >"$tmpdir/nft.$label"
-	for h in $ALL_HOSTS; do
-		ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" \
-			"nft list chain inet fw4 raw_prerouting_local 2>/dev/null" \
-			</dev/null >"$tmpdir/nft.$label.raw" 2>/dev/null || true
-		if [ ! -s "$tmpdir/nft.$label.raw" ]; then
-			printf '%s\t%s\t?\t?\n' "$h" "chain" >>"$tmpdir/nft.$label"
-			continue
-		fi
-		for pair in \
-			"guard-first|fib daddr . iif oifname \"br-lan.300\" counter|first" \
-			"saddr-12|ip saddr 192.168.12.0/24 counter|first" \
-			"daddr-12|ip daddr 192.168.12.0/24 counter|first" \
-			"saddr-11|ip saddr 192.168.11.0/24 counter|first" \
-			"daddr-11|ip daddr 192.168.11.0/24 counter|first" \
-			"daddr-172|ip daddr 172.16.11.0/24 counter|first" \
-			"guard-last|fib daddr . iif oifname \"br-lan.300\" counter|last"; do
-			rule_label=${pair%%|*}
-			rest=${pair#*|}
-			pattern=${rest%|*}
-			pick=${rest##*|}
-			if [ "$pick" = last ]; then
-				line=$(grep -F "$pattern" "$tmpdir/nft.$label.raw" | tail -n 1 || true)
-			else
-				line=$(grep -F "$pattern" "$tmpdir/nft.$label.raw" | head -n 1 || true)
-			fi
-			if [ -z "$line" ]; then
-				printf '%s\t%s\t?\t?\n' "$h" "$rule_label" >>"$tmpdir/nft.$label"
-				continue
-			fi
-			pk=$(printf '%s' "$line" | sed -n 's/.*counter packets \([0-9][0-9]*\) bytes \([0-9][0-9]*\).*/\1/p')
-			by=$(printf '%s' "$line" | sed -n 's/.*counter packets \([0-9][0-9]*\) bytes \([0-9][0-9]*\).*/\2/p')
-			printf '%s\t%s\t%s\t%s\n' "$h" "$rule_label" "${pk:-?}" "${by:-?}" >>"$tmpdir/nft.$label"
-		done
-	done
-}
-
 analysis_start() {
 	echo "== analysis capture =="
 	echo "analysis dir: $CAP_DIR/analysis (conntrack dumps/events, ha-dhcpc status/logs)"
 	for h in $ALL_HOSTS; do
 		ct_dump_remote "$h" pre
 	done
-	nft_counters pre
 	# events+samples run on every node: a disconnect on any node counts, and
 	# the recheck window needs the monitors alive until analysis_stop_fetch.
 	for h in $ALL_HOSTS; do
@@ -344,7 +301,6 @@ analysis_stop_fetch() {
 	else
 		echo "  saved: $CAP_DIR/analysis/ (remote /tmp/ha-failover-${ts}-${PORT}-* preserved for diagnosis due to fetch warnings)" >&2
 	fi
-	nft_counters post
 	# Always kill leftovers on all hosts
 	for h in $CAP_HOSTS $ALL_HOSTS; do
 		ssh -o BatchMode=yes -o ConnectTimeout=5 "root@$h" "killall tcpdump 2>/dev/null || true; killall conntrack 2>/dev/null || true" >/dev/null 2>&1 || true
@@ -471,6 +427,12 @@ if [ "$BASELINE_COUNT" -gt 0 ]; then
 		pat="sport=${o_sp}[[:space:]]+dport=${o_dp}|sport=${r_sp}[[:space:]]+dport=${r_dp}"
 		for ef in "$CAP_DIR"/analysis/*-events.log; do
 			[ -f "$ef" ] || continue
+			# The demoting node destroys its own conntrack entries during the
+			# handoff; that is local teardown, not a flow disconnect. The new
+			# master's log still catches real FIN/close events.
+			case "$(basename "$ef")" in
+				*"-${CURRENT_MASTER}-events.log") continue ;;
+			esac
 			line=$(grep -E "$pat" "$ef" 2>/dev/null | grep -E 'CLOSE_WAIT|LAST_ACK|TIME_WAIT|CLOSE|FIN_WAIT|DELETE|DESTROY|REPLACED' |
 				awk '!/packets=0 bytes=0/ || /packets=[1-9]/' | head -n 1 || true)
 			[ -n "$line" ] || continue
@@ -534,37 +496,6 @@ if [ -s "$EVENT_HITS" ]; then
 	echo "  (presence in the final snapshot is not survival: a same-tuple reconnect looks identical)" >&2
 	ok=0
 fi
-
-# Report the watched raw_prerouting_local counters across the failover window
-# (guard trackers are counter-only, first and last; see
-# production/routers/nftables.d/).
-echo "== nft guard counters (raw_prerouting_local, delta across this failover) =="
-for h in $ALL_HOSTS; do
-	for rule in guard-first saddr-12 daddr-12 saddr-11 daddr-11 daddr-172 guard-last; do
-		pre=$(awk -F'\t' -v h="$h" -v r="$rule" '$1==h && $2==r {print $3; exit}' "$tmpdir/nft.pre" 2>/dev/null || true)
-		post=$(awk -F'\t' -v h="$h" -v r="$rule" '$1==h && $2==r {print $3; exit}' "$tmpdir/nft.post" 2>/dev/null || true)
-		pre=${pre:-?}
-		post=${post:-?}
-		if [ "$pre" != "?" ] && [ "$post" != "?" ]; then
-			delta=$((post - pre))
-		else
-			delta=?
-		fi
-		echo "  $h  $rule: pre=$pre post=$post delta=$delta packets"
-	done
-done
-for h in $ALL_HOSTS; do
-	awk -F'\t' -v h="$h" '
-		FNR==NR && $1==h && $2=="guard-first" {pre1=$3}
-		FNR==NR && $1==h && $2=="guard-last" {pre2=$3}
-		FNR!=NR && $1==h && $2=="guard-first" {post1=$3}
-		FNR!=NR && $1==h && $2=="guard-last" {post2=$3}
-		END {
-			if (pre1=="" || post1=="" || pre2=="" || post2=="") print "  " h " check: guard counters unavailable (deploy the counter drop-in first)"
-			else if (post1-pre1 == post2-pre2) print "  " h " check: first=" post1-pre1 " last=" post2-pre2 " -> no internet-egress packet was intercepted by a notrack rule during the run: guard is redundant"
-			else print "  " h " check: first=" post1-pre1 " last=" post2-pre2 " -> " (post1-pre1)-(post2-pre2) " internet-egress packet(s) were intercepted by the notrack rules: guard would change behavior for them"
-		}' "$tmpdir/nft.pre" "$tmpdir/nft.post"
-done
 
 if [ "$ok" -eq 1 ]; then
 	echo "RESULT: PASS (failover $CURRENT_MASTER -> $TARGET, port $PORT)"

@@ -317,6 +317,7 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             out->backup_gateway = rgw;
     }
     bool master_like = (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING);
+    bool forwarding = hadc_route_forwarding(ctx);
     bool demote_hold = (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold);
     struct in_addr demote_via = demote_route_nexthop(ctx);
     bool steering = demote_via.s_addr != 0;
@@ -331,7 +332,8 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
     /* Backup default route: a slave keeps a higher-metric route so it stays
      * reachable when its synced lease has no gateway; a master never uses it.
      * Effective gateway may come from static config or fabric-learned routing. */
-    out->backup_route = (ctx->role == HADC_ROLE_SLAVE) && out->backup_gateway.s_addr != 0;
+    out->backup_route = (ctx->role == HADC_ROLE_SLAVE) && out->backup_gateway.s_addr != 0 &&
+                        !forwarding;
 
     if (lease->state == HADC_LEASE_NONE) {
         out->present = false;
@@ -359,8 +361,7 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
         } else {
             out->gateway.s_addr = 0;
         }
-    } else if (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold &&
-             lease->state != HADC_LEASE_NONE)
+    } else if (forwarding && lease->state != HADC_LEASE_NONE)
         out->gateway = lease->gateway;
     out->link_state = 0;
     out->slave_nft_block = false;
@@ -378,7 +379,15 @@ void hadc_executor_desired(hadc_ctx_t *ctx, const hadc_lease_t *lease, hadc_desi
             out->backup_route = false;
         }
     } else if (ctx->role == HADC_ROLE_SLAVE && !ctx->shutting_down) {
-        if (ctx->conf.apply.slave_sync_wan) {
+        if (forwarding && lease->state != HADC_LEASE_NONE) {
+            /* Designated master (or post-handoff grace): forward now, before the
+             * role_change callback and before the old node steers traffic here. */
+            out->link_state = 1;
+            out->slave_nft_block = false;
+            out->present = true;
+            out->add_routes = ctx->conf.apply.routes;
+            out->backup_route = false;
+        } else if (ctx->conf.apply.slave_sync_wan) {
             out->link_state = 1;
             out->slave_nft_block = false;
             /* With sync, don't add the old slave backup route; we want the synced default. */

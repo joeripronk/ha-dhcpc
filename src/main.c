@@ -209,9 +209,11 @@ static void handoff_hold_complete(hadc_ctx_t *ctx, const char *reason)
 {
     if (!ctx->handoff_forward_hold)
         return;
+    uint64_t now = (uint64_t)hadc_now_ms();
     ctx->handoff_forward_hold = false;
     ctx->handoff_target[0] = '\0';
     ctx->handoff_hold_until_ms = 0;
+    ctx->handoff_route_grace_until_ms = now + ctx->conf.apply.handoff_hold_ms;
     ctx->steering_routes_ready = false;
     /* transition DEMOTING -> SLAVE and apply full slave isolation (egress block) */
     if (ctx->role == HADC_ROLE_DEMOTING) {

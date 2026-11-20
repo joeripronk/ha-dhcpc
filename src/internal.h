@@ -54,6 +54,10 @@ struct hadc_ctx {
      * IP/route kept, nft egress off) until the new master is ready or timeout. */
     bool handoff_forward_hold;
     uint64_t handoff_hold_until_ms;
+    /* Post-handoff grace: a demoted node still receives traffic to the old VIP
+     * until clients re-ARP, so routing must keep forwarding (and keep the primary
+     * default route) for this long after the hold completes. */
+    uint64_t handoff_route_grace_until_ms;
     char handoff_target[HADC_NODE_ID_MAX];
 
     /* Demote return-traffic steering over fabric to the new master (opt-in).
@@ -113,6 +117,12 @@ void hadc_promotion_finalize_complete(hadc_ctx_t *ctx, const char *reason);
 void hadc_gwping_start(hadc_ctx_t *ctx);
 void hadc_gwping_stop(hadc_ctx_t *ctx);
 void hadc_gwping_tick(hadc_ctx_t *ctx);
+
+/* True while this node must own the primary forwarding path (lease default
+ * route): as master, during a handoff hold and its post-handoff grace, and as
+ * a slave already designated as the next master (so the route exists before
+ * the old node steers traffic here). */
+bool hadc_route_forwarding(const hadc_ctx_t *ctx);
 
 /* Serialized maintenance worker (step 3): heavy/IO maintenance (fsync-heavy
  * persist, netlink-heavy executor audit/routing reconcile) runs on a dedicated

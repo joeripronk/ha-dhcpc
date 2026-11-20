@@ -132,6 +132,25 @@ bool hadc_cluster_graceful_active(hadc_ctx_t *ctx)
     return until != 0;
 }
 
+bool hadc_route_forwarding(const hadc_ctx_t *ctx)
+{
+    if (!ctx)
+        return false;
+    uint64_t now = (uint64_t)hadc_now_ms();
+    if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
+        return true;
+    if (ctx->role == HADC_ROLE_DEMOTING && ctx->handoff_forward_hold)
+        return true;
+    /* A still-slave node that has already learned it is the designated master
+     * must have the primary default route before the old node starts steering
+     * traffic to it: the role_change callback can lag the steering apply. */
+    if (ctx->role == HADC_ROLE_SLAVE && ctx->conf.designated_master[0] &&
+        !strcmp(ctx->conf.designated_master, ctx->conf.self) &&
+        ctx->lease.address.s_addr != 0 && ctx->lease.state != HADC_LEASE_NONE)
+        return true;
+    return ctx->handoff_route_grace_until_ms > now;
+}
+
 void hadc_cluster_broadcast_graceful(hadc_ctx_t *ctx)
 {
     if (ctx->udp_fd < 0)

@@ -69,6 +69,21 @@ static void test_build_apply_msg_create_delete(void) {
     TASSERT(len3 > 0, "build delete msg");
     TASSERT((nh->nlmsg_type & 0xff) == IPCTNL_MSG_CT_DELETE, "delete msg type");
     TASSERT(!(nh->nlmsg_flags & NLM_F_CREATE), "no create on delete");
+
+    /* A CREATE with source NAT must send the un-NATed reply destination so the
+     * kernel actually performs the translation and sets IPS_SRC_NAT. */
+    uint32_t nat_ip;
+    inet_pton(AF_INET, "198.51.100.7", &nat_ip);
+    e.flags = 0x10;
+    e.nat_src_ip = nat_ip;
+    uint32_t translated;
+    inet_pton(AF_INET, "203.0.113.5", &translated);
+    size_t len4 = ctnl_build_apply_msg(msg, sizeof(msg), &e, false, true, 45);
+    TASSERT(len4 > 0 && memmem(msg, len4, &translated, sizeof(translated)) == NULL,
+            "nat create uses untranslated reply tuple");
+    size_t len5 = ctnl_build_apply_msg(msg, sizeof(msg), &e, false, false, 46);
+    TASSERT(len5 > 0 && memmem(msg, len5, &translated, sizeof(translated)) != NULL,
+            "update keeps translated reply tuple");
 }
 
 static void test_hdr_wire(void) {
@@ -124,9 +139,12 @@ static void test_shadow_stage_prune_and_compact(void) {
     stage_or_apply(&ct, &e, false);
     TASSERT(ct.n_shadow == 1 && ct.shadow[0].valid, "restage after compact");
     stage_or_apply(&ct, &e, true);
-    TASSERT(ct.n_shadow == 1 && !ct.shadow[0].valid, "delete marks invalid");
-    prune_shadow(&ct, (uint64_t)hadc_now_ms());
-    TASSERT(ct.n_shadow == 0, "delete compacted");
+    TASSERT(ct.n_shadow == 1 && ct.shadow[0].valid && ct.shadow[0].pending_del,
+            "delete retains state as pending for promotion");
+    prune_shadow(&ct, 1000); /* inside the grace window */
+    TASSERT(ct.n_shadow == 1 && ct.shadow[0].valid, "pending delete survives grace window");
+    prune_shadow(&ct, HADC_CT_SHADOW_DEL_GRACE_MS + 1000);
+    TASSERT(ct.n_shadow == 0, "pending delete compacted after grace");
 }
 
 static void test_shadow_eviction_when_full(void) {

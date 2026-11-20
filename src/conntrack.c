@@ -56,6 +56,10 @@
 #define HADC_CT_APPLY_PENDING_MAX 2048
 #define HADC_CT_APPLY_MAX_RETRIES 3
 #define HADC_CT_DUMP_EVENT_BUF_MAX 2048
+/* A master's DELETE may be its own local teardown during a handoff, not a
+ * global flow end. Keep the replica state this long so a promoting node can
+ * still install it; prune_shadow() expires it afterwards. */
+#define HADC_CT_SHADOW_DEL_GRACE_MS 30000
 
 enum {
     HADC_CT_MSG_HELLO = 1,
@@ -162,9 +166,11 @@ typedef struct {
 typedef struct {
     hadc_ct_entry_v1_t e;
     uint64_t updated_ms;
+    uint64_t deleted_ms;  /* when a DELETE was received; state kept for promotion */
     bool valid;
     bool seen_in_snapshot;
     bool timer_dirty;
+    bool pending_del;     /* master deleted it; retain until grace expires */
     int16_t hnext;
 } hadc_ct_shadow_ent_t;
 
@@ -552,6 +558,7 @@ static uint8_t nla_get_u8(struct nlattr *n)
 static int queue_entry(struct hadc_conntrack *ct, hadc_ct_peer_t *p, uint8_t type, const hadc_ct_entry_v1_t *e);
 static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *e, bool del);
 static void ct_debug_entry(const struct hadc_conntrack *ct, const char *tag, const hadc_ct_entry_v1_t *e);
+static void ct_entry_log_tuple(char *buf, size_t buflen, const hadc_ct_entry_v1_t *e);
 
 static bool same_tuple(const hadc_ct_entry_v1_t *a, const hadc_ct_entry_v1_t *b);
 static void master_queue_entry_all(struct hadc_conntrack *ct, uint8_t type, const hadc_ct_entry_v1_t *e, const hadc_ct_peer_t *exclude);
@@ -898,12 +905,16 @@ static hadc_ct_shadow_ent_t *shadow_alloc_slot(struct hadc_conntrack *ct, const 
     for (size_t i = 0; i < ct->n_shadow; i++) {
         if (!ct->shadow[i].valid) {
             ct->shadow[i].hnext = -1;
+            ct->shadow[i].pending_del = false;
+            ct->shadow[i].deleted_ms = 0;
             return &ct->shadow[i];
         }
     }
     if (ct->n_shadow < HADC_CT_SHADOW_MAX) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[ct->n_shadow++];
         s->hnext = -1;
+        s->pending_del = false;
+        s->deleted_ms = 0;
         return s;
     }
     /* evict oldest valid */
@@ -921,6 +932,8 @@ static hadc_ct_shadow_ent_t *shadow_alloc_slot(struct hadc_conntrack *ct, const 
         ct->st.dropped_entries++;
     }
     s->hnext = -1;
+    s->pending_del = false;
+    s->deleted_ms = 0;
     return s;
 }
 
@@ -931,6 +944,8 @@ static void shadow_mark_dirty(struct hadc_conntrack *ct, const hadc_ct_entry_v1_
         s->e = *e;
         s->timer_dirty = true;
         s->updated_ms = (uint64_t)hadc_now_ms();
+        s->pending_del = false;
+        s->deleted_ms = 0;
         return;
     }
     s = shadow_alloc_slot(ct, e);
@@ -1060,8 +1075,14 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
 
     if (!build_tuple_nla(buf, buflen, &off, CTA_TUPLE_ORIG,
                          e->orig_src, e->orig_dst, e->proto, e->orig_sport, e->orig_dport)) return 0;
+    /* On a CREATE with source NAT, the kernel only sets IPS_SRC_NAT when the
+     * NAT range actually changes the reply tuple (nf_nat_setup_info). Sending
+     * the already-translated public IP here makes it a no-op that sets only
+     * IPS_SRC_NAT_DONE, so outbound packets are never SNATed. Use the original
+     * source address and let CTA_NAT_SRC perform the translation. */
+    uint32_t reply_dst = (create && (e->flags & 0x10)) ? e->orig_src : e->repl_dst;
     if (!build_tuple_nla(buf, buflen, &off, CTA_TUPLE_REPLY,
-                         e->repl_src, e->repl_dst, e->proto, e->repl_sport, e->repl_dport)) return 0;
+                         e->repl_src, reply_dst, e->proto, e->repl_sport, e->repl_dport)) return 0;
 
     if (!is_del) {
         uint32_t timeout = htonl(e->timeout_s ? e->timeout_s : 120);
@@ -1088,7 +1109,11 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
                 nla_nest_end(buf, hn, off);
             }
         }
-        if (e->flags & 0x10) {
+        /* Netfilter rejects CTA_NAT_SRC/CTA_NAT_DST on an update of an existing
+         * entry with EOPNOTSUPP: NAT bindings cannot be changed in place. Keep
+         * the existing binding and only refresh state/timeout/mark. NAT attrs
+         * belong on the initial CREATE (and on the promotion reinstall). */
+        if (create && (e->flags & 0x10)) {
             size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_SRC);
             if (nn != (size_t)-1) {
                 if (e->nat_src_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_src_ip, 4);
@@ -1106,7 +1131,7 @@ static size_t ctnl_build_apply_msg(char *buf, size_t buflen, const hadc_ct_entry
                 nla_nest_end(buf, nn, off);
             }
         }
-        if (e->flags & 0x20) {
+        if (create && (e->flags & 0x20)) {
             size_t nn = nla_nest_start(buf, buflen, &off, CTA_NAT_DST);
             if (nn != (size_t)-1) {
                 if (e->nat_dst_ip) (void)nla_put(buf, buflen, &off, CTA_NAT_V4_MINIP, &e->nat_dst_ip, 4);
@@ -1225,7 +1250,10 @@ static void ctnl_apply_retry_tick(struct hadc_conntrack *ct, uint64_t now)
     }
 }
 
-static void apply_shadow_all(struct hadc_conntrack *ct)
+/* include_pending_del is set on promotion: replica state whose master DELETE
+ * arrived just before the handoff must still be installed. The deferred
+ * post-promotion apply skips it so a genuinely closed flow is not resurrected. */
+static void apply_shadow_all(struct hadc_conntrack *ct, bool include_pending_del)
 {
     if (!ct) return;
     if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
@@ -1234,36 +1262,55 @@ static void apply_shadow_all(struct hadc_conntrack *ct)
     for (size_t i = 0; i < ct->n_shadow; i++) {
         hadc_ct_shadow_ent_t *s = &ct->shadow[i];
         if (!s->valid) continue;
-        if (ct->max_entry_age_s > 0 && now - s->updated_ms > (uint64_t)ct->max_entry_age_s * 1000) {
+        if (s->pending_del && !include_pending_del)
+            continue;
+        if (!s->pending_del && ct->max_entry_age_s > 0 &&
+            now - s->updated_ms > (uint64_t)ct->max_entry_age_s * 1000) {
             shadow_unlink(ct, s);
             s->valid = false;
             s->timer_dirty = false;
             continue;
         }
+        if (include_pending_del) {
+            /* A slave's kernel replica can be stale (e.g. still SYN_SENT while
+             * the master is ESTABLISHED): an in-place CT_NEW update is not
+             * guaranteed to replace TCP state/NAT. Reinstall from scratch. */
+            (void)ctnl_apply_entry(ct, &s->e, true);
+        }
         (void)ctnl_apply_entry(ct, &s->e, false);
+        if (s->pending_del) {
+            /* Installed on the promoted node: this is now ordinary local state. */
+            s->pending_del = false;
+            s->deleted_ms = 0;
+            s->updated_ms = now;
+        }
     }
 }
 
 static void prune_shadow(struct hadc_conntrack *ct, uint64_t now)
 {
     if (!ct) return;
-    bool changed = false;
-    if (ct->max_entry_age_s > 0) {
-        uint64_t max_age = (uint64_t)ct->max_entry_age_s * 1000;
-        for (size_t i = 0; i < ct->n_shadow; i++) {
-            hadc_ct_shadow_ent_t *s = &ct->shadow[i];
-            if (s->valid && now - s->updated_ms > max_age) {
-                shadow_unlink(ct, s);
-                s->valid = false;
-                s->timer_dirty = false;
-                changed = true;
-            }
+    for (size_t i = 0; i < ct->n_shadow; i++) {
+        hadc_ct_shadow_ent_t *s = &ct->shadow[i];
+        if (!s->valid)
+            continue;
+        bool expired = s->pending_del
+            ? now - s->deleted_ms > HADC_CT_SHADOW_DEL_GRACE_MS
+            : (ct->max_entry_age_s > 0 &&
+               now - s->updated_ms > (uint64_t)ct->max_entry_age_s * 1000);
+        if (expired) {
+            /* Only drop the cached state. The kernel entry is left to its own
+             * timeout or to a later authoritative snapshot: deleting it here
+             * can kill a flow that is still live on this node. */
+            shadow_unlink(ct, s);
+            s->valid = false;
+            s->timer_dirty = false;
+            s->pending_del = false;
         }
     }
     /* compact invalid tail slots */
     while (ct->n_shadow > 0 && !ct->shadow[ct->n_shadow - 1].valid)
         ct->n_shadow--;
-    (void)changed;
 }
 
 static void drain_ctnl(struct hadc_conntrack *ct)
@@ -1296,11 +1343,17 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                         ap->in_use = false;
                     } else if (ap->is_del && e == ENOENT) {
                         ap->in_use = false; /* already gone */
-                    } else if (!ap->is_del && e == EEXIST && ap->create) {
-                        /* conflict: exists, retry as replace/update without CREATE */
+                    } else if (!ap->is_del && ap->create &&
+                               (e == EEXIST || e == EOPNOTSUPP)) {
+                        /* The entry already exists: NLM_F_CREATE takes the
+                         * update path, which rejects CTA_NAT_* with
+                         * EOPNOTSUPP. Retry without CREATE (and therefore
+                         * without NAT attrs) to refresh state/timeout only. */
+                        ct_debug_entry(ct, e == EOPNOTSUPP ? "retry-nat" : "retry-exists", &ap->e);
                         ap->create = false;
                         ap->retries++;
-                        ap->next_retry_ms = 0;
+                        /* 0 means "no retry scheduled" to the retry tick. */
+                        ap->next_retry_ms = (uint64_t)hadc_now_ms();
                     } else if (!ap->is_del && e == ENOENT && ap->retries < HADC_CT_APPLY_MAX_RETRIES) {
                         /* missing during replace attempt, retry as create */
                         ap->create = true;
@@ -1311,8 +1364,13 @@ static void drain_ctnl(struct hadc_conntrack *ct)
                         ap->next_retry_ms = (uint64_t)hadc_now_ms() + 200;
                     } else {
                         ap->in_use = false;
-                        if (e != EEXIST && e != ENOENT && e != EBUSY)
+                        if (e != EEXIST && e != ENOENT && e != EBUSY) {
+                            char desc[256];
+                            ct_entry_log_tuple(desc, sizeof(desc), &ap->e);
+                            hadc_warn("conntrack: apply %s failed (%d): %s",
+                                      ap->is_del ? "delete" : "upsert", e, desc);
                             ct->st.dropped_entries++;
+                        }
                     }
                 } else {
                     if (e != 0) {
@@ -1822,8 +1880,13 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
     hadc_ct_shadow_ent_t *s = shadow_find(ct, e);
     if (s) {
         if (del) {
-            shadow_unlink(ct, s);
-            s->valid = false;
+            /* Keep the replica state instead of discarding it: the master may
+             * be tearing down its own flow during a handoff, and a promoting
+             * node still needs these NAT/conntrack tuples. The kernel entry is
+             * removed by handle_frame(); prune_shadow() expires this after the
+             * grace window. */
+            s->pending_del = true;
+            s->deleted_ms = (uint64_t)hadc_now_ms();
             s->timer_dirty = false;
             ct->st.applied_entries++;
         } else {
@@ -1831,6 +1894,8 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
             s->updated_ms = (uint64_t)hadc_now_ms();
             s->seen_in_snapshot = ct->rx_snapshot_active;
             s->timer_dirty = false;
+            s->pending_del = false;
+            s->deleted_ms = 0;
             ct->st.applied_entries++;
         }
         return;
@@ -2021,7 +2086,11 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                 hadc_dbg("conntrack: synced %s from %s: %s",
                          h->type == HADC_CT_MSG_SNAPSHOT_ENTRY ? "snapshot" : (del ? "delete" : "upsert"),
                          p->id, desc);
-                if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE) {
+                if (ct->slave_apply_mode == HADC_CT_APPLY_IMMEDIATE &&
+                    !(del && existed)) {
+                    /* Keep the kernel entry when its shadow state is retained:
+                     * removing it lets steered packets create a no-NAT tuple
+                     * that a later re-apply cannot supersede. */
                     if (ct->ctnl_fd < 0) (void)ctnl_open(ct, ct->role == HADC_ROLE_MASTER);
                     (void)ctnl_apply_entry(ct, e, del);
                 }
@@ -2051,6 +2120,8 @@ static void handle_frame(struct hadc_conntrack *ct, hadc_ct_peer_t *p, const had
                             s->e = *e;
                             s->timer_dirty = false;
                             s->updated_ms = (uint64_t)hadc_now_ms();
+                            s->pending_del = false;
+                            s->deleted_ms = 0;
                         } else {
                             s = shadow_alloc_slot(ct, e);
                             if (s) {
@@ -2283,7 +2354,7 @@ static void *conntrack_thread_main(void *arg)
 
         if (ct->apply_shadow_pending && ct->role == HADC_ROLE_MASTER) {
             ct->apply_shadow_pending = false;
-            apply_shadow_all(ct);
+            apply_shadow_all(ct, false);
         }
         if (ct->enabled && ct->role == HADC_ROLE_MASTER && ct->resync_interval_s > 0 &&
             now - ct->last_resync_ms >= (uint64_t)ct->resync_interval_s * 1000) {
@@ -2588,7 +2659,7 @@ void hadc_conntrack_apply_shadow(hadc_ctx_t *ctx)
         return;
     pthread_mutex_lock(&ct->lock);
     ct->apply_shadow_pending = false;
-    apply_shadow_all(ct);
+    apply_shadow_all(ct, true);
     pthread_mutex_unlock(&ct->lock);
 }
 
