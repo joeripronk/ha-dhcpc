@@ -527,6 +527,15 @@ int hadc_ctl_rebind(hadc_ctx_t *ctx)
     return 1;
 }
 
+static void ctl_pending_release(ctl_pending_t *p)
+{
+    free(p->reply);
+    p->reply = NULL;
+    p->off = 0;
+    close(p->fd);
+    p->fd = -1;
+}
+
 static char *compare_reply_json(hadc_ctx_t *ctx, bool done)
 {
     char *cmp_txt = hadc_conntrack_compare_json(ctx);
@@ -565,16 +574,14 @@ int hadc_ctl_step(hadc_ctx_t *ctx)
                 continue; /* still running: never block the main loop */
             char *txt = compare_reply_json(ctx, done);
             if (!txt) {
-                close(p->fd);
-                p->fd = -1;
+                ctl_pending_release(p);
                 continue;
             }
             size_t len = strlen(txt);
             p->reply = malloc(len + 2);
             if (!p->reply) {
                 free(txt);
-                close(p->fd);
-                p->fd = -1;
+                ctl_pending_release(p);
                 continue;
             }
             memcpy(p->reply, txt, len);
@@ -592,13 +599,11 @@ int hadc_ctl_step(hadc_ctx_t *ctx)
             continue; /* retry next loop iteration */
         } else if (n < 0) {
             hadc_warn("ctl: compare reply write failed: %s", strerror(errno));
+            ctl_pending_release(p);
+            continue;
         }
-        if (p->off >= len) {
-            free(p->reply);
-            p->reply = NULL;
-            close(p->fd);
-            p->fd = -1;
-        }
+        if (p->off >= len)
+            ctl_pending_release(p);
     }
     return 0;
 }

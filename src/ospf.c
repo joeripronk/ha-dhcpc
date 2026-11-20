@@ -648,6 +648,12 @@ static bool install_lsa(const uint8_t *lsapkt, size_t lsalen)
         if (!lsa_more_recent(h, &old->hdr) && ntohl(h->seq) == ntohl(old->hdr.seq) &&
             h->checksum == old->hdr.checksum && ntohs(h->age) == ntohs(old->hdr.age))
             return false; /* duplicate */
+        /* An older instance must never replace a newer one. MaxAge is the
+         * newest instance for its sequence, so allow a same/newer-seq flush
+         * whose age-only change makes lsa_more_recent() compare checksums. */
+        if (!lsa_more_recent(h, &old->hdr) &&
+            !(maxage && ntohl(h->seq) >= ntohl(old->hdr.seq)))
+            return false;
         free(old->body);
         old->body = NULL;
         old->valid = false;
@@ -2251,6 +2257,8 @@ static size_t ospf_default_candidates_locked(hadc_ctx_t *ctx, hadc_routing_defau
         struct in_addr gw = {0};
         if (fwd != 0) {
             gw.s_addr = fwd;
+            if (!nexthop_on_fabric(gw))
+                continue; /* forwarding address is not reachable on our fabric */
         } else {
             /* forwarding addr 0.0.0.0 => traffic to ASBR; resolve via adjacent
              * neighbor or intra-area SPF path to advertising router. */

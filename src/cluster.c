@@ -894,12 +894,18 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
         return -1;
     }
     fcntl(fd, F_SETFL, O_NONBLOCK);
+    /* Register before swapping: if epoll add fails, keep the old transport
+     * intact instead of leaving the node deaf to all cluster traffic. */
+    if (hadc_loop_add(ctx, fd, udp_ready, 0) != 0) {
+        hadc_err("cluster: cannot register rebound transport: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
     int old = udp_fd_swap(ctx, fd);
     if (old >= 0) {
         hadc_loop_del(ctx, old);
         close(old);
     }
-    hadc_loop_add(ctx, fd, udp_ready, 0);
     g_bound = addr;
     {
         char abuf[INET_ADDRSTRLEN];

@@ -1769,6 +1769,7 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
     struct rtnl_route *sroute;
     const hadc_desired_t *prev = g_applied_valid ? &g_applied : NULL;
     int ifindex, fatal = 0, ar = 0;
+    bool steer_cleanup_failed = false;
 
     if (!g_sk) {
         hadc_err("executor: netlink socket not open");
@@ -2105,14 +2106,18 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
             /* Handoff target may have changed mid-hold: remove split
              * routes still pointing at the previous nexthop. */
             if (steering_route_cleanup(ctx, g_sk, rcache, desired,
-                    &desired->steer_via, reason))
+                    &desired->steer_via, reason)) {
                 fatal = -1;
+                steer_cleanup_failed = true;
+            }
         } else if (prev && prev->steer_via.s_addr) {
             /* Delete every live split route via a known cluster nexthop,
              * not just the last desired one: a failed delete or a target
              * change mid-hold can leave routes via earlier nexthops behind. */
-            if (steering_route_cleanup(ctx, g_sk, rcache, prev, NULL, reason))
+            if (steering_route_cleanup(ctx, g_sk, rcache, prev, NULL, reason)) {
                 fatal = -1; /* keep g_applied; retry on next audit */
+                steer_cleanup_failed = true;
+            }
         }
     }
 
@@ -2127,9 +2132,11 @@ static int executor_apply_locked(hadc_ctx_t *ctx, const hadc_desired_t *desired,
 
     apply_slave_nft_block(desired->interface, desired->slave_nft_block, reason);
 
-    /* Steering routes are gone by now: only then tear down the mark/NOTRACK
-     * chains, so traffic during route cleanup still bypasses conntrack/NAT. */
-    apply_demote_hold_nft(ctx, desired, prev, reason, false);
+    /* Only tear down the mark/NOTRACK chains once steering routes are really
+     * gone. If cleanup failed, keep them active so remaining steered traffic
+     * still bypasses conntrack/NAT and the next audit can retry. */
+    if (!steer_cleanup_failed)
+        apply_demote_hold_nft(ctx, desired, prev, reason, false);
 
     if (ctx->conf.apply.dns_hook[0]) {
         char *argv[2] = { ctx->conf.apply.dns_hook, NULL };

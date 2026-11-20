@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +138,28 @@ static int persist_write_file(const char *path, const char *json)
         hadc_err("persist: rename to %s: %s", path, strerror(errno));
         return -1;
     }
+    /* Fsync the directory too, otherwise a crash can lose the rename even
+     * though the file contents were flushed. */
+    char dir[HADC_PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash)
+        snprintf(dir, sizeof(dir), ".");
+    else if (slash == dir)
+        dir[1] = '\0';
+    else
+        *slash = '\0';
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+        hadc_err("persist: open dir %s: %s", dir, strerror(errno));
+        return -1;
+    }
+    if (fsync(dfd) != 0) {
+        hadc_err("persist: fsync dir %s: %s", dir, strerror(errno));
+        close(dfd);
+        return -1;
+    }
+    close(dfd);
     return 0;
 }
 

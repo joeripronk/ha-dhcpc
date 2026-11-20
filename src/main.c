@@ -755,7 +755,8 @@ static int ctl_client(const char *conf_path, const char *local_path, const char 
     hadc_conf_t conf;
     char err[256];
     char line[256];
-    char reply[4096];
+    char reply[262144];
+    ssize_t total = 0;
 
     if (hadc_config_load(conf_path, local_path, &conf, err, sizeof(err)) != 0) {
         fprintf(stderr, "ha-dhcpc ctl: %s\n", err);
@@ -775,13 +776,20 @@ static int ctl_client(const char *conf_path, const char *local_path, const char 
         close(fd);
         return 1;
     }
-    ssize_t n = read(fd, reply, sizeof(reply) - 1);
+    for (;;) {
+        ssize_t n = read(fd, reply + total, sizeof(reply) - (size_t)total - 1);
+        if (n <= 0)
+            break;
+        total += n;
+        if (total >= (ssize_t)sizeof(reply) - 1)
+            break;
+    }
     close(fd);
-    if (n <= 0) {
+    if (total <= 0) {
         fprintf(stderr, "ha-dhcpc ctl: no reply from daemon\n");
         return 1;
     }
-    reply[n] = '\0';
+    reply[total] = '\0';
     fputs(reply, stdout);
     return 0;
 }
@@ -1078,6 +1086,11 @@ static const char *ctl_resolve(const char *tok, const char *cmd)
     const char *match = NULL;
     size_t tl = strlen(tok);
 
+    /* "s" is the documented ctl abbreviation for status; shutdown has no
+     * documented abbreviation, so do not treat it as an ambiguous prefix. */
+    if (!cmd && !strcmp(tok, "s"))
+        return "status";
+
     if (cmd && !strcmp(cmd, "graceful-restart")) {
         set = gr_args;
         n = sizeof(gr_args) / sizeof(gr_args[0]);
@@ -1128,6 +1141,14 @@ int main(int argc, char **argv)
             const char *resolved_cmd = NULL;
             for (int j = i + 1; j < argc; j++) {
                 const char *tok = argv[j];
+                /* Usage allows config options after the ctl command too. */
+                if ((!strcmp(tok, "--conf") || !strcmp(tok, "--local-conf")) && j + 1 < argc) {
+                    if (!strcmp(tok, "--conf"))
+                        conf_path = argv[++j];
+                    else
+                        local_path = argv[++j];
+                    continue;
+                }
                 if (j == i + 1) {
                     resolved_cmd = ctl_resolve(tok, NULL);
                     tok = resolved_cmd;

@@ -938,12 +938,16 @@ static hadc_ct_shadow_ent_t *shadow_alloc_slot(struct hadc_conntrack *ct, const 
         s->deleted_ms = 0;
         return s;
     }
-    /* evict oldest valid */
+    /* Evict the oldest entry not protected by the pending-delete grace. */
     size_t victim = SIZE_MAX;
     uint64_t oldest = UINT64_MAX;
+    uint64_t now = (uint64_t)hadc_now_ms();
     for (size_t i = 0; i < ct->n_shadow; i++) {
-        if (!ct->shadow[i].valid) { victim = i; break; }
-        if (ct->shadow[i].updated_ms < oldest) { oldest = ct->shadow[i].updated_ms; victim = i; }
+        hadc_ct_shadow_ent_t *s = &ct->shadow[i];
+        if (!s->valid) { victim = i; break; }
+        if (s->pending_del && now - s->deleted_ms < HADC_CT_SHADOW_DEL_GRACE_MS)
+            continue;
+        if (s->updated_ms < oldest) { oldest = s->updated_ms; victim = i; }
     }
     if (victim == SIZE_MAX) return NULL;
     hadc_ct_shadow_ent_t *s = &ct->shadow[victim];
@@ -1242,8 +1246,7 @@ static int ctnl_apply_entry(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t 
         struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
         int rc = sendto(ct->ctnl_fd, buf, off, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0 ? -1 : 0;
         if (rc < 0) ct->st.dropped_entries++;
-        else ct->st.dropped_entries++; /* untracked: cannot correlate ACK/retry */
-        return rc;
+        return rc; /* untracked apply: no ACK/retry, but a successful send is not a drop */
     }
     memset(ap, 0, sizeof(*ap));
     ap->in_use = true;
@@ -1922,6 +1925,10 @@ static void stage_or_apply(struct hadc_conntrack *ct, const hadc_ct_entry_v1_t *
              * grace window. */
             s->pending_del = true;
             s->deleted_ms = (uint64_t)hadc_now_ms();
+            /* A delete received during a dump is part of that snapshot view;
+             * without this the SNAPSHOT_END pass counts it again as extra and
+             * drops the shadow entry before the delete grace expires. */
+            s->seen_in_snapshot = ct->rx_snapshot_active;
             s->timer_dirty = false;
             ct->st.applied_entries++;
         } else {
@@ -2668,6 +2675,10 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
             ct->apply_shadow_pending = true; /* deferred to worker */
     } else {
         ct->ctnl_dump_pending = false;
+        /* Events buffered as master are stale once we are no longer master;
+         * a later re-promotion must not replay them as authoritative. */
+        ct->dump_event_count = 0;
+        ct->dump_event_overflow = false;
         ct->slave_resync_requested = true; /* validate/fix against new master */
         ct->slave_recent_master_handoff = true; /* first snapshot after handoff may fix */
         for (size_t i = 0; i < ct->n_peers; i++)

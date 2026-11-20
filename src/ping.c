@@ -98,11 +98,13 @@ static void ping_ready(hadc_ctx_t *ctx, int fd)
                 hadc_dbg("gwping: recv error %s", strerror(errno));
                 break;
             }
-            /* Genuinely unusable fd: EPOLLERR/HUP with HADC_FD_ERR_DROP
-             * reaches us once before the main loop deregisters. */
+            /* Genuinely unusable fd: close and deregister it here. The probe
+             * fd must not be marked HADC_FD_ERR_DROP: ordinary ICMP errors set
+             * EPOLLERR too, and the main loop would orphan a healthy socket. */
             hadc_warn("gwping: probe socket unusable: %s; restarting", strerror(errno));
             if (fd == g_fd) {
                 bool was_unreachable = g_unreachable;
+                hadc_loop_del(ctx, fd);
                 close(fd);
                 g_fd = -1;
                 g_awaiting = false;
@@ -236,7 +238,7 @@ void hadc_gwping_start(hadc_ctx_t *ctx)
                   strerror(errno));
         goto out;
     }
-    if (hadc_loop_add(ctx, g_fd, ping_ready, HADC_FD_ERR_DROP) != 0) {
+    if (hadc_loop_add(ctx, g_fd, ping_ready, 0) != 0) {
         hadc_warn("gwping: probe fd could not be registered; skipped");
         close(g_fd);
         g_fd = -1;

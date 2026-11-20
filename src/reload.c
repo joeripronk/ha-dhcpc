@@ -59,6 +59,19 @@ static void restore_conf(hadc_ctx_t *ctx, const hadc_conf_t *prev)
     hadc_log_set_level(ctx->conf.loglevel);
 }
 
+static void arm_maint_timer(hadc_ctx_t *ctx)
+{
+    uint32_t maint_ms = hadc_cluster_maint_interval_ms(ctx);
+    struct itimerspec its = {
+        .it_interval = { .tv_sec = maint_ms / 1000,
+                         .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
+        .it_value = { .tv_sec = maint_ms / 1000,
+                      .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
+    };
+    if (ctx->maintfd >= 0 && timerfd_settime(ctx->maintfd, 0, &its, NULL) != 0)
+        hadc_warn("reload: maintfd re-arm failed: %s", strerror(errno));
+}
+
 int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
 {
     hadc_conf_t next;
@@ -195,27 +208,19 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
     hadc_info("reload(%s): %s -> %s", why, ctx->conf.base_path, changes);
     hadc_validate_demote_route_config(ctx, why ? why : "reload");
 
-    {
-        /* Cluster maintenance cadence depends on election deadline (heartbeat send
-         * rate is driven by the hb thread and reads conf each tick). */
-        uint32_t maint_ms = hadc_cluster_maint_interval_ms(ctx);
-        struct itimerspec its = {
-            .it_interval = { .tv_sec = maint_ms / 1000,
-                             .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
-            .it_value = { .tv_sec = maint_ms / 1000,
-                          .tv_nsec = (long)(maint_ms % 1000) * 1000000 },
-        };
-        if (ctx->maintfd >= 0 && timerfd_settime(ctx->maintfd, 0, &its, NULL) != 0)
-            hadc_warn("reload: maintfd re-arm failed: %s", strerror(errno));
-    }
+    /* Cluster maintenance cadence depends on election deadline (heartbeat send
+     * rate is driven by the hb thread and reads conf each tick). */
+    arm_maint_timer(ctx);
     if (transport && hadc_cluster_rebind(ctx) != 0) {
         hadc_err("reload(%s): cluster rebind failed; keeping the config in use", why);
         restore_conf(ctx, &prev);
+        arm_maint_timer(ctx);
         return -1;
     }
     if (ctl && hadc_ctl_rebind(ctx) != 0) {
         hadc_err("reload(%s): control socket rebind failed; keeping the config in use", why);
         restore_conf(ctx, &prev);
+        arm_maint_timer(ctx);
         if (transport)
             (void)hadc_cluster_rebind(ctx); /* return the transport to the previous binding */
         return -1;
@@ -225,13 +230,16 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
      * the engine starts speaking on it. */
     if (apply) {
         hadc_desired_t desired;
+        /* Clear a stale gateway verdict before computing desired state: the
+         * probe is about to be restarted, so applying with "unreachable" would
+         * leave the backup default route installed until a later audit. */
+        hadc_gwping_stop(ctx);
         if (routing_changed)
             hadc_routing_reconcile(ctx, "reload");
         hadc_executor_desired(ctx, &ctx->lease, &desired);
         hadc_executor_apply(ctx, &desired, "RELOAD");
         if ((ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING) && cluster_addrs)
             hadc_executor_announce_cluster(ctx);
-        hadc_gwping_stop(ctx);
         if (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
             hadc_gwping_start(ctx);
     } else if (routing_changed) {
