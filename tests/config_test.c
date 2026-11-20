@@ -581,6 +581,52 @@ int main(void)
         }
     }
 
+    {
+        char cbuf[4096];
+        snprintf(cbuf, sizeof(cbuf),
+                 "%s"
+                 "cluster:\n"
+                 "  addresses:\n"
+                 "    br-lan:\n"
+                 "      addresses: [192.168.10.1/24]\n"
+                 "      disable_ipv6: true\n",
+                 BASE_NOMAC);
+        write_file(base, cbuf);
+        unlink(local);
+        if (hadc_config_load(base, local, &conf, err, sizeof(err)) != 0) {
+            printf("config_test: %s\n", err);
+            fail("cluster addresses object form load");
+        } else if (conf.cluster.n_ifaces != 1 ||
+                   strcmp(conf.cluster.ifaces[0].interface, "br-lan") != 0 ||
+                   conf.cluster.ifaces[0].n_addrs != 1 ||
+                   !conf.cluster.ifaces[0].ipv6_disable_set ||
+                   !conf.cluster.ifaces[0].ipv6_disable) {
+            fail("cluster addresses object form values");
+        } else {
+            ok("cluster addresses object form: addresses + disable_ipv6");
+        }
+    }
+
+    {
+        const char *bad_types[] = {
+            "default_role: 7\n",
+            "dhcp:\n  retention: false\n",
+            "dhcp:\n  rediscover_in_retention: 1\n",
+            "dhcp:\n  request_options: 3\n",
+            "apply:\n  dns_hook: 5\n",
+            "ospf:\n  auth: { type: 2, key: secret }\n",
+        };
+        write_file(base, BASE_NOMAC);
+        for (size_t i = 0; i < sizeof(bad_types) / sizeof(bad_types[0]); i++) {
+            write_file(local, bad_types[i]);
+            if (hadc_config_load(base, local, &conf, err, sizeof(err)) == 0)
+                fail("wrong-typed config value should be an error");
+            else
+                ok("wrong-typed config value rejected");
+        }
+        unlink(local);
+    }
+
     const char *bad_cluster[] = {
         "  addresses:\n    br-lan:\n      - not-an-address/24\n",
         "  addresses:\n    br-lan:\n      - 192.168.10.1/33\n",

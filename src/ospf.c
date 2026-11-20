@@ -895,17 +895,23 @@ static void flood_self_lsas_to_neighbor(ospf_neighbor_t *n)
 static size_t flush_lsas_maxage_adv(uint32_t adv_net)
 {
     size_t flushed = 0;
-    for (size_t i = 0; i < g_ospf.n_lsas; i++) {
+    for (size_t i = 0; i < g_ospf.n_lsas; ) {
         ospf_lsa_t *e = &g_ospf.lsdb[i];
-        if (!e->valid || e->hdr.adv_router != adv_net)
+        if (!e->valid || e->hdr.adv_router != adv_net) {
+            i++;
             continue;
+        }
         size_t l = lsa_wire_len(e);
-        if (l == 0 || l > OSPF_MTU)
+        if (l == 0 || l > OSPF_MTU) {
+            i++;
             continue;
+        }
         size_t plen = sizeof(ospf_hdr_t) + 4 + l;
         uint8_t *pkt = calloc(1, plen);
-        if (!pkt)
+        if (!pkt) {
+            i++;
             continue;
+        }
         ospf_hdr_t *oh = (ospf_hdr_t *)pkt;
         oh->version = OSPF_VERSION;
         oh->type = OSPF_LSUPDATE;
@@ -923,16 +929,17 @@ static size_t flush_lsas_maxage_adv(uint32_t adv_net)
         apply_auth(oh, g_ospf.ctx, pkt, plen);
         oh->checksum = 0;
         oh->checksum = hadc_checksum_host(pkt, plen);
-        size_t sent = 0;
         for (size_t k = 0; k < OSPF_MAX_NEIGHBORS; k++) {
-            if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY) {
+            if (g_ospf.nbrs[k].in_use && g_ospf.nbrs[k].state >= NSTATE_2WAY)
                 send_to(g_ospf.nbrs[k].ip, g_ospf.nbrs[k].ifindex, pkt, plen);
-                sent++;
-            }
         }
-        if (sent)
-            flushed++;
         free(pkt);
+        flushed++;
+        /* A MaxAge flush withdraws the LSA locally as well. Keeping it in the
+         * LSDB would let the periodic full flood re-announce the dead peer's
+         * route after the neighbors had already removed it. */
+        remove_lsa_at(i);
+        /* remove_lsa_at swaps the last entry into i; inspect it next. */
     }
     return flushed;
 }

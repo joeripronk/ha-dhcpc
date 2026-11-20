@@ -1219,6 +1219,15 @@ int main(int argc, char **argv)
     hadc_persist_init(ctx, persist_path);
     hadc_persist_view_t pv;
     hadc_persist_load(ctx, &pv);
+    /* A state file with no valid role would pin the node in UNKNOWN: bootstrap
+     * election requires SLAVE and role-change handling skips UNKNOWN, so the
+     * node would never rejoin. Re-select the role from config in that case. */
+    if (pv.found && pv.role == HADC_ROLE_UNKNOWN) {
+        hadc_warn("persist: no valid role in state file; reselecting from config");
+        pv.role = !strcmp(ctx->conf.designated_master, ctx->conf.self)
+                      ? HADC_ROLE_MASTER
+                      : HADC_ROLE_SLAVE;
+    }
     ctx->role = pv.found ? pv.role
                          : (!strcmp(ctx->conf.designated_master, ctx->conf.self)
                                 ? HADC_ROLE_MASTER

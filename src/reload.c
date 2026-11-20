@@ -46,6 +46,19 @@ static const struct in_addr *self_sync_of(hadc_conf_t *c)
     return NULL;
 }
 
+/* Restore the effective config after a failed live apply. Both the OSPF thread
+ * and the heartbeat thread read conf without a combined lock, so take both in
+ * the same order as the swap above. */
+static void restore_conf(hadc_ctx_t *ctx, const hadc_conf_t *prev)
+{
+    hadc_ospf_lock();
+    hadc_cluster_lock();
+    ctx->conf = *prev;
+    hadc_cluster_unlock();
+    hadc_ospf_unlock();
+    hadc_log_set_level(ctx->conf.loglevel);
+}
+
 int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
 {
     hadc_conf_t next;
@@ -172,6 +185,7 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
                   ctx->conf.seed_master[0] ? ctx->conf.seed_master : "(none)",
                   next.seed_master[0] ? next.seed_master : "(none)");
 
+    hadc_conf_t prev = ctx->conf;
     hadc_ospf_lock();    /* the OSPF thread reads conf.ospf.* every tick/packet */
     hadc_cluster_lock(); /* the heartbeat thread snapshots conf every tick     */
     ctx->conf = next;
@@ -194,10 +208,18 @@ int hadc_conf_reload(hadc_ctx_t *ctx, const char *why)
         if (ctx->maintfd >= 0 && timerfd_settime(ctx->maintfd, 0, &its, NULL) != 0)
             hadc_warn("reload: maintfd re-arm failed: %s", strerror(errno));
     }
-    if (transport)
-        hadc_cluster_rebind(ctx);
-    if (ctl)
-        hadc_ctl_rebind(ctx);
+    if (transport && hadc_cluster_rebind(ctx) != 0) {
+        hadc_err("reload(%s): cluster rebind failed; keeping the config in use", why);
+        restore_conf(ctx, &prev);
+        return -1;
+    }
+    if (ctl && hadc_ctl_rebind(ctx) != 0) {
+        hadc_err("reload(%s): control socket rebind failed; keeping the config in use", why);
+        restore_conf(ctx, &prev);
+        if (transport)
+            (void)hadc_cluster_rebind(ctx); /* return the transport to the previous binding */
+        return -1;
+    }
 
     /* Executor first: the address and routes move to the new interface before
      * the engine starts speaking on it. */

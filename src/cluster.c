@@ -877,11 +877,8 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
         memcmp(&g_bound.sin_addr, &self->sync_address, sizeof(self->sync_address)) == 0)
         return 0;
 
-    int old = udp_fd_swap(ctx, -1);
-    if (old >= 0) {
-        hadc_loop_del(ctx, old);
-        close(old);
-    }
+    /* Bind the new socket before dropping the old one: a failed rebind must
+     * leave the current cluster transport in place. */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         hadc_err("cluster: socket: %s", strerror(errno));
@@ -897,7 +894,11 @@ int hadc_cluster_rebind(hadc_ctx_t *ctx)
         return -1;
     }
     fcntl(fd, F_SETFL, O_NONBLOCK);
-    udp_fd_swap(ctx, fd);
+    int old = udp_fd_swap(ctx, fd);
+    if (old >= 0) {
+        hadc_loop_del(ctx, old);
+        close(old);
+    }
     hadc_loop_add(ctx, fd, udp_ready, 0);
     g_bound = addr;
     {

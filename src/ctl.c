@@ -29,6 +29,21 @@
 
 static char g_ctl_path[HADC_PATH_MAX]; /* where ctl_fd is bound (rebind check) */
 
+/* A conntrack compare is driven by the conntrack worker; polling for its
+ * result must not block the epoll loop. The accepted fd stays open and the
+ * final single-line reply is written from hadc_ctl_step(). */
+#define CTL_PENDING_MAX 8
+#define CTL_COMPARE_TIMEOUT_MS 10000
+
+typedef struct {
+    int fd;
+    long long deadline_ms;
+    char *reply;
+    size_t off;
+} ctl_pending_t;
+
+static ctl_pending_t g_pending[CTL_PENDING_MAX];
+
 static json_t *status_object(hadc_ctx_t *ctx)
 {
     bool gr_active = hadc_cluster_graceful_active(ctx);
@@ -132,7 +147,23 @@ char *hadc_ctl_status_json(hadc_ctx_t *ctx)
     return txt;
 }
 
-static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
+/* Reserve a deferred reply slot; fd >= 0 is owned by the slot until the reply
+ * is written. Returns 0 when no slot is free. */
+static int ctl_pending_add(int fd, long long deadline_ms)
+{
+    for (size_t i = 0; i < CTL_PENDING_MAX; i++) {
+        if (g_pending[i].fd < 0) {
+            g_pending[i].fd = fd;
+            g_pending[i].deadline_ms = deadline_ms;
+            g_pending[i].reply = NULL;
+            g_pending[i].off = 0;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd, int *deferred)
 {
     char cmd[64] = "", arg[128] = "";
     if (sscanf(line, "%63s %127s", cmd, arg) < 1)
@@ -275,38 +306,13 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
                 reply = "{\"ok\":false,\"error\":\"conntrack compare requires slave role\"}";
             } else if (hadc_conntrack_compare(ctx) != 0) {
                 reply = "{\"ok\":false,\"error\":\"conntrack compare unavailable\"}";
+            } else if (ctl_pending_add(reply_fd, hadc_now_ms() + CTL_COMPARE_TIMEOUT_MS) != 0) {
+                reply = "{\"ok\":false,\"error\":\"too many pending compares\"}";
             } else {
-                long long deadline = hadc_now_ms() + 10000;
-                while (hadc_now_ms() < deadline && !hadc_conntrack_compare_done(ctx)) {
-                    struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 };
-                    nanosleep(&ts, NULL);
-                }
-                char *cmp_txt = hadc_conntrack_compare_json(ctx);
-                json_t *cmp = NULL;
-                if (cmp_txt) {
-                    json_error_t jerr;
-                    cmp = json_loads(cmp_txt, 0, &jerr);
-                    free(cmp_txt);
-                }
-                if (!cmp)
-                    cmp = json_object();
-                bool done = hadc_conntrack_compare_done(ctx);
-                json_t *out = json_object();
-                json_object_set_new(out, "ok", json_boolean(done));
-                if (!done)
-                    json_object_set_new(out, "error", json_string("conntrack compare timed out"));
-                json_object_set_new(out, "compare", cmp);
-                char *txt = json_dumps(out, JSON_PRESERVE_ORDER | JSON_COMPACT);
-                json_decref(out);
-                if (txt) {
-                    char nl = '\n';
-                    (void)!write(reply_fd, txt, strlen(txt));
-                    (void)!write(reply_fd, &nl, 1);
-                    free(txt);
-                    reply = NULL;
-                } else {
-                    reply = "{\"ok\":false,\"error\":\"conntrack compare failed\"}";
-                }
+                /* The worker finishes asynchronously; hadc_ctl_step writes the
+                 * only reply on this fd when the result is ready. */
+                *deferred = 1;
+                reply = NULL;
             }
         } else {
             reply = "{\"ok\":false,\"error\":\"usage: conntrack resync|compare\"}";
@@ -347,15 +353,34 @@ static void handle_command(hadc_ctx_t *ctx, const char *line, int reply_fd)
 
 static void ctl_ready(hadc_ctx_t *ctx, int fd)
 {
-    int c = accept(fd, NULL, NULL);
+    /* Linux does not inherit O_NONBLOCK from a nonblocking listener through
+     * accept(); without accept4 a client that connects and sends nothing
+     * blocks this epoll callback and stalls the whole main loop. */
+    int c = accept4(fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (c < 0)
         return;
     char line[256];
-    ssize_t n = read(c, line, sizeof(line) - 1);
-    if (n > 0) {
-        line[n] = '\0';
+    size_t used = 0;
+    for (;;) {
+        ssize_t n = read(c, line + used, sizeof(line) - 1 - used);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            break; /* EAGAIN: no more data available without blocking */
+        }
+        if (n == 0)
+            break;
+        used += (size_t)n;
+        if (memchr(line, '\n', used) || used == sizeof(line) - 1)
+            break;
+    }
+    if (used > 0) {
+        line[used] = '\0';
         line[strcspn(line, "\r\n")] = '\0';
-        handle_command(ctx, line, c);
+        int deferred = 0;
+        handle_command(ctx, line, c, &deferred);
+        if (deferred)
+            return; /* hadc_ctl_step owns fd c until the compare completes */
     }
     close(c);
 }
@@ -415,6 +440,32 @@ int hadc_ctl_init(hadc_ctx_t *ctx)
     return 0;
 }
 
+/* A path with a socket file may still be stale; only a listening daemon answers
+ * a connect. Keep this separate from unlink so a rebind never removes another
+ * live instance's control socket. */
+static int ctl_path_live(const char *path)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%.*s", (int)sizeof(addr.sun_path) - 1, path);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0)
+        return 0;
+    int live = 0;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        live = 1;
+    } else if (errno == EINPROGRESS) {
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT };
+        if (poll(&pfd, 1, 200) > 0) {
+            int soerr = 0;
+            socklen_t slen = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 && soerr == 0)
+                live = 1;
+        }
+    }
+    close(fd);
+    return live;
+}
+
 /* Move the control socket after a reload changed ctl_socket; 0 when unchanged. */
 int hadc_ctl_rebind(hadc_ctx_t *ctx)
 {
@@ -424,32 +475,110 @@ int hadc_ctl_rebind(hadc_ctx_t *ctx)
     if (ctx->ctl_fd >= 0 && strcmp(addr.sun_path, g_ctl_path) == 0)
         return 0;
 
-    if (ctx->ctl_fd >= 0) {
-        hadc_loop_del(ctx, ctx->ctl_fd);
-        close(ctx->ctl_fd);
-        ctx->ctl_fd = -1;
-        unlink(g_ctl_path);
-    }
-    ctx->ctl_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (ctx->ctl_fd < 0) {
+    /* Bind the new socket before touching the old one: a failed rebind must
+     * leave the current control socket working, not strand the operator. */
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) {
         hadc_err("ctl: socket: %s", strerror(errno));
         return -1;
     }
-    if (bind(ctx->ctl_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        hadc_err("ctl: bind %s: %s", ctx->conf.ctl_socket, strerror(errno));
-        close(ctx->ctl_fd);
-        ctx->ctl_fd = -1;
+    if (ctl_path_live(addr.sun_path)) {
+        hadc_err("ctl: %s is held by a live ha-dhcpc; refusing rebind", ctx->conf.ctl_socket);
+        close(fd);
         return -1;
     }
-    listen(ctx->ctl_fd, 8);
-    hadc_loop_add(ctx, ctx->ctl_fd, ctl_ready, 0);
+    unlink(addr.sun_path); /* stale file from a dead daemon */
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        hadc_err("ctl: bind %s: %s", ctx->conf.ctl_socket, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    listen(fd, 8);
+    if (hadc_loop_add(ctx, fd, ctl_ready, 0) != 0) {
+        hadc_err("ctl: cannot register new control socket: %s", strerror(errno));
+        close(fd);
+        unlink(addr.sun_path);
+        return -1;
+    }
+    int old = ctx->ctl_fd;
+    ctx->ctl_fd = fd;
+    if (old >= 0) {
+        hadc_loop_del(ctx, old);
+        close(old);
+        unlink(g_ctl_path);
+    }
     snprintf(g_ctl_path, sizeof(g_ctl_path), "%s", addr.sun_path);
     hadc_info("ctl: control socket moved to %s", g_ctl_path);
     return 1;
 }
 
+static char *compare_reply_json(hadc_ctx_t *ctx, bool done)
+{
+    char *cmp_txt = hadc_conntrack_compare_json(ctx);
+    json_t *cmp = NULL;
+    if (cmp_txt) {
+        json_error_t jerr;
+        cmp = json_loads(cmp_txt, 0, &jerr);
+        free(cmp_txt);
+    }
+    if (!cmp)
+        cmp = json_object();
+    json_t *out = json_object();
+    json_object_set_new(out, "ok", json_boolean(done));
+    if (!done)
+        json_object_set_new(out, "error", json_string("conntrack compare timed out"));
+    json_object_set_new(out, "compare", cmp); /* steals cmp's reference */
+    char *txt = json_dumps(out, JSON_PRESERVE_ORDER | JSON_COMPACT);
+    json_decref(out);
+    return txt;
+}
+
 int hadc_ctl_step(hadc_ctx_t *ctx)
 {
-    (void)ctx;
+    for (size_t i = 0; i < CTL_PENDING_MAX; i++) {
+        ctl_pending_t *p = &g_pending[i];
+        if (p->fd < 0)
+            continue;
+        if (!p->reply) {
+            bool done = hadc_conntrack_compare_done(ctx);
+            if (!done && hadc_now_ms() < p->deadline_ms)
+                continue; /* still running: never block the main loop */
+            char *txt = compare_reply_json(ctx, done);
+            if (!txt) {
+                close(p->fd);
+                p->fd = -1;
+                continue;
+            }
+            size_t len = strlen(txt);
+            p->reply = malloc(len + 2);
+            if (!p->reply) {
+                free(txt);
+                close(p->fd);
+                p->fd = -1;
+                continue;
+            }
+            memcpy(p->reply, txt, len);
+            p->reply[len] = '\n';
+            p->reply[len + 1] = '\0';
+            free(txt);
+        }
+        size_t len = strlen(p->reply);
+        ssize_t n = write(p->fd, p->reply + p->off, len - p->off);
+        if (n > 0) {
+            p->off += (size_t)n;
+        } else if (n < 0 && (errno == EAGAIN || errno == EINTR)) {
+            if (errno == EINTR)
+                continue;
+            continue; /* retry next loop iteration */
+        } else if (n < 0) {
+            hadc_warn("ctl: compare reply write failed: %s", strerror(errno));
+        }
+        if (p->off >= len) {
+            free(p->reply);
+            p->reply = NULL;
+            close(p->fd);
+            p->fd = -1;
+        }
+    }
     return 0;
 }

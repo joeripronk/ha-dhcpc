@@ -256,12 +256,16 @@ static int get_str(json_t *o, const char *key, char *dst, size_t dstsz, bool req
                    const char *what)
 {
     json_t *v = o ? json_object_get(o, key) : NULL;
-    if (!v || !json_is_string(v)) {
+    if (!v || json_is_null(v)) {
         if (required) {
             snprintf(g_errbuf, sizeof(g_errbuf), "%s: missing %s", what, key);
             return -1;
         }
         return 0;
+    }
+    if (!json_is_string(v)) {
+        snprintf(g_errbuf, sizeof(g_errbuf), "%s: %s must be a string", what, key);
+        return -1;
     }
     snprintf(dst, dstsz, "%s", json_string_value(v));
     return 0;
@@ -601,10 +605,6 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 snprintf(err, errlen, "config: bad cluster.address interface '%s'", ifname);
                 goto derr;
             }
-            if (!json_is_array(list)) {
-                snprintf(err, errlen, "config: cluster.addresses.%s must be a list", ifname);
-                goto derr;
-            }
             json_t *addr_list = list;
             json_t *if6 = NULL;
             if (json_is_object(list)) {
@@ -667,6 +667,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
 
     const char *dr = "slave";
     json_t *drv = json_object_get(root, "default_role");
+    if (drv && !json_is_null(drv) && !json_is_string(drv)) {
+        snprintf(err, errlen, "config: default_role must be a string");
+        goto derr;
+    }
     if (drv && json_is_string(drv))
         dr = json_string_value(drv);
     if (!strcmp(dr, "slave"))
@@ -681,6 +685,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     json_t *d = json_object_get(root, "dhcp");
     const char *ret = "forever";
     json_t *rv = d ? json_object_get(d, "retention") : NULL;
+    if (rv && !json_is_null(rv) && !json_is_string(rv)) {
+        snprintf(err, errlen, "config: dhcp.retention must be a string");
+        goto derr;
+    }
     if (rv && json_is_string(rv))
         ret = json_string_value(rv);
     if (!strcmp(ret, "forever"))
@@ -702,6 +710,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     }
     out->dhcp.retention_max_duration_s = (uint64_t)v;
     json_t *rr = d ? json_object_get(d, "rediscover_in_retention") : NULL;
+    if (rr && !json_is_null(rr) && !json_is_boolean(rr)) {
+        snprintf(err, errlen, "config: dhcp.rediscover_in_retention must be a boolean");
+        goto derr;
+    }
     out->dhcp.rediscover_in_retention = rr && json_is_boolean(rr) ? json_is_true(rr) : true;
     if (get_int(d ? d : root, "rate_limit_ms", &v, 0, false, "dhcp")) goto derr;
     if (v < 0 || v > 3600000) {
@@ -716,6 +728,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     }
     out->dhcp.renew_retry_interval_s = (uint32_t)v;
     json_t *ro = d ? json_object_get(d, "request_options") : NULL;
+    if (ro && !json_is_null(ro) && !json_is_array(ro)) {
+        snprintf(err, errlen, "config: dhcp.request_options must be a list");
+        goto derr;
+    }
     if (ro && json_is_array(ro)) {
         json_t *e;
         size_t idx;
@@ -738,14 +754,8 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
     }
     if (get_addr(a, "backup_gateway", &out->apply.backup_gateway)) goto derr;
     if (get_addr(a, "master_backup_gateway", &out->apply.master_backup_gateway)) goto derr;
-    snprintf(out->apply.dns_hook, HADC_PATH_MAX, "%s",
-             (a && json_object_get(a, "dns_hook") && json_is_string(json_object_get(a, "dns_hook")))
-                 ? json_string_value(json_object_get(a, "dns_hook"))
-                 : "");
-    snprintf(out->apply.ddclient, HADC_PATH_MAX, "%s",
-             (a && json_object_get(a, "ddclient") && json_is_string(json_object_get(a, "ddclient")))
-                 ? json_string_value(json_object_get(a, "ddclient"))
-                 : "");
+    if (get_str(a, "dns_hook", out->apply.dns_hook, HADC_PATH_MAX, false, "apply")) goto derr;
+    if (get_str(a, "ddclient", out->apply.ddclient, HADC_PATH_MAX, false, "apply")) goto derr;
     out->apply.announce_gratuitous = true;
     out->apply.announce_gratuitous_duration_ms = 10;
     out->apply.handoff_hold_ms = 5000;
@@ -1024,6 +1034,10 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                 }
                 const char *t = "none";
                 json_t *tv = json_object_get(au, "type");
+                if (tv && !json_is_null(tv) && !json_is_string(tv)) {
+                    snprintf(err, errlen, "config: ospf.auth.type must be a string");
+                    goto derr;
+                }
                 if (tv && json_is_string(tv))
                     t = json_string_value(tv);
                 if (!strcmp(t, "none") || !strcmp(t, "off"))
@@ -1037,9 +1051,17 @@ int hadc_config_load(const char *base_path, const char *local_path, hadc_conf_t 
                     goto derr;
                 }
                 json_t *kv = json_object_get(au, "key");
+                if (kv && !json_is_null(kv) && !json_is_string(kv)) {
+                    snprintf(err, errlen, "config: ospf.auth.key must be a string");
+                    goto derr;
+                }
                 if (kv && json_is_string(kv))
                     snprintf(out->ospf.auth.key, sizeof(out->ospf.auth.key), "%s", json_string_value(kv));
                 json_t *kid = json_object_get(au, "key_id");
+                if (kid && !json_is_null(kid) && !json_is_integer(kid)) {
+                    snprintf(err, errlen, "config: ospf.auth.key_id must be an integer");
+                    goto derr;
+                }
                 if (kid && json_is_integer(kid))
                     out->ospf.auth.key_id = (int)json_integer_value(kid);
                 if (out->ospf.auth.type != 0 && out->ospf.auth.key[0] == '\0') {
