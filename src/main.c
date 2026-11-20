@@ -197,8 +197,8 @@ static void periodic_ready(hadc_ctx_t *ctx, int fd)
     }
     /* Deferred promotion (takeover handshake): the ack wait expired, so announce
      * ownership anyway (fallback to the pre-handshake behavior). */
-    if (ctx->role == HADC_ROLE_PROMOTING && ctx->promotion_finalize_at_ms &&
-        now >= ctx->promotion_finalize_at_ms)
+    if ((ctx->role == HADC_ROLE_PROMOTING || ctx->role == HADC_ROLE_MASTER) &&
+        ctx->promotion_finalize_at_ms && now >= ctx->promotion_finalize_at_ms)
         hadc_promotion_finalize_complete(ctx, "takeover-ack-timeout");
     /* Offload audit/gwping/routing maintenance to the serialized worker so the
      * main loop stays responsive to heartbeats. */
@@ -559,17 +559,25 @@ static void cb_carrier_return(void *arg)
  * flip), then gateway probe. */
 static void promotion_finalize(hadc_ctx_t *ctx, const char *reason)
 {
-    if (ctx->role != HADC_ROLE_PROMOTING)
+    hadc_role_t before = ctx->role;
+    if (before != HADC_ROLE_PROMOTING && before != HADC_ROLE_MASTER)
         return;
     ctx->takeover_from[0] = '\0';
     hadc_executor_announce_cluster(ctx); /* configurable burst; switches L2 to us */
     hadc_dhcpcore_start(ctx);
     /* announce ready: heartbeats now report master */
     hadc_cluster_lock();
-    if (ctx->role == HADC_ROLE_PROMOTING)
+    if (before == HADC_ROLE_PROMOTING)
         ctx->role = HADC_ROLE_MASTER;
     ctx->promotion_pending = false;
     hadc_cluster_unlock();
+    /* Now that the dataplane is ready, release the withheld role announcement. */
+    hadc_cluster_announce_role(ctx);
+    /* The PROMOTING->MASTER flip bypasses set_role, so cb_role_change never
+     * runs for it. Notify conntrack here; the direct SLAVE->MASTER path is
+     * already notified by the cb_role_change tail. */
+    if (before == HADC_ROLE_PROMOTING)
+        hadc_conntrack_notify_role(ctx, HADC_ROLE_PROMOTING, HADC_ROLE_MASTER);
     hadc_info("promotion: setup complete, announced master (reason=%s)", reason);
     /* delay gwping to avoid probe traffic/mac flips during handoff */
     if (ctx->conf.apply.gateway_probe && ctx->conf.apply.gateway_probe_start_delay_ms > 0) {
@@ -582,22 +590,15 @@ static void promotion_finalize(hadc_ctx_t *ctx, const char *reason)
 }
 
 /* Complete a deferred promotion (called from the takeover_ack handler and the
- * finalize deadline): the announce plus conntrack ownership, ack and persist.
- * The deferred cb_role_change tail already ran a notify with the intermediate
- * PROMOTING role (slave-side semantics during the handshake window); this
- * re-notifies the real SLAVE->MASTER transition so ownership + shadow apply
- * follow the announce. */
+ * finalize deadline): the announce plus ack and persist. promotion_finalize()
+ * now performs the conntrack ownership transition at the announce itself. */
 void hadc_promotion_finalize_complete(hadc_ctx_t *ctx, const char *reason)
 {
-    if (ctx->role != HADC_ROLE_PROMOTING)
+    if (ctx->role != HADC_ROLE_PROMOTING && ctx->role != HADC_ROLE_MASTER)
         return;
     ctx->promotion_finalize_at_ms = 0;
     ctx->takeover_from[0] = '\0';
     promotion_finalize(ctx, reason);
-    /* conntrack ownership follows the announce: the SLAVE->MASTER transition
-     * applies the shadow state replicated from the old master (seamless
-     * takeover depends on this being the conntrack/NAT state owner). */
-    hadc_conntrack_notify_role(ctx, HADC_ROLE_SLAVE, ctx->role);
     ctx->acked_version = ctx->lease.version;
     hadc_persist_save(ctx);
 }
@@ -609,7 +610,10 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
 
     if (old_role == new_role)
         return;
-    if (new_role == HADC_ROLE_PROMOTING) {
+    if (new_role == HADC_ROLE_PROMOTING ||
+        (new_role == HADC_ROLE_MASTER && old_role != HADC_ROLE_MASTER)) {
+        /* PROMOTING for a live handoff; a SLAVE->MASTER transition is a
+         * dead-master promotion. Both need the same dataplane sequence. */
         ctx->promotion_pending = true;
         hadc_executor_link_up(ctx->conf.interface); /* the master must speak DHCP */
         hadc_lease_prepare_for_promotion(&ctx->lease);
@@ -656,8 +660,20 @@ static void cb_role_change(void *arg, hadc_role_t old_role, hadc_role_t new_role
                 }
             }
         }
-        if (!deferred)
-            promotion_finalize(ctx, "PROMOTE");
+        if (!deferred) {
+            /* Dead-master promotion has no handshake peer, but still must not
+             * announce VIPs/role=master without a working local WAN path. Retry
+             * on the finalize deadline instead of committing a route-less master. */
+            bool verified = ctx->lease.address.s_addr != 0 &&
+                ctx->lease.state != HADC_LEASE_NONE &&
+                hadc_executor_default_route_present(ctx);
+            if (verified) {
+                promotion_finalize(ctx, "PROMOTE");
+            } else {
+                hadc_warn("promotion: public ip/default route not verified; deferring announce by 1s");
+                ctx->promotion_finalize_at_ms = (uint64_t)hadc_now_ms() + 1000;
+            }
+        }
     } else if (new_role == HADC_ROLE_DEMOTING) {
         /* Controlled handoff: keep public IP/default route and forward traffic
          * (clients may still send to our MAC); defer nft egress block until the new

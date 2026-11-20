@@ -81,6 +81,17 @@ static uint8_t role_wire(hadc_role_t r)
     }
 }
 
+/* A dead-master promotion sets role=MASTER immediately but keeps
+ * promotion_pending until the WAN path is verified and the VIP announce is
+ * done. Do not let peers treat it as ready in that window. */
+static uint8_t role_wire_for(const hadc_ctx_t *ctx)
+{
+    hadc_role_t r = ctx->role;
+    if (ctx->promotion_pending && r == HADC_ROLE_MASTER)
+        r = HADC_ROLE_PROMOTING;
+    return role_wire(r);
+}
+
 static bool role_is_master_ready(hadc_role_t r) { return r == HADC_ROLE_MASTER; }
 static bool role_claims_master(hadc_role_t r) { return r == HADC_ROLE_MASTER || r == HADC_ROLE_PROMOTING; }
 
@@ -288,7 +299,7 @@ static size_t build_bin_heartbeat(const hadc_ctx_t *ctx, uint8_t *out)
     memset(out, 0, HADC_WIRE_HB_LEN + blen);
     out[1] = (uint8_t)member_index(ctx, ctx->conf.self);
     out[2] = (uint8_t)member_index(ctx, ctx->conf.designated_master);
-    out[3] = role_wire(ctx->role);
+    out[3] = role_wire_for(ctx);
     put_be(out + 4, ctx->lease.version, 8);
     put_be(out + 12, hadc_realtime_ms() & 0xffffffffu, 4);
     uint64_t bits = hb_seen_bits(ctx);
@@ -456,7 +467,7 @@ static void *hb_thread_main(void *arg)
         clock_nanosleep(CLOCK_MONOTONIC, 0, &nap, NULL);
 
         HB_LOCK(ctx);
-        snap.role = role_wire(ctx->role);
+        snap.role = role_wire_for(ctx);
         snap.lease_version = ctx->lease.version;
         snap.master_idx = (uint8_t)member_index(ctx, ctx->conf.designated_master);
         snap.self_idx = (uint8_t)member_index(ctx, ctx->conf.self);
@@ -1146,12 +1157,17 @@ static void udp_ready(hadc_ctx_t *ctx, int fd)
                  * self-originated election has no handshake peer and keeps the
                  * immediate-GARP behavior. */
                 snprintf(ctx->takeover_from, sizeof(ctx->takeover_from), "%s",
-                         (ours && strcmp(msg.origin, ctx->conf.self)) ? msg.origin : "");
+                         (ours && handoff && strcmp(msg.origin, ctx->conf.self))
+                             ? msg.origin : "");
+                if (ours && !handoff)
+                    ctx->promotion_finalize_at_ms = 0; /* no handshake to wait for */
                 /* Adopt self-mastery via the full promotion flow so dataplane and
                  * the DHCP engine are started; never jump straight to MASTER.
                  * When yielding mastership, enter DEMOTING so VIPs drop immediately
                  * but public IP and default route are held for the handoff window. */
-                set_role(ctx, ours ? HADC_ROLE_PROMOTING
+                /* PROMOTING is only meaningful with a live demoting peer to
+                 * handshake with; a dead-master claim goes straight to MASTER. */
+                set_role(ctx, ours ? (handoff ? HADC_ROLE_PROMOTING : HADC_ROLE_MASTER)
                                    : (ctx->role == HADC_ROLE_MASTER || ctx->role == HADC_ROLE_PROMOTING)
                                          ? HADC_ROLE_DEMOTING
                                          : HADC_ROLE_SLAVE);
@@ -1705,6 +1721,11 @@ void hadc_cluster_elect_check(hadc_ctx_t *ctx)
     hadc_cluster_promote(ctx, ctx->conf.self);
 }
 
+void hadc_cluster_announce_role(hadc_ctx_t *ctx)
+{
+    propagate_role(ctx);
+}
+
 /* Send a role_change cluster-wide (plan §4: every role change propagates). */
 static void propagate_role(hadc_ctx_t *ctx)
 {
@@ -1832,13 +1853,20 @@ int hadc_cluster_promote(hadc_ctx_t *ctx, const char *new_master_id)
            so only the handoff cooldown (preempt/election) is armed here. */
         g_handoff_until_ms = (uint64_t)hadc_now_ms() + 60000;
     } else {
-        /* self-promote: enter PROMOTING; cb_role_change will complete and flip to MASTER
-         * only after dataplane+VIP+GARP are ready so heartbeats announce readiness. */
-        set_role(ctx, HADC_ROLE_PROMOTING);
+        /* Dead-master failover: there is no demoting node to handshake with, so
+         * skip the transient PROMOTING step and go straight to MASTER. The role
+         * hook still runs the full dataplane sequence (IP/routes/VIPs/GARP) before
+         * propagate_role announces it. PROMOTING is only for a live handoff. */
+        ctx->takeover_from[0] = '\0';
+        ctx->promotion_finalize_at_ms = 0;
+        set_role(ctx, HADC_ROLE_MASTER);
     }
     hadc_info("cluster: role change -> master=%s (this node: %s)", ctx->conf.designated_master,
               hadc_role_name(ctx->role));
-    propagate_role(ctx);
+    /* During a pending promotion the role is committed internally but not yet
+     * announced: promotion_finalize() propagates once the dataplane is ready. */
+    if (!ctx->promotion_pending)
+        propagate_role(ctx);
     hadc_persist_save(ctx);
     return 0;
 }

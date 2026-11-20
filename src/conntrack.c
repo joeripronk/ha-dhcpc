@@ -2617,7 +2617,6 @@ void hadc_conntrack_shutdown(hadc_ctx_t *ctx)
 void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role_t new_role)
 {
     struct hadc_conntrack *ct = ctx ? ctx->conntrack : NULL;
-    (void)old_role;
     if (!ct)
         return;
     pthread_mutex_lock(&ct->lock);
@@ -2630,7 +2629,11 @@ void hadc_conntrack_notify_role(hadc_ctx_t *ctx, hadc_role_t old_role, hadc_role
         ct->slave_resync_requested = false;
         ct->rx_snapshot_active = false;
         ct->slave_recent_master_handoff = false;
-        if (old_role == HADC_ROLE_SLAVE)
+        /* Both the handshake takeover and the dead-master promotion arrive
+         * here as PROMOTING->MASTER (the SLAVE->PROMOTING hook ran earlier);
+         * the graceful finalize may also report SLAVE->MASTER. Either way the
+         * replicated table must be applied before we own conntrack. */
+        if (old_role == HADC_ROLE_SLAVE || old_role == HADC_ROLE_PROMOTING)
             ct->apply_shadow_pending = true; /* deferred to worker */
     } else {
         ct->ctnl_dump_pending = false;

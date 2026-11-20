@@ -123,6 +123,7 @@ void hadc_gwping_tick(hadc_ctx_t *ctx);
  * a slave already designated as the next master (so the route exists before
  * the old node steers traffic here). */
 bool hadc_route_forwarding(const hadc_ctx_t *ctx);
+void hadc_cluster_announce_role(hadc_ctx_t *ctx);
 
 /* Serialized maintenance worker (step 3): heavy/IO maintenance (fsync-heavy
  * persist, netlink-heavy executor audit/routing reconcile) runs on a dedicated
