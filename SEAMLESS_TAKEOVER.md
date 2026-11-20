@@ -57,12 +57,84 @@ the synced lease, VIPs assigned without GARP, verified active — a working defa
 route must be present before any announce), then signals the old master via the
 cluster protocol (`takeover_prep`). The old master, holding for this node with its
 /+1 steering routes installed, answers `takeover_ack` (steered=false when it cannot
-steer); only then the new master GARPs the VIPs and announces ready (which unblocks
-the old master's egress block as before). The ack wait is bounded by
-`handoff_hold_ms` (min 1000 ms); on timeout — or when the old master cannot steer,
-is not a live peer (dead-master failover), or there is no cluster transport
-(single-node) — promotion falls back to the original behavior and GARPs
-immediately.
+steer); only then the new master GARPs the VIPs and announces ready. The ack wait is
+bounded by `handoff_hold_ms` (min 1000 ms). With no handshake peer (dead master or
+single-node) the handshake is skipped: promotion goes straight to MASTER, verifies
+the local WAN path, and withholds the role announcement until GARP is done (see
+"Dead-master failover").
+
+## Ordering: NOTRACK before steering (critical)
+
+On the demoting node the mark/NOTRACK chains must be installed **before** the /1 and
+VIP-split steering routes, and removed **after** those routes on teardown. Otherwise
+steered packets are tracked and SNATed by the old master before they reach the new
+master: the new master then sees a public-IP source and installs a no-NAT conntrack
+entry for the flow. Survival snapshots are not enough — the flow is broken.
+
+```
+WRONG (steering before NOTRACK):
+  client 172.16.202.42:50636
+      -> OLD MASTER (SNAT -> 82.174.239.91) --fabric--> NEW MASTER
+      -> NEW MASTER sees src=82.174.239.91 -> creates no-SNAT entry
+      -> reply goes to 82.174.239.91, tuple mismatch -> retransmits -> RST
+
+RIGHT (NOTRACK before steering):
+  client 172.16.202.42:50636
+      -> OLD MASTER (NOTRACK, forward as-is) --fabric--> NEW MASTER
+      -> NEW MASTER applies SNAT once: 172.16.202.42 -> 82.174.239.91
+```
+
+Teardown order is the reverse: remove steering routes first, then the mark/NOTRACK
+chains, so traffic during route cleanup still bypasses conntrack/NAT.
+
+## Conntrack/NAT state rules
+
+The replica table on the slave is the source of truth for the new master. These
+rules were added after flow-loss traces:
+
+- **Port-preserving NAT only.** Reject replicated entries whose translated source
+  port differs from the original source port; adopting them installs a wrong reply
+  tuple on the new master.
+- **CREATE must send the un-translated reply tuple.** Netfilter sets `IPS_SRC_NAT`
+  only when the NAT range actually changes the reply tuple. Sending the already-NATed
+  public IP produces only `IPS_SRC_NAT_DONE` and no SNAT, so outbound packets leave
+  with the private source and replies are dropped.
+- **A master DELETE during handoff is local teardown, not a flow end.** Keep the
+  replica shadow entry for 30 s (pending-delete) and reinstall it at promotion with
+  DELETE then CREATE; a plain in-place update cannot fix TCP state/NAT.
+- **Retry on EEXIST/EOPNOTSUPP without NAT attributes**, and actually schedule the
+  retry (`next_retry_ms = 0` means "no retry"). Unexpected netlink failures are
+  logged.
+- **Routing state is state-aware:** a demoted node keeps its primary default route
+  through the hold and a short post-handoff grace; it does not switch to the slave
+  backup route while clients still send to the old VIP. A node designated master
+  installs its primary route before the old node starts steering to it.
+
+## Dead-master failover (poweroff)
+
+No handshake, no old-master DELETE sequence. Election/failover detection is
+~0.75 s on the routers (100 ms heartbeat, 500 ms deadline, 250 ms maintenance tick);
+defaults are ~6.5 s. The chosen slave goes **straight to MASTER** — PROMOTING is only
+used for a live handoff with a demoting peer.
+
+```
+  MASTER dies (no heartbeat, no takeover_prep / takeover_ack)
+        |
+        v  ~0.75 s
+  slave wins -> role=MASTER (no PROMOTING step)
+        |
+        +-- verify public IP + default route
+        +-- withhold wire role + role_change until ready
+        +-- apply VIPs, GARP, start DHCP
+        +-- notify conntrack, apply replica shadow (DELETE+CREATE)
+        |
+        v
+  peers see MASTER only after the announce
+```
+
+A dead master's OSPF LSAs are flushed at MaxAge by a surviving node; a poweroff
+cannot flush its own LSAs, so the LSA dead timer is the fallback. If the dead master
+left a graceful-restart window active, failover is suppressed for up to 180 s.
 
 ## Routing strategies
 
@@ -190,6 +262,7 @@ Notes:
 - `apply.disable_rp_filter` (default on) reconciles rp_filter on managed/all/default interfaces.
 - Steering uses additive split /1 routes via the new master's fabric nexthop during the demoting hold (the lease default route stays in place); per-VIP-subnet splits are installed where applicable.
 - VIP addresses remain assigned through the hold; ARP replies for VIPs are suppressed and locally-originated VIP-source traffic is dropped (scoped nftables), then VIPs are removed at hold completion. nft rules are reconciled on state transitions.
-- NAT/conntrack bypass: `apply.demote_nat_bypass_mark` (default 0) marks steered traffic (prerouting/postrouting, raw priority); `apply.demote_notrack` (default on) NOTRACKs steered traffic at prerouting so conntrack/NAT do not run on the demoting node. Zone-based forward policies may need cooperation (see `SEAMLESS_FIREWALL_HOWTO.md`).
-- Takeover handshake (implemented): the new master verifies its local environment (public IP + default route + VIPs, no GARP), sends `takeover_prep`; the old master (in hold, steering installed) acks via `takeover_ack`; the new master GARPs only after the ack, the ack budget (`handoff_hold_ms`, min 1000 ms), or a non-steering ack. No handshake peer (dead-master failover, single-node) keeps the original immediate-GARP behavior.
+- NAT/conntrack bypass: `apply.demote_nat_bypass_mark` (default 0) marks steered traffic (prerouting/postrouting, raw priority); `apply.demote_notrack` (default on) NOTRACKs steered traffic at prerouting so conntrack/NAT do not run on the demoting node. Chains are installed **before** the steering routes and removed **after** them. Zone-based forward policies may need cooperation (see `SEAMLESS_FIREWALL_HOWTO.md`).
+- Takeover handshake (implemented): the new master verifies its local environment (public IP + default route + VIPs, no GARP), sends `takeover_prep`; the old master (in hold, steering installed) acks via `takeover_ack`; the new master GARPs only after the ack, the ack budget (`handoff_hold_ms`, min 1000 ms), or a non-steering ack. No handshake peer (dead-master failover, single-node) skips the handshake: straight to MASTER, WAN verification, then announce.
+- Validation (`failover-openwrt.sh`): baseline uses only the current master's long-lived flows; post/recheck presence checks do not apply the lifetime filter; the old master's teardown events and daemon-issued reinstall DELETEs are ignored.
 - Tests: unit coverage for steering/suppression/mark and config parsing; netns integration `tests/seamless-takeover-netns.sh` (root; nft checks when available). Load and WAN-ingress-under-load cases remain manual.
